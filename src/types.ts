@@ -2,7 +2,6 @@ export const CUSTOM_ENTRY_TYPE = "pi-codex-multi-goal";
 export const MAX_STAGES = 24;
 export const MIN_WIZARD_STAGES = 2;
 export const MAX_STAGE_TITLE_CHARS = 200;
-export const STAGE_SEPARATOR = " || ";
 
 // Provisional limits — to be validated against the long-run fixtures (Task 9);
 // these are not frozen product numbers. Bytes are not a token count.
@@ -19,6 +18,12 @@ export interface Criterion {
   id: string;
   text: string;
   requiresHumanDecision?: boolean;
+}
+
+/** One human-authored step of a goal contract: an objective plus accepted criteria. */
+export interface GoalStep {
+  objective: string;
+  criteria: string[];
 }
 
 export interface Stage {

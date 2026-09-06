@@ -1,5 +1,5 @@
 import { currentStage } from "./state.js";
-import type { MultiGoal } from "./types.js";
+import type { GoalMemory, MultiGoal } from "./types.js";
 
 export function escapeXmlText(value: string): string {
   return value
@@ -34,18 +34,59 @@ export function otherStageTitles(goal: MultiGoal): string[] {
   return goal.stages.filter((_, index) => index !== goal.index).map((stage) => stage.title);
 }
 
+function formatMemoryLine(memory: GoalMemory): string {
+  if (
+    memory.revision === 0 &&
+    memory.proved.length === 0 &&
+    memory.unresolved.length === 0 &&
+    memory.next === ""
+  ) {
+    return "  Memory: none recorded yet";
+  }
+  const parts = [`revision ${memory.revision}`];
+  if (memory.proved.length > 0) {
+    parts.push(`proved: ${memory.proved.length}`);
+  }
+  if (memory.unresolved.length > 0) {
+    parts.push(`unresolved: ${memory.unresolved.length}`);
+  }
+  if (memory.next.length > 0) {
+    parts.push(`next: ${memory.next}`);
+  }
+  return `  Memory: ${parts.join("; ")}`;
+}
+
 export function formatHumanStatus(goal: MultiGoal | null): string {
   if (!goal) {
-    return ["Usage: /goal <objective>   or   /goal-multi", "No goal is currently set."].join("\n");
+    return [
+      "No goal is currently set.",
+      "Usage: /goal <objective>   or   /goal-multi",
+      'Headless (no TUI): /goal {"objective":"...","criteria":["..."]} — plain text never starts a goal.',
+    ].join("\n");
   }
   const lines = [
     `Status: ${goal.status}`,
     `Stage: ${goal.index + 1}/${goal.stages.length}`,
-    ...goal.stages.map((stage, index) => {
-      const mark = stage.status === "complete" ? "x" : stage.status === "active" ? ">" : " ";
-      return `  [${mark}] ${index + 1}. ${stage.title}`;
-    }),
   ];
+  goal.stages.forEach((stage, index) => {
+    const mark = stage.status === "complete" ? "x" : stage.status === "active" ? ">" : " ";
+    lines.push(`  [${mark}] ${index + 1}. ${stage.title}`);
+    if (stage.criteria.length === 0) {
+      lines.push("        Criteria: (awaiting confirmation)");
+    } else {
+      for (const criterion of stage.criteria) {
+        const decision = criterion.requiresHumanDecision ? " (needs human decision)" : "";
+        lines.push(`        - ${criterion.text}${decision}`);
+      }
+    }
+  });
+  lines.push(formatMemoryLine(goal.memory));
+  lines.push(
+    `Allowance: no-progress ${goal.execution.noProgressRemaining}/${goal.execution.noProgressLimit}, total ${goal.execution.totalRemaining}/${goal.execution.totalLimit}`,
+  );
+  if (goal.pauseReason) {
+    lines.push(`Paused: ${goal.pauseReason}`);
+  }
   if (goal.status === "active") {
     lines.push("Hint: /goal pause, /goal clear");
   } else if (goal.status === "paused" || goal.status === "blocked") {

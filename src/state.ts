@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 
-import { parseStageTitles, validateTitles } from "./parse.js";
+import { parseStageTitles, validateSteps, validateTitles } from "./parse.js";
 import {
   CUSTOM_ENTRY_TYPE,
   DEFAULT_NO_PROGRESS_LIMIT,
@@ -12,6 +12,7 @@ import {
   type GoalMemory,
   type GoalResult,
   type GoalStatus,
+  type GoalStep,
   MAX_STAGES,
   MEMORY_MAX_BYTES,
   type MultiGoal,
@@ -72,6 +73,11 @@ export function currentStage(goal: MultiGoal): Stage {
   return stage;
 }
 
+/**
+ * Test-compat constructor: each stage gets its objective as its sole criterion.
+ * Production start paths must use replaceGoalFromSteps, which requires accepted
+ * nonempty human criteria.
+ */
 export function createGoal(titles: string[], now = unixSeconds()): MultiGoal {
   return {
     goalId: randomUUID(),
@@ -82,8 +88,6 @@ export function createGoal(titles: string[], now = unixSeconds()): MultiGoal {
     memory: emptyMemory(),
     execution: freshExecution(),
     pauseReason: null,
-    // Compat path until Task 3: production constructors still take titles, so
-    // each stage starts with the objective as its sole accepted criterion.
     stages: titles.map((title, index) => ({
       id: randomUUID(),
       title,
@@ -91,6 +95,34 @@ export function createGoal(titles: string[], now = unixSeconds()): MultiGoal {
       criteria: [{ id: randomUUID(), text: title }],
     })),
   };
+}
+
+function createGoalFromSteps(steps: GoalStep[], now = unixSeconds()): MultiGoal {
+  return {
+    goalId: randomUUID(),
+    status: "active",
+    index: 0,
+    createdAt: now,
+    updatedAt: now,
+    memory: emptyMemory(),
+    execution: freshExecution(),
+    pauseReason: null,
+    stages: steps.map((step, index) => ({
+      id: randomUUID(),
+      title: step.objective,
+      status: index === 0 ? "active" : "pending",
+      criteria: step.criteria.map((text) => ({ id: randomUUID(), text })),
+    })),
+  };
+}
+
+export function replaceGoalFromSteps(steps: GoalStep[]): GoalResult {
+  const validated = validateSteps(steps);
+  if (!validated.ok) {
+    return { ok: false, message: validated.message, goal: null };
+  }
+  const goal = createGoalFromSteps(validated.steps);
+  return { ok: true, message: formatSetMessage(goal), goal };
 }
 
 export function replaceGoalFromTitles(titles: string[]): GoalResult {

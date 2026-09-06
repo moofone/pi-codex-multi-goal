@@ -10,6 +10,7 @@ import {
   isMultiGoal,
   reconstructGoal,
   replaceGoal,
+  replaceGoalFromSteps,
   setEntry,
   setGoalStatus,
 } from "../src/state.ts";
@@ -39,10 +40,34 @@ test("block does not advance", () => {
   assert.equal(blocked.goal?.stages[0]?.status, "active");
 });
 
-test("replaceGoal parses stages", () => {
+test("replaceGoal keeps one objective from piped text", () => {
+  // ` || ` splitting is retired; the raw text is one objective.
   const result = replaceGoal("one || two");
   assert.equal(result.ok, true);
-  assert.equal(result.goal?.stages.length, 2);
+  assert.equal(result.goal?.stages.length, 1);
+  assert.equal(result.goal?.stages[0]?.title, "one || two");
+});
+
+test("replaceGoalFromSteps requires accepted nonempty criteria", () => {
+  const rejected = replaceGoalFromSteps([{ objective: "a", criteria: [] }]);
+  assert.equal(rejected.ok, false);
+
+  const accepted = replaceGoalFromSteps([
+    { objective: "a", criteria: ["a done"] },
+    { objective: "b", criteria: ["b done"] },
+  ]);
+  assert.equal(accepted.ok, true);
+  assert.equal(accepted.goal?.stages.length, 2);
+  assert.deepEqual(
+    accepted.goal?.stages[0]?.criteria.map((criterion) => criterion.text),
+    ["a done"],
+  );
+  assert.deepEqual(
+    accepted.goal?.stages[1]?.criteria.map((criterion) => criterion.text),
+    ["b done"],
+  );
+  assert.equal(accepted.goal?.stages[0]?.status, "active");
+  assert.equal(accepted.goal?.stages[1]?.status, "pending");
 });
 
 test("v2 contract validation and v1 migration", () => {
