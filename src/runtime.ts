@@ -644,18 +644,24 @@ export function registerMultiGoal(pi: ExtensionAPI): void {
   });
 
   // The isolation boundary (F06/A08), built on probe 3: a context handler's
-  // returned { messages } replaces the provider-visible list. After a persisted
-  // step transition, every message at or before the boundary belongs to the
-  // completed step (its transcript, its tool results, its memory snapshot) and
-  // is dropped; extension goal messages that are not the CURRENT step's
-  // snapshot are dropped in all cases, so the model view holds exactly one
-  // current goal context. The CURRENT step's snapshot is kept regardless of
-  // its timestamp — a snapshot stamped exactly at the cutoff (host clock tie)
-  // must stay visible — and it anchors the epoch: the completing turn's own
-  // leftovers (its tool results) are stamped after the cutoff but before the
-  // next snapshot lands, so anything after the cutoff that is not stamped
-  // later than the newest current-snapshot stamp is old-step debris and is
-  // dropped too. Paused/restored goals keep filtering through the persisted
+  // returned { messages } replaces the provider-visible list. The CURRENT
+  // step's snapshot (customType + details.goalId/stage) is always kept
+  // regardless of its timestamp — including a snapshot stamped exactly at the
+  // cutoff (host clock tie) — and every other extension goal message is always
+  // dropped, so the model view holds exactly one current goal context.
+  // isolationCutoff applies only when it is non-null: non-snapshot messages at
+  // or before the boundary belong to the completed step (its transcript, its
+  // tool results, its memory) and are dropped. The completing turn's own
+  // leftovers are identified by OLD-STEP IDENTITY, never by comparing stamps
+  // against the newest current-snapshot stamp: production stamps the completion
+  // tool result after the cutoff was taken and after the next kickoff was sent,
+  // and the newest snapshot stamp must never become a global transcript cutoff
+  // (with no boundary at all, or with a later boundary snapshot present, it
+  // would delete the current step's own in-flight work). Leftover identity: a
+  // tool result — or the assistant tool call — whose tool-call id answers an
+  // accepted completion of this goal, or answers a tool call issued at or
+  // before the boundary, reports on the old step no matter when the host
+  // stamped it. Paused/restored goals keep filtering through the persisted
   // boundary; while pi-orchestrate owns the session the extension never
   // touches the context at all. There is no newSession fallback: if this
   // filter could not be proven, the next kickoff would stay withheld instead.
@@ -679,7 +685,7 @@ export function registerMultiGoal(pi: ExtensionAPI): void {
     if (!goal || yielding(ctx)) {
       return undefined;
     }
-    const cutoff = goal.isolationCutoff ?? 0;
+    const cutoff = goal.isolationCutoff ?? null;
     const stampOf = (message: unknown): number => {
       const stamp = (message as { timestamp?: unknown } | null)?.timestamp;
       return typeof stamp === "number" ? stamp : 0;
@@ -687,17 +693,62 @@ export function registerMultiGoal(pi: ExtensionAPI): void {
     const isCurrentGoalSnapshot = (message: unknown): boolean =>
       (message as { role?: unknown } | null)?.role === "custom" &&
       !isNonCurrentGoalMessage(message, goal);
-    // Newest current-snapshot stamp wins over the cutoff: messages in the
-    // (cutoff, epoch] window are completing-turn leftovers of the OLD step.
-    let snapshotEpoch = cutoff;
-    for (const message of event.messages) {
-      if (isCurrentGoalSnapshot(message)) {
-        snapshotEpoch = Math.max(snapshotEpoch, stampOf(message));
+    // Old-step tool-call identity: ids of accepted completions for this goal,
+    // plus ids of tool calls issued at or before the boundary (the completing
+    // turn's call is among them; a restart empties the in-memory map, the
+    // branch does not). Only collected once a boundary exists.
+    const oldCallIds = new Set<string>();
+    if (cutoff !== null) {
+      for (const [id, record] of acceptedCompletions) {
+        if (record.goalId === goal.goalId) {
+          oldCallIds.add(id);
+        }
+      }
+      for (const message of event.messages) {
+        if (stampOf(message) > cutoff) {
+          continue;
+        }
+        const assistant = message as { role?: unknown; content?: unknown } | null;
+        if (assistant?.role !== "assistant" || !Array.isArray(assistant.content)) {
+          continue;
+        }
+        for (const block of assistant.content) {
+          const id = (block as { type?: unknown; id?: unknown } | null)?.id;
+          if (typeof id === "string") {
+            oldCallIds.add(id);
+          }
+        }
       }
     }
-    const messages = event.messages.filter(
-      (message) => isCurrentGoalSnapshot(message) || stampOf(message) > snapshotEpoch,
-    );
+    const isOldStepLeftover = (message: unknown): boolean => {
+      const record = message as { role?: unknown; content?: unknown; toolCallId?: unknown } | null;
+      if (typeof record?.toolCallId === "string" && oldCallIds.has(record.toolCallId)) {
+        return true;
+      }
+      if (record?.role === "assistant" && Array.isArray(record.content)) {
+        return record.content.some(
+          (block) =>
+            typeof (block as { id?: unknown } | null)?.id === "string" &&
+            oldCallIds.has((block as { id?: unknown }).id as string),
+        );
+      }
+      return false;
+    };
+    const messages = event.messages.filter((message) => {
+      if (isCurrentGoalSnapshot(message)) {
+        return true; // always visible, regardless of its stamp
+      }
+      if (isNonCurrentGoalMessage(message, goal)) {
+        return false; // other extension goal messages never surface
+      }
+      if (cutoff === null) {
+        return true; // no boundary: the current step's conversation stays
+      }
+      if (stampOf(message) <= cutoff) {
+        return false; // at or before the boundary: the completed step's transcript
+      }
+      return !isOldStepLeftover(message); // completing-turn leftovers, by identity
+    });
     if (messages.length === event.messages.length) {
       return undefined;
     }

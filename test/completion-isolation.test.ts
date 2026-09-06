@@ -354,6 +354,48 @@ test("next context is clean or kickoff is withheld", async t => {
   await h.memory({ ...identity, proved: ["old-memory-note-from-step-one"], unresolved: [], next: "old-next-action" });
   assert.equal(h.current().memory.revision, 1, "sanity: old memory recorded");
 
+  const asCustom = (sent: { message: any }, timestamp: number) => ({
+    role: "custom",
+    customType: sent.message.customType,
+    content: sent.message.content,
+    display: sent.message.display,
+    details: sent.message.details,
+    timestamp,
+  });
+
+  if (isolationProven) {
+    // Mid-step, before any transition (isolationCutoff still null): the filter
+    // must not use the newest current-step snapshot as a global transcript
+    // cutoff — the current step's own user/assistant/tool work stays visible.
+    assert.equal(h.current().isolationCutoff ?? null, null, "sanity: no boundary before the first transition");
+    const stepWork = [
+      { role: "user", content: "please start with the first step", timestamp: 1000 },
+      asCustom(h.sent[0]!, 1500),
+      { role: "assistant", content: [{ type: "text", text: "working on step one" }], timestamp: 2000 },
+      { role: "toolResult", toolCallId: "in-step-1", content: [{ type: "text", text: "step-one tool output" }], timestamp: 2100 },
+    ];
+    const midStep = await h.context(stepWork);
+    const midVisible = JSON.stringify(midStep?.messages ?? stepWork);
+    assert.ok(midVisible.includes("please start with the first step"), "without a boundary the current step's user message survives");
+    assert.ok(midVisible.includes("working on step one"), "without a boundary the current step's assistant turn survives");
+    assert.ok(midVisible.includes("step-one tool output"), "without a boundary the current step's tool result survives");
+
+    // A second current-step snapshot (e.g. a boundary reminder) must not delete
+    // the in-step work recorded between the two snapshots.
+    const withBoundary = [...stepWork, asCustom(h.sent[0]!, 3000)];
+    const boundaryView = await h.context(withBoundary);
+    const boundaryMessages = boundaryView?.messages ?? withBoundary;
+    assert.equal(
+      boundaryMessages.filter((m: any) => m.role === "custom" && m.details?.stage === 1).length,
+      2,
+      "both current-step snapshots remain",
+    );
+    const boundaryVisible = JSON.stringify(boundaryMessages);
+    assert.ok(boundaryVisible.includes("please start with the first step"), "a later boundary snapshot keeps the earlier user message");
+    assert.ok(boundaryVisible.includes("working on step one"), "a later boundary snapshot keeps the in-step assistant turn");
+    assert.ok(boundaryVisible.includes("step-one tool output"), "a later boundary snapshot keeps the in-step tool result");
+  }
+
   await h.updateGoal({
     status: "complete",
     ...identity,
@@ -378,14 +420,6 @@ test("next context is clean or kickoff is withheld", async t => {
   // step's conversation, a sentinel planted in the old step, the completing
   // turn's old-step tool acknowledgement, and the new kickoff after the
   // boundary.
-  const asCustom = (sent: { message: any }, timestamp: number) => ({
-    role: "custom",
-    customType: sent.message.customType,
-    content: sent.message.content,
-    display: sent.message.display,
-    details: sent.message.details,
-    timestamp,
-  });
   const transcript = [
     { role: "user", content: "please start with the first step", timestamp: 1000 },
     asCustom(h.sent[0]!, 1500),
@@ -397,9 +431,12 @@ test("next context is clean or kickoff is withheld", async t => {
     { role: "toolResult", toolCallId: "terminal-1", content: [{ type: "text", text: "Stage 1/3 complete. PREVIOUS_STEP_TRANSCRIPT_SENTINEL" }], timestamp: cutoff + 100 },
     // The stage_advance snapshot can carry a timestamp exactly equal to the
     // cutoff (host clock tie): it is the current step's snapshot and must stay
-    // visible regardless of its stamp.
+    // visible regardless of its stamp. There is deliberately no later duplicate
+    // snapshot: production stamps the completing-turn leftover AFTER this
+    // snapshot (and after the kickoff sendMessage went out), so the filter must
+    // drop the leftover by old-step identity, never by comparing stamps
+    // against the newest current-snapshot stamp.
     asCustom(h.sent[1]!, cutoff),
-    asCustom(h.sent[1]!, cutoff + 200),
   ];
   const filtered = await h.context(transcript);
   assert.ok(filtered && Array.isArray(filtered.messages), "the extension filters the provider-visible list");
