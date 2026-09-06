@@ -12,12 +12,51 @@ export function formatGoalWrapper(goal: MultiGoal): string {
   const stage = currentStage(goal);
   const k = goal.index + 1;
   const n = goal.stages.length;
-  return [
+  // Exactly one current contract + memory snapshot (A06): this step's
+  // objective, criteria, working memory, and k/n — never other steps'
+  // titles, instructions, or memory. The memory block carries the goal/step
+  // identity, execution generation, and revision that update_goal_memory
+  // validates against.
+  const lines = [
     "<goal>",
     "<objective>",
     escapeXmlText(stage.title),
     "</objective>",
     `<stage>${k}/${n}</stage>`,
+  ];
+  if (stage.criteria.length > 0) {
+    lines.push("<criteria>");
+    for (const criterion of stage.criteria) {
+      const decision = criterion.requiresHumanDecision ? " (needs human decision)" : "";
+      lines.push(`- ${escapeXmlText(criterion.text)}${decision}`);
+    }
+    lines.push("</criteria>");
+  }
+  lines.push(
+    `<memory goal="${escapeXmlText(goal.goalId)}" step="${k}" ` +
+      `generation="${goal.execution.generation}" revision="${goal.memory.revision}">`,
+  );
+  if (goal.memory.proved.length > 0) {
+    lines.push("<proved>");
+    for (const item of goal.memory.proved) {
+      lines.push(`- ${escapeXmlText(item)}`);
+    }
+    lines.push("</proved>");
+  }
+  if (goal.memory.unresolved.length > 0) {
+    lines.push("<unresolved>");
+    for (const item of goal.memory.unresolved) {
+      lines.push(`- ${escapeXmlText(item)}`);
+    }
+    lines.push("</unresolved>");
+  }
+  if (goal.memory.next.length > 0) {
+    lines.push("<next>");
+    lines.push(escapeXmlText(goal.memory.next));
+    lines.push("</next>");
+  }
+  lines.push("</memory>");
+  lines.push(
     "<instructions>",
     "You are working on this active goal stage.",
     "Keep making concrete progress on THIS stage only.",
@@ -25,9 +64,11 @@ export function formatGoalWrapper(goal: MultiGoal): string {
     "Before declaring this stage done, verify it against current evidence.",
     'When THIS stage is fully achieved, call update_goal with {"status":"complete"}.',
     'If this stage cannot proceed without user input, call update_goal with {"status":"blocked"}.',
+    "When meaningful new evidence appears or the plan changes, call update_goal_memory with the goal, step, generation, and revision from this snapshot; it replaces the whole memory record.",
     "</instructions>",
     "</goal>",
-  ].join("\n");
+  );
+  return lines.join("\n");
 }
 
 export function otherStageTitles(goal: MultiGoal): string[] {

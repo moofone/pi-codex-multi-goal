@@ -9,6 +9,7 @@ import {
 import { registerGoalCommand, registerGoalMultiCommand } from "./commands.js";
 import { createContinuation } from "./continuation.js";
 import { createPersistence } from "./persistence.js";
+import { validateMemoryContent } from "./memory.js";
 import { formatFooterStatus } from "./prompts.js";
 import { loadSettings } from "./settings.js";
 import {
@@ -18,8 +19,8 @@ import {
   setGoalStatus,
   unixSeconds,
 } from "./state.js";
-import { registerGoalTools } from "./tools.js";
-import type { GoalContinuationKind, GoalEntrySource, GoalResult, MultiGoal } from "./types.js";
+import { registerGoalTools, type MemoryUpdateInput } from "./tools.js";
+import type { GoalContinuationKind, GoalEntrySource, GoalMemory, GoalResult, MultiGoal } from "./types.js";
 import { CUSTOM_ENTRY_TYPE } from "./types.js";
 import { sessionOwnsLiveOrchestrateFeature, type SessionIdentity } from "./yield.js";
 
@@ -269,10 +270,97 @@ export function registerMultiGoal(pi: ExtensionAPI): void {
     return result;
   };
 
+  // Bounded working-memory replace (Task 7). The update is bound to the
+  // execution it came from: goal id, step, generation, and the memory revision
+  // the model last saw. Memory is continuity state only — criteria, steps, and
+  // allowance are untouched, and no continuation is scheduled here (Task 6
+  // cadence: snapshots go out at step start and eligible boundaries only).
+  const updateMemory = (input: MemoryUpdateInput, ctx: ExtensionContext): GoalResult => {
+    const goal = persistence.getGoal();
+    if (!goal) {
+      return { ok: false, message: "No active goal exists.", goal: null };
+    }
+    if (goal.status !== "active") {
+      return {
+        ok: false,
+        message: `Goal is ${goal.status}; memory updates belong to an active execution.`,
+        goal,
+      };
+    }
+    if (yielding(ctx)) {
+      return { ok: false, message: ORCHESTRATE_TRANSITION_REFUSAL, goal };
+    }
+    if (persistenceBroken) {
+      return { ok: false, message: PERSIST_FAILURE_NOTICE, goal };
+    }
+    if (input.goalId !== goal.goalId) {
+      return {
+        ok: false,
+        message: "Memory update rejected: it was not created by the current goal execution.",
+        goal,
+      };
+    }
+    if (input.step !== goal.index + 1) {
+      return {
+        ok: false,
+        message: `Memory update rejected: this execution is bound to step ${goal.index + 1} of this goal.`,
+        goal,
+      };
+    }
+    if (input.generation !== goal.execution.generation) {
+      return {
+        ok: false,
+        message:
+          "Memory update rejected: the execution generation has changed; re-read the current goal snapshot.",
+        goal,
+      };
+    }
+    const proposedRevision = goal.memory.revision + 1;
+    const validated = validateMemoryContent(input, proposedRevision);
+    if (!validated.ok) {
+      return { ok: false, message: validated.message, goal };
+    }
+    const sameContent =
+      JSON.stringify({ proved: validated.proved, unresolved: validated.unresolved, next: validated.next }) ===
+      JSON.stringify({
+        proved: goal.memory.proved,
+        unresolved: goal.memory.unresolved,
+        next: goal.memory.next,
+      });
+    if (sameContent) {
+      // Identical replay: already recorded, no revision bump, nothing persisted.
+      return { ok: true, message: "Memory already recorded; nothing changed.", goal };
+    }
+    if (input.revision !== goal.memory.revision) {
+      return {
+        ok: false,
+        message:
+          `Memory update rejected: expected memory revision ${goal.memory.revision}; ` +
+          "the supplied revision is stale. Re-read the current goal snapshot.",
+        goal,
+      };
+    }
+    const next = cloneGoal(goal);
+    const memory: GoalMemory = {
+      revision: proposedRevision,
+      proved: validated.proved,
+      unresolved: validated.unresolved,
+      next: validated.next,
+    };
+    next.memory = memory;
+    next.updatedAt = unixSeconds();
+    persist(next, "tool", ctx);
+    if (persistenceBroken) {
+      return { ok: false, message: PERSIST_FAILURE_NOTICE, goal: persistence.getGoal() };
+    }
+    return { ok: true, message: `Memory revision ${memory.revision} recorded.`, goal: next };
+  };
+
   registerGoalTools(pi, {
     getGoal: () => persistence.getGoal(),
     completeStage,
     blockGoal,
+    updateMemory,
   });
 
   const commandHost = {
