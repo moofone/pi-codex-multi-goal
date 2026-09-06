@@ -375,8 +375,9 @@ test("next context is clean or kickoff is withheld", async t => {
   assert.equal(typeof cutoff, "number", "the isolation boundary is persisted");
 
   // The provider-visible transcript as the host would assemble it: the old
-  // step's conversation, a sentinel planted in the old step, the old-step tool
-  // acknowledgement, and the new kickoff after the boundary.
+  // step's conversation, a sentinel planted in the old step, the completing
+  // turn's old-step tool acknowledgement, and the new kickoff after the
+  // boundary.
   const asCustom = (sent: { message: any }, timestamp: number) => ({
     role: "custom",
     customType: sent.message.customType,
@@ -390,11 +391,27 @@ test("next context is clean or kickoff is withheld", async t => {
     asCustom(h.sent[0]!, 1500),
     { role: "user", content: "PREVIOUS_STEP_TRANSCRIPT_SENTINEL", timestamp: 1600 },
     { role: "assistant", content: [{ type: "text", text: "working on step one PREVIOUS_STEP_TRANSCRIPT_SENTINEL" }], timestamp: 1700 },
-    { role: "toolResult", toolCallId: "terminal-1", content: [{ type: "text", text: "Stage 1/3 complete." }], timestamp: cutoff + 100 },
+    // The completing turn's tool result is created AFTER the cutoff was taken,
+    // so a timestamp-only `> cutoff` filter keeps it. It is an old-step
+    // leftover and must be absent from the next step's provider context.
+    { role: "toolResult", toolCallId: "terminal-1", content: [{ type: "text", text: "Stage 1/3 complete. PREVIOUS_STEP_TRANSCRIPT_SENTINEL" }], timestamp: cutoff + 100 },
+    // The stage_advance snapshot can carry a timestamp exactly equal to the
+    // cutoff (host clock tie): it is the current step's snapshot and must stay
+    // visible regardless of its stamp.
+    asCustom(h.sent[1]!, cutoff),
     asCustom(h.sent[1]!, cutoff + 200),
   ];
   const filtered = await h.context(transcript);
   assert.ok(filtered && Array.isArray(filtered.messages), "the extension filters the provider-visible list");
+  assert.equal(
+    filtered.messages.some((m: any) => m.role === "toolResult" && m.toolCallId === "terminal-1"),
+    false,
+    "the old step's completing-turn tool result is absent even though it is stamped after the cutoff",
+  );
+  assert.ok(
+    filtered.messages.some((m: any) => m.role === "custom" && m.details?.stage === 2 && m.timestamp === cutoff),
+    "the current-step snapshot stamped exactly at the cutoff remains visible",
+  );
   const visible = JSON.stringify(filtered.messages);
   assert.equal(visible.includes("PREVIOUS_STEP_TRANSCRIPT_SENTINEL"), false, "no previous-step transcript");
   assert.equal(visible.includes("old-memory-note-from-step-one"), false, "no old memory");

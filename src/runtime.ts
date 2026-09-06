@@ -623,9 +623,15 @@ export function registerMultiGoal(pi: ExtensionAPI): void {
   // completed step (its transcript, its tool results, its memory snapshot) and
   // is dropped; extension goal messages that are not the CURRENT step's
   // snapshot are dropped in all cases, so the model view holds exactly one
-  // current goal context. Paused/restored goals keep filtering through the
-  // persisted boundary; while pi-orchestrate owns the session the extension
-  // never touches the context at all. There is no newSession fallback: if this
+  // current goal context. The CURRENT step's snapshot is kept regardless of
+  // its timestamp — a snapshot stamped exactly at the cutoff (host clock tie)
+  // must stay visible — and it anchors the epoch: the completing turn's own
+  // leftovers (its tool results) are stamped after the cutoff but before the
+  // next snapshot lands, so anything after the cutoff that is not stamped
+  // later than the newest current-snapshot stamp is old-step debris and is
+  // dropped too. Paused/restored goals keep filtering through the persisted
+  // boundary; while pi-orchestrate owns the session the extension never
+  // touches the context at all. There is no newSession fallback: if this
   // filter could not be proven, the next kickoff would stay withheld instead.
   const isNonCurrentGoalMessage = (message: unknown, goal: MultiGoal): boolean => {
     if (!message || typeof message !== "object") {
@@ -652,8 +658,19 @@ export function registerMultiGoal(pi: ExtensionAPI): void {
       const stamp = (message as { timestamp?: unknown } | null)?.timestamp;
       return typeof stamp === "number" ? stamp : 0;
     };
+    const isCurrentGoalSnapshot = (message: unknown): boolean =>
+      (message as { role?: unknown } | null)?.role === "custom" &&
+      !isNonCurrentGoalMessage(message, goal);
+    // Newest current-snapshot stamp wins over the cutoff: messages in the
+    // (cutoff, epoch] window are completing-turn leftovers of the OLD step.
+    let snapshotEpoch = cutoff;
+    for (const message of event.messages) {
+      if (isCurrentGoalSnapshot(message)) {
+        snapshotEpoch = Math.max(snapshotEpoch, stampOf(message));
+      }
+    }
     const messages = event.messages.filter(
-      (message) => stampOf(message) > cutoff && !isNonCurrentGoalMessage(message, goal),
+      (message) => isCurrentGoalSnapshot(message) || stampOf(message) > snapshotEpoch,
     );
     if (messages.length === event.messages.length) {
       return undefined;
