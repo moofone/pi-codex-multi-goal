@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import test from "node:test";
 import { registerMultiGoal } from "../src/runtime.ts";
 import { createGoal, setEntry } from "../src/state.ts";
@@ -41,8 +42,22 @@ function seededSteps(): unknown[] {
   ];
 }
 
+/** Task 8 completion evidence for the current stage's criterion, backed by a real artifact. */
+function harness_evidenceFor(goal: any) {
+  const content = "the fix, applied\n";
+  mkdirSync("src", { recursive: true });
+  writeFileSync(join("src", "fix.ts"), content);
+  return {
+    operation: "edit",
+    artifact: "src/fix.ts",
+    fingerprint: createHash("sha256").update(content).digest("hex").slice(0, 16),
+    criteria: [goal.stages[goal.index].criteria[0].id],
+  };
+}
+
 function harness(t: any, options: HarnessOptions = {}) {
   const root = mkdtempSync(join(tmpdir(), "multi-goal-continuation-"));
+  const previousCwd = process.cwd();
   const oldAgent = process.env.PI_AGENT_DIR;
   const oldOrchestrator = process.env.PI_ORCHESTRATOR_ROOT;
   process.env.PI_AGENT_DIR = root;
@@ -50,6 +65,9 @@ function harness(t: any, options: HarnessOptions = {}) {
   mkdirSync(join(root, "orchestrator", "repo", "feature"), { recursive: true });
   // Settings must be in place before registration reads them.
   writeFileSync(join(root, "pi-codex-multi-goal.json"), JSON.stringify(options.limits ?? {}));
+  // Completion evidence artifacts resolve against the working directory of the
+  // pi process (Task 8); the harness chdirs into its own root.
+  process.chdir(root);
 
   const branch: any[] = [...(options.seed ?? [])];
   const entries: any[] = branch;
@@ -104,6 +122,13 @@ function harness(t: any, options: HarnessOptions = {}) {
   };
   t.after(async () => {
     await emit("session_shutdown");
+    // Nested harnesses restore cwd outermost-first; a previous dir may already
+    // be gone, and losing the restore must not fail the test.
+    try {
+      process.chdir(previousCwd);
+    } catch {
+      /* previous directory already removed */
+    }
     if (oldAgent === undefined) delete process.env.PI_AGENT_DIR;
     else process.env.PI_AGENT_DIR = oldAgent;
     if (oldOrchestrator === undefined) delete process.env.PI_ORCHESTRATOR_ROOT;
@@ -123,10 +148,42 @@ function harness(t: any, options: HarnessOptions = {}) {
     pending,
     aborted: () => aborts,
     command: (text: string) => commands.get("goal").handler(text, ctx),
-    complete: (id = "same-completion") =>
-      goalTool.execute(id, { status: "complete" }, new AbortController().signal, undefined, ctx),
-    block: (id = "same-block") =>
-      goalTool.execute(id, { status: "blocked" }, new AbortController().signal, undefined, ctx),
+    /** The goal/step/generation binding the model reads from the snapshot. */
+    identity: () => {
+      const goal = entries.at(-1)?.data.goal;
+      return { goalId: goal.goalId, step: goal.index + 1, generation: goal.execution.generation };
+    },
+    /** One evidence ref backed by a real artifact, covering the given criteria. */
+    evidence: (criteria: string[], artifact = "src/fix.ts", content = "the fix, applied\n") => {
+      const absolute = join(root, artifact);
+      mkdirSync(dirname(absolute), { recursive: true });
+      writeFileSync(absolute, content);
+      return {
+        operation: "edit",
+        artifact,
+        fingerprint: createHash("sha256").update(content).digest("hex").slice(0, 16),
+        criteria,
+      };
+    },
+    complete: (id = "same-completion") => {
+      const goal = entries.at(-1)?.data.goal;
+      return goalTool.execute(id, {
+        status: "complete",
+        goalId: goal.goalId,
+        step: goal.index + 1,
+        generation: goal.execution.generation,
+        evidence: [harness_evidenceFor(goal)],
+      }, new AbortController().signal, undefined, ctx);
+    },
+    block: (id = "same-block") => {
+      const goal = entries.at(-1)?.data.goal;
+      return goalTool.execute(id, {
+        status: "blocked",
+        goalId: goal.goalId,
+        step: goal.index + 1,
+        generation: goal.execution.generation,
+      }, new AbortController().signal, undefined, ctx);
+    },
     compact: () => emit("session_compact", { reason: "threshold" }),
     providerRequest: () => emit("before_provider_request", {
       payload: { model: "fake-model", messages: [{ role: "user", content: "<goal>turn</goal>" }], tools: [] },
@@ -196,17 +253,34 @@ test("one kickoff one boundary no per-turn spam", async t => {
   await h.compact();
   assert.equal(h.sent.length, 3);
 
-  // Delivery revalidation: the queued continuation was built for step 1; the
-  // step advance invalidates it, so its late delivery must arm nothing.
+  // Delivery revalidation and the Task 8 completion boundary: the accepted
+  // completion withdraws the stale queued step-1 continuation (abort, once —
+  // no goal loop is in flight whose tool result could be lost), persists the
+  // transition, and admits exactly one kickoff for the next step.
   await h.complete();
   assert.equal(h.current().index, 1, "sanity: completion advances exactly one step");
-  assert.equal(h.sent.length, 3, "a stage advance schedules no continuation");
+  assert.equal(h.aborted(), 1, "the stale queued step-1 continuation is withdrawn exactly once");
+  assert.equal(h.pending.length, 1, "only the stage-advance kickoff remains queued");
+  assert.equal(h.sent.length, 4, "an accepted completion admits exactly one stage-advance kickoff");
+  assert.equal(h.sent[3]!.message.details.kind, "stage_advance");
+  assert.equal(h.sent[3]!.message.details.stage, 2);
+  assert.equal(
+    JSON.stringify(h.sent[3]!.message.content).includes("\"first\"") || JSON.stringify(h.sent[3]!.message.content).includes("first\n"),
+    false,
+    "the stage-advance kickoff snapshot is the new step only",
+  );
+
+  // The stage-advance kickoff itself participates in the Task 6 cadence: one
+  // boundary snapshot after its delivery, never stacking.
   await h.deliver();
   await h.compact();
-  assert.equal(h.sent.length, 3, "a stale delivery must not arm the next boundary");
+  assert.equal(h.sent.length, 5, "after delivery the next boundary re-arms exactly one snapshot");
+  await h.compact();
+  assert.equal(h.sent.length, 5, "still at most one pending goal continuation");
 
+  await h.deliver();
   await h.emit("agent_end", { messages: [] });
-  assert.equal(h.sent.length, 3, "still no per-turn sends");
+  assert.equal(h.sent.length, 5, "still no per-turn sends");
 });
 
 test("pause withdraws goal work not peer", async t => {

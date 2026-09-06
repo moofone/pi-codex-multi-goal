@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import test from "node:test";
 import { registerMultiGoal } from "../src/runtime.ts";
 import { completeCurrentStage, createGoal } from "../src/state.ts";
@@ -20,11 +21,15 @@ interface HarnessOptions {
 
 function harness(t: any, options: HarnessOptions) {
   const root = mkdtempSync(join(tmpdir(), "multi-goal-recovery-"));
+  const previousCwd = process.cwd();
   const oldAgent = process.env.PI_AGENT_DIR;
   const oldOrchestrator = process.env.PI_ORCHESTRATOR_ROOT;
   process.env.PI_AGENT_DIR = root;
   process.env.PI_ORCHESTRATOR_ROOT = join(root, "orchestrator");
   mkdirSync(join(root, "orchestrator", "repo", "feature"), { recursive: true });
+  // Completion evidence artifacts resolve against the working directory of the
+  // pi process (Task 8); the harness chdirs into its own root.
+  process.chdir(root);
 
   const entries: any[] = [...options.entries];
   let branch: any[] = [...options.branch];
@@ -72,8 +77,25 @@ function harness(t: any, options: HarnessOptions) {
   };
   registerMultiGoal(pi);
   const emit = async (name: string, event: any = {}) => handlers.get(name)?.({ type: name, ...event }, ctx);
+  /** Last goal snapshot the extension appended to the selected branch. */
+  const appendedGoalSnapshot = () => {
+    for (let i = branch.length - 1; i >= 0; i -= 1) {
+      const goal = (branch[i]?.data as any)?.goal;
+      if (goal) {
+        return goal;
+      }
+    }
+    return null;
+  };
   t.after(async () => {
     await emit("session_shutdown");
+    // Nested harnesses restore cwd outermost-first; a previous dir may already
+    // be gone, and losing the restore must not fail the test.
+    try {
+      process.chdir(previousCwd);
+    } catch {
+      /* previous directory already removed */
+    }
     if (oldAgent === undefined) delete process.env.PI_AGENT_DIR; else process.env.PI_AGENT_DIR = oldAgent;
     if (oldOrchestrator === undefined) delete process.env.PI_ORCHESTRATOR_ROOT; else process.env.PI_ORCHESTRATOR_ROOT = oldOrchestrator;
     rmSync(root, { recursive: true, force: true });
@@ -88,17 +110,28 @@ function harness(t: any, options: HarnessOptions) {
       return lastNotified ?? "";
     },
     /** Last goal snapshot the extension appended to the selected branch. */
-    appendedGoal: () => {
-      for (let i = branch.length - 1; i >= 0; i -= 1) {
-        const goal = (branch[i]?.data as any)?.goal;
-        if (goal) {
-          return goal;
-        }
-      }
-      return null;
-    },
+    appendedGoal: appendedGoalSnapshot,
     command: (text: string) => commands.get("goal").handler(text, ctx),
-    complete: () => goalTool.execute("same-completion", { status: "complete" }, new AbortController().signal, undefined, ctx),
+    // A well-formed terminal call under the Task 8 contract: bound to the
+    // current goal/step/generation with evidence covering the current criterion.
+    complete: () => {
+      const goal = appendedGoalSnapshot();
+      const content = "the fix, applied\n";
+      mkdirSync(dirname(join(root, "src", "fix.ts")), { recursive: true });
+      writeFileSync(join(root, "src", "fix.ts"), content);
+      return goalTool.execute("same-completion", {
+        status: "complete",
+        goalId: goal.goalId,
+        step: goal.index + 1,
+        generation: goal.execution.generation,
+        evidence: [{
+          operation: "edit",
+          artifact: "src/fix.ts",
+          fingerprint: createHash("sha256").update(content).digest("hex").slice(0, 16),
+          criteria: [goal.stages[goal.index].criteria[0].id],
+        }],
+      }, new AbortController().signal, undefined, ctx);
+    },
     branch: (value: any[]) => { branch = value; },
     breakAppend: () => { appendBroken = true; },
   };

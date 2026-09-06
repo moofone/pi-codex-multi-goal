@@ -1,5 +1,5 @@
 import { cloneGoal } from "./state.js";
-import type { GoalExecution, MultiGoal } from "./types.js";
+import { MAX_CREDITED_EVIDENCE, type GoalExecution, type MultiGoal } from "./types.js";
 
 /**
  * Persisted request accounting. The allowance is finite and durable: it lives
@@ -69,6 +69,37 @@ export function applyResumeGrant(goal: MultiGoal): MultiGoal {
     noProgressRemaining: next.execution.noProgressLimit,
   };
   return next;
+}
+
+export interface CreditOutcome {
+  goal: MultiGoal;
+  /** Keys newly credited by this call (empty when everything was stale). */
+  creditedKeys: string[];
+}
+
+/**
+ * Verified mid-step progress credit (Task 8), applied ONLY to refs that passed
+ * the shared evidence-validation path. A novel verified evidence ref resets the
+ * no-progress streak to the grant limit — once per ref, keyed by
+ * operation/artifact/fingerprint, so repeated pass/fail toggling of the same
+ * evidence cannot refill repeatedly. Nothing here touches totalRemaining,
+ * lifetimeRequests, or tokenUsage; memory text, tool success, and
+ * edit/write/apply_patch names alone never reach this function.
+ */
+export function creditVerifiedEvidence(goal: MultiGoal, keys: string[]): CreditOutcome {
+  const already = new Set(goal.execution.creditedEvidence ?? []);
+  const fresh = [...new Set(keys)].filter((key) => !already.has(key));
+  if (fresh.length === 0) {
+    return { goal, creditedKeys: [] };
+  }
+  const next = cloneGoal(goal);
+  const credited = [...(next.execution.creditedEvidence ?? []), ...fresh];
+  next.execution = {
+    ...next.execution,
+    creditedEvidence: credited.slice(-MAX_CREDITED_EVIDENCE),
+    noProgressRemaining: next.execution.noProgressLimit,
+  };
+  return { goal: next, creditedKeys: fresh };
 }
 
 export function allowancePauseReason(

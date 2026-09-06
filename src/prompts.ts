@@ -28,7 +28,8 @@ export function formatGoalWrapper(goal: MultiGoal): string {
     lines.push("<criteria>");
     for (const criterion of stage.criteria) {
       const decision = criterion.requiresHumanDecision ? " (needs human decision)" : "";
-      lines.push(`- ${escapeXmlText(criterion.text)}${decision}`);
+      // Criterion ids are stable: evidence refs associate by id.
+      lines.push(`- ${criterion.id}: ${escapeXmlText(criterion.text)}${decision}`);
     }
     lines.push("</criteria>");
   }
@@ -62,9 +63,10 @@ export function formatGoalWrapper(goal: MultiGoal): string {
     "Keep making concrete progress on THIS stage only.",
     "Do not work on other stages. Do not redefine this stage.",
     "Before declaring this stage done, verify it against current evidence.",
-    'When THIS stage is fully achieved, call update_goal with {"status":"complete"}.',
-    'If this stage cannot proceed without user input, call update_goal with {"status":"blocked"}.',
-    "When meaningful new evidence appears or the plan changes, call update_goal_memory with the goal, step, generation, and revision from this snapshot; it replaces the whole memory record.",
+    "Evidence refs are project-relative: { operation: the tool run that produced the artifact, artifact: its path, fingerprint: first 16 hex chars of the artifact's sha256, criteria: the criterion ids above }.",
+    'To record memory or report verified progress, call update_goal_memory with the goal, step, generation, and revision from this snapshot; optional evidence refs earn progress credit once per novel verified ref. It replaces the whole memory record.',
+    'When THIS stage is fully achieved and every criterion is covered by valid evidence, call update_goal with {"status":"complete", goalId, step, generation, evidence}.',
+    'If this stage cannot proceed without user input, call update_goal with {"status":"blocked", goalId, step, generation}.',
     "</instructions>",
     "</goal>",
   );

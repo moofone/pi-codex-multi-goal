@@ -219,6 +219,16 @@ export function createContinuation(deps: ContinuationDeps) {
   const outstanding = (): boolean =>
     (phase === "queued" && !userMessageSinceSend) || (goalLoopInFlight && loopTrigger === "goal");
 
+  /**
+   * True when a queued, undelivered goal continuation is stale relative to the
+   * goal lifecycle AND aborting it cannot kill a running goal loop that is
+   * reporting a terminal tool result (the caller's own loop). The completion
+   * boundary uses this to withdraw old-step queue entries without aborting the
+   * loop whose tool result must still land.
+   */
+  const queuedStale = (): boolean =>
+    phase === "queued" && !userMessageSinceSend && !goalLoopInFlight;
+
   return {
     clear,
     clearSchedule,
@@ -229,6 +239,7 @@ export function createContinuation(deps: ContinuationDeps) {
     agentLoopEnded,
     goalTurnInFlight,
     outstanding,
+    queuedStale,
   };
 }
 

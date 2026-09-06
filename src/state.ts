@@ -5,6 +5,7 @@ import {
   CUSTOM_ENTRY_TYPE,
   DEFAULT_NO_PROGRESS_LIMIT,
   DEFAULT_TOTAL_LIMIT,
+  MAX_CREDITED_EVIDENCE,
   type Criterion,
   type GoalCustomEntry,
   type GoalEntrySource,
@@ -46,6 +47,7 @@ export function freshExecution(
     totalLimit: limits.totalLimit,
     lifetimeRequests: 0,
     tokenUsage: null,
+    creditedEvidence: [],
   };
 }
 
@@ -56,13 +58,14 @@ export function cloneGoal(goal: MultiGoal): MultiGoal {
     index: goal.index,
     createdAt: goal.createdAt,
     updatedAt: goal.updatedAt,
+    isolationCutoff: goal.isolationCutoff ?? null,
     memory: {
       revision: goal.memory.revision,
       proved: [...goal.memory.proved],
       unresolved: [...goal.memory.unresolved],
       next: goal.memory.next,
     },
-    execution: { ...goal.execution },
+    execution: { ...goal.execution, creditedEvidence: [...(goal.execution.creditedEvidence ?? [])] },
     pauseReason: goal.pauseReason,
     stages: goal.stages.map((stage) => ({
       ...stage,
@@ -91,6 +94,7 @@ export function createGoal(titles: string[], now = unixSeconds()): MultiGoal {
     index: 0,
     createdAt: now,
     updatedAt: now,
+    isolationCutoff: null,
     memory: emptyMemory(),
     execution: freshExecution(),
     pauseReason: null,
@@ -114,6 +118,7 @@ function createGoalFromSteps(
     index: 0,
     createdAt: now,
     updatedAt: now,
+    isolationCutoff: null,
     memory: emptyMemory(),
     execution: freshExecution(limits),
     pauseReason: null,
@@ -184,6 +189,56 @@ export function completeCurrentStage(current: MultiGoal | null, now = unixSecond
   return {
     ok: true,
     message: `Stage ${next.index + 1}/${next.stages.length} active.`,
+    goal: next,
+  };
+}
+
+/**
+ * The accepted-completion boundary (Task 8): the old step is marked complete,
+ * its working memory is removed, and — when a next step exists — the next step
+ * starts with empty memory, a fresh bounded grant (same limits, new generation,
+ * its own accounting), and the persisted provider-visible isolation boundary.
+ * The optional handoff is the single minimal factual note the next step
+ * explicitly depends on; it can never rewrite criteria or add instructions
+ * beyond what the bounded memory record already is. Lifetime totals are not
+ * reset: they stay visible across grants.
+ */
+export function acceptCompletion(
+  current: MultiGoal | null,
+  isolationCutoffMs: number,
+  options: { handoff?: string } = {},
+  now = unixSeconds(),
+): GoalResult {
+  const completed = completeCurrentStage(current, now);
+  if (!completed.ok || !completed.goal) {
+    return completed;
+  }
+  const next = completed.goal;
+  if (next.status === "complete") {
+    // Last step: keep the completion receipt in the stages, drop active memory.
+    next.memory = emptyMemory();
+    next.pauseReason = null;
+    return { ok: true, message: "Goal complete.", goal: next };
+  }
+  next.memory = emptyMemory();
+  if (typeof options.handoff === "string" && options.handoff.trim().length > 0) {
+    next.memory.proved = [options.handoff.trim().slice(0, 512)];
+  }
+  next.execution = {
+    generation: next.execution.generation + 1,
+    noProgressRemaining: next.execution.noProgressLimit,
+    totalRemaining: next.execution.totalLimit,
+    noProgressLimit: next.execution.noProgressLimit,
+    totalLimit: next.execution.totalLimit,
+    lifetimeRequests: next.execution.lifetimeRequests,
+    tokenUsage: next.execution.tokenUsage,
+    creditedEvidence: [],
+  };
+  next.isolationCutoff = isolationCutoffMs;
+  next.pauseReason = null;
+  return {
+    ok: true,
+    message: `Stage ${next.index}/${next.stages.length} complete.`,
     goal: next,
   };
 }
@@ -298,6 +353,14 @@ function isGoalExecution(value: unknown): value is GoalExecution {
     return false;
   }
   const execution = value as GoalExecution;
+  // creditedEvidence was added in Task 8; snapshots persisted by earlier
+  // builds may omit it and are accepted until the next write materializes it.
+  const credited = execution.creditedEvidence;
+  const creditedValid =
+    credited === undefined ||
+    (Array.isArray(credited) &&
+      credited.length <= MAX_CREDITED_EVIDENCE &&
+      credited.every((key) => typeof key === "string" && key.length <= 1024));
   return (
     Number.isInteger(execution.generation) &&
     execution.generation >= 0 &&
@@ -312,7 +375,8 @@ function isGoalExecution(value: unknown): value is GoalExecution {
     Number.isInteger(execution.lifetimeRequests) &&
     execution.lifetimeRequests >= 0 &&
     (execution.tokenUsage === null ||
-      (typeof execution.tokenUsage === "number" && Number.isFinite(execution.tokenUsage)))
+      (typeof execution.tokenUsage === "number" && Number.isFinite(execution.tokenUsage))) &&
+    creditedValid
   );
 }
 
@@ -338,6 +402,16 @@ export function isMultiGoal(value: unknown): value is MultiGoal {
     !isGoalMemory(goal.memory) ||
     !isGoalExecution(goal.execution) ||
     !(goal.pauseReason === null || typeof goal.pauseReason === "string")
+  ) {
+    return false;
+  }
+  // isolationCutoff was added in Task 8; tolerate snapshots persisted by
+  // earlier builds until the next write materializes it.
+  const cutoff = goal.isolationCutoff;
+  if (
+    cutoff !== undefined &&
+    cutoff !== null &&
+    !(typeof cutoff === "number" && Number.isFinite(cutoff) && cutoff >= 0)
   ) {
     return false;
   }
@@ -472,6 +546,7 @@ export function migrateV1Goal(v1: V1GoalShape): MultiGoal {
     index: v1.index,
     createdAt: v1.createdAt,
     updatedAt: v1.updatedAt,
+    isolationCutoff: null,
     memory: emptyMemory(),
     execution: freshExecution(),
     pauseReason: complete ? null : V1_MIGRATION_PAUSE_REASON,

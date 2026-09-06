@@ -42,8 +42,8 @@ test("wrapper includes current criteria and memory only", () => {
   assert.match(wrapper, /<objective>\nwrite red test\n<\/objective>/);
   assert.match(wrapper, /<stage>2\/3<\/stage>/);
   assert.match(wrapper, /<criteria>/);
-  assert.match(wrapper, /- duplicate pinned in the lockfile/);
-  assert.match(wrapper, /- release manager signs off \(needs human decision\)/);
+  assert.match(wrapper, /- c-current-1: duplicate pinned in the lockfile/);
+  assert.match(wrapper, /- c-current-2: release manager signs off \(needs human decision\)/);
   assert.match(wrapper, /revision="2"/);
   assert.match(wrapper, /<proved>\n- proved: lockfile pinned \(artifact: package-lock\.json\)\n<\/proved>/);
   assert.match(wrapper, /<unresolved>\n- unresolved: sign-off pending\n<\/unresolved>/);

@@ -8,13 +8,16 @@ export const MAX_STAGE_TITLE_CHARS = 200;
 export const MEMORY_MAX_BYTES = 8192;
 export const DEFAULT_NO_PROGRESS_LIMIT = 20;
 export const DEFAULT_TOTAL_LIMIT = 200;
+/** Maximum credited-evidence dedupe keys kept on one execution grant. */
+export const MAX_CREDITED_EVIDENCE = 64;
 
 export type GoalStatus = "active" | "paused" | "blocked" | "complete";
 export type StageStatus = "pending" | "active" | "complete";
 export type GoalEntrySource = "command" | "tool" | "runtime";
-// No "stage_advance" kind: automatic multi-step kickoffs stay disabled — a
-// completed step never schedules a continuation for the next one.
-export type GoalContinuationKind = "continuation" | "command_start" | "command_resume";
+// "stage_advance" is the single continuation a persisted, isolated step
+// transition may schedule (Task 8): one kickoff for the freshly admitted step,
+// only after the completion boundary is committed.
+export type GoalContinuationKind = "continuation" | "command_start" | "command_resume" | "stage_advance";
 
 export interface Criterion {
   id: string;
@@ -35,7 +38,7 @@ export interface Stage {
   criteria: Criterion[];
 }
 
-/** Current-step memory only. Reset when the goal transitions to a new step. */
+/** Bounded working-memory record of the current step. Reset when the goal transitions to a new step. */
 export interface GoalMemory {
   revision: number;
   proved: string[];
@@ -52,6 +55,8 @@ export interface GoalExecution {
   totalLimit: number;
   lifetimeRequests: number;
   tokenUsage: number | null;
+  /** Dedupe keys of evidence refs that already received progress credit. */
+  creditedEvidence: string[];
 }
 
 export interface MultiGoal {
@@ -64,6 +69,12 @@ export interface MultiGoal {
   memory: GoalMemory;
   execution: GoalExecution;
   pauseReason: string | null;
+  /**
+   * Provider-visible isolation boundary (epoch ms) recorded when a step
+   * transition was accepted: messages at or before this point belong to the
+   * completed step and are dropped from model context.
+   */
+  isolationCutoff: number | null;
 }
 
 export type GoalCustomEntry =

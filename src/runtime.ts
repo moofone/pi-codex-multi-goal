@@ -4,22 +4,31 @@ import {
   allowanceExhaustion,
   allowancePauseReason,
   chargeRequest,
+  creditVerifiedEvidence,
   type AllowanceExhaustion,
 } from "./allowance.js";
 import { registerGoalCommand, registerGoalMultiCommand } from "./commands.js";
 import { createContinuation } from "./continuation.js";
+import { checkEvidenceCoverage, validateEvidenceRefs } from "./evidence.js";
 import { createPersistence } from "./persistence.js";
 import { validateMemoryContent } from "./memory.js";
 import { formatFooterStatus } from "./prompts.js";
 import { loadSettings } from "./settings.js";
 import {
+  acceptCompletion,
   cloneGoal,
-  completeCurrentStage,
+  currentStage,
   reconstructGoal,
   setGoalStatus,
   unixSeconds,
 } from "./state.js";
-import { registerGoalTools, type MemoryUpdateInput } from "./tools.js";
+import {
+  registerGoalTools,
+  type MemoryResult,
+  type MemoryUpdateInput,
+  type TerminalInput,
+  type TerminalResult,
+} from "./tools.js";
 import type { GoalContinuationKind, GoalEntrySource, GoalMemory, GoalResult, MultiGoal } from "./types.js";
 import { CUSTOM_ENTRY_TYPE } from "./types.js";
 import { sessionOwnsLiveOrchestrateFeature, type SessionIdentity } from "./yield.js";
@@ -56,6 +65,18 @@ const PERSIST_FAILURE_NOTICE =
 // the model-facing terminal tools.
 const ORCHESTRATE_TRANSITION_REFUSAL =
   "pi-orchestrate owns this session: goal stage transitions are paused until it hands back control.";
+
+const HANDOFF_MAX_CHARS = 512;
+
+/** An accepted completion, remembered so the SAME tool-call id replays idempotently. */
+interface AcceptedCompletion {
+  goalId: string;
+  step: number;
+  generation: number;
+  result: TerminalResult;
+}
+
+const MAX_ACCEPTED_COMPLETIONS = 32;
 
 export function registerMultiGoal(pi: ExtensionAPI): void {
   const settings = loadSettings();
@@ -227,38 +248,173 @@ export function registerMultiGoal(pi: ExtensionAPI): void {
     }
   };
 
-  const completeStage = (source: GoalEntrySource, ctx: ExtensionContext): GoalResult => {
+  // Accepted completions, newest kept per tool-call id: a replayed terminal
+  // call is acknowledged without re-running the transition (F05/A07). Bounded;
+  // the oldest entries are forgotten first (they are stale by then anyway).
+  const acceptedCompletions = new Map<string, AcceptedCompletion>();
+
+  const rememberCompletion = (toolCallId: string, record: AcceptedCompletion): void => {
+    acceptedCompletions.delete(toolCallId);
+    acceptedCompletions.set(toolCallId, record);
+    while (acceptedCompletions.size > MAX_ACCEPTED_COMPLETIONS) {
+      const oldest = acceptedCompletions.keys().next().value;
+      if (oldest === undefined) {
+        break;
+      }
+      acceptedCompletions.delete(oldest);
+    }
+  };
+
+  /** Identity binding shared by both terminal tools: an old call cannot claim
+   *  a newly active step, and a stale callback is rejected. */
+  const rejectUnboundTerminal = (goal: MultiGoal, input: TerminalInput, action: string): GoalResult | null => {
+    if (input.goalId !== goal.goalId) {
+      return {
+        ok: false,
+        message: `${action} rejected: it was not created by the current goal execution.`,
+        goal,
+      };
+    }
+    if (input.step !== goal.index + 1) {
+      return {
+        ok: false,
+        message: `${action} rejected: this execution is bound to step ${goal.index + 1} of this goal; the step you referenced is already handled.`,
+        goal,
+      };
+    }
+    if (input.generation !== goal.execution.generation) {
+      return {
+        ok: false,
+        message: `${action} rejected: the execution generation has changed; re-read the current goal snapshot.`,
+        goal,
+      };
+    }
+    return null;
+  };
+
+  // The accepted-completion boundary (Task 8): bind, require criterion
+  // coverage on the one evidence path, persist the transition (completion,
+  // cleared memory, fresh grant, isolation boundary), withdraw old-step queue
+  // entries, acknowledge ONLY the old step, then admit exactly one kickoff for
+  // the next step through the usual admission gates. There is no fallback that
+  // runs the next step inside the old transcript.
+  const completeStage = (source: GoalEntrySource, ctx: ExtensionContext, input: TerminalInput): TerminalResult => {
     if (yielding(ctx)) {
       return { ok: false, message: ORCHESTRATE_TRANSITION_REFUSAL, goal: persistence.getGoal() };
     }
     if (persistenceBroken) {
       return { ok: false, message: PERSIST_FAILURE_NOTICE, goal: persistence.getGoal() };
     }
-    const result = completeCurrentStage(persistence.getGoal());
-    if (!result.ok || !result.goal) {
-      return result;
+    const goal = persistence.getGoal();
+    if (!goal) {
+      return { ok: false, message: "No active goal exists.", goal: null };
     }
-    // A step advanced: the old step's queued/delivered continuation line is
-    // invalidated, and the loop that reported completion keeps running so its
-    // tool result can land. There is no continuation.request on stage_advance —
-    // automatic multi-step stays disabled, and the next step waits for an
-    // explicit user decision.
+    // Idempotent replay of the SAME accepted completion: acknowledged, no
+    // second advance, no second kickoff.
+    const replay = acceptedCompletions.get(input.toolCallId);
+    if (
+      replay &&
+      replay.goalId === input.goalId &&
+      replay.step === input.step &&
+      replay.generation === input.generation &&
+      goal.goalId === input.goalId
+    ) {
+      return replay.result;
+    }
+    if (goal.status !== "active") {
+      return { ok: false, message: `Goal is ${goal.status}.`, goal };
+    }
+    const unbound = rejectUnboundTerminal(goal, input, "Completion");
+    if (unbound) {
+      return unbound;
+    }
+    // A human-decision criterion can never be completed from agent evidence:
+    // the step stays blocked from automatic completion (A11).
+    const decision = currentStage(goal).criteria.find((criterion) => criterion.requiresHumanDecision);
+    if (decision) {
+      return {
+        ok: false,
+        message:
+          `Completion rejected: criterion "${decision.id}" (${decision.text}) requires a human decision. ` +
+          'Resolve it with the human, or call update_goal with status "blocked" to keep the step for that decision.',
+        goal,
+      };
+    }
+    // One evidence-validation path for credit and completion: existence,
+    // producing operation, fingerprint, and criterion association.
+    const validated = validateEvidenceRefs(goal, input.evidence);
+    if (!validated.ok) {
+      return { ok: false, message: validated.message, goal };
+    }
+    const coverage = checkEvidenceCoverage(goal, validated.refs);
+    if (!coverage.ok) {
+      return { ok: false, message: coverage.message, goal };
+    }
+    if (input.handoff !== undefined && (typeof input.handoff !== "string" || input.handoff.length > HANDOFF_MAX_CHARS)) {
+      return {
+        ok: false,
+        message: `Completion rejected: the handoff must be one factual note of at most ${HANDOFF_MAX_CHARS} characters.`,
+        goal,
+      };
+    }
+    // Persist the transition BEFORE acknowledging it or admitting the kickoff.
+    // The withdrawal decision is read before the schedule is cleared: a queued
+    // old-step continuation is withdrawn (it is provably goal-owned and no
+    // goal loop is in flight whose tool result could be lost), the loop that
+    // reported completion keeps running so its tool result can land.
+    const withdrawQueued = continuation.queuedStale();
+    const result = acceptCompletion(goal, Date.now(), {
+      handoff: typeof input.handoff === "string" ? input.handoff : undefined,
+    });
+    if (!result.ok || !result.goal) {
+      return { ok: false, message: result.message, goal: result.goal ?? goal };
+    }
+    if (withdrawQueued) {
+      ctx.abort();
+    }
     continuation.clearSchedule();
     persist(result.goal, source, ctx);
     if (persistenceBroken) {
       return { ok: false, message: PERSIST_FAILURE_NOTICE, goal: persistence.getGoal() };
     }
-    return result;
+    const terminal: TerminalResult = { ...result, acknowledgedStep: input.step };
+    rememberCompletion(input.toolCallId, {
+      goalId: input.goalId,
+      step: input.step,
+      generation: input.generation,
+      result: terminal,
+    });
+    if (result.goal.status === "active") {
+      // Exactly one kickoff for the next step, through the admission gates
+      // (fresh grant, ownership, persistence) — isolation is enforced by the
+      // persisted context boundary the provider request is filtered through.
+      requestContinuation(ctx, "stage_advance");
+    } else {
+      // Final step: the goal is done; invalidate all goal work.
+      continuation.clear();
+    }
+    return terminal;
   };
 
-  const blockGoal = (source: GoalEntrySource, ctx: ExtensionContext): GoalResult => {
+  const blockGoal = (source: GoalEntrySource, ctx: ExtensionContext, input: TerminalInput): TerminalResult => {
     if (yielding(ctx)) {
       return { ok: false, message: ORCHESTRATE_TRANSITION_REFUSAL, goal: persistence.getGoal() };
     }
     if (persistenceBroken) {
       return { ok: false, message: PERSIST_FAILURE_NOTICE, goal: persistence.getGoal() };
     }
-    const result = setGoalStatus(persistence.getGoal(), "blocked");
+    const goal = persistence.getGoal();
+    if (!goal) {
+      return { ok: false, message: "No active goal exists.", goal: null };
+    }
+    if (goal.status !== "active") {
+      return { ok: false, message: `Goal is ${goal.status}.`, goal };
+    }
+    const unbound = rejectUnboundTerminal(goal, input, "Block");
+    if (unbound) {
+      return unbound;
+    }
+    const result = setGoalStatus(goal, "blocked");
     if (!result.ok || !result.goal) {
       return result;
     }
@@ -267,15 +423,19 @@ export function registerMultiGoal(pi: ExtensionAPI): void {
     if (persistenceBroken) {
       return { ok: false, message: PERSIST_FAILURE_NOTICE, goal: persistence.getGoal() };
     }
-    return result;
+    return { ...result, acknowledgedStep: input.step };
   };
 
-  // Bounded working-memory replace (Task 7). The update is bound to the
-  // execution it came from: goal id, step, generation, and the memory revision
-  // the model last saw. Memory is continuity state only — criteria, steps, and
-  // allowance are untouched, and no continuation is scheduled here (Task 6
-  // cadence: snapshots go out at step start and eligible boundaries only).
-  const updateMemory = (input: MemoryUpdateInput, ctx: ExtensionContext): GoalResult => {
+  // Bounded working-memory replace (Task 7) with optional verified progress
+  // credit (Task 8). The update is bound to the execution it came from: goal
+  // id, step, generation, and the memory revision the model last saw. Memory
+  // is continuity state only — criteria, steps, and the total allowance are
+  // untouched, and no continuation is scheduled here (Task 6 cadence).
+  // Evidence refs ride the same validation path completion uses; each novel
+  // verified ref resets only the no-progress streak, once. Unverifiable
+  // claims stay in memory without resetting counters, and late writes bound
+  // to a completed step or a spent generation are rejected.
+  const updateMemory = (input: MemoryUpdateInput, ctx: ExtensionContext): MemoryResult => {
     const goal = persistence.getGoal();
     if (!goal) {
       return { ok: false, message: "No active goal exists.", goal: null };
@@ -340,7 +500,20 @@ export function registerMultiGoal(pi: ExtensionAPI): void {
         goal,
       };
     }
-    const next = cloneGoal(goal);
+    // Verified progress credit (Task 8): only refs that pass the shared
+    // evidence validation, and only once per novel ref. An invalid ref
+    // rejects the whole update, keeping the previous record and counters.
+    let next = cloneGoal(goal);
+    let credited = 0;
+    if (input.evidence !== undefined) {
+      const evidence = validateEvidenceRefs(goal, input.evidence);
+      if (!evidence.ok) {
+        return { ok: false, message: evidence.message, goal };
+      }
+      const outcome = creditVerifiedEvidence(goal, evidence.refs.map((ref) => ref.key));
+      next = outcome.goal;
+      credited = outcome.creditedKeys.length;
+    }
     const memory: GoalMemory = {
       revision: proposedRevision,
       proved: validated.proved,
@@ -353,7 +526,15 @@ export function registerMultiGoal(pi: ExtensionAPI): void {
     if (persistenceBroken) {
       return { ok: false, message: PERSIST_FAILURE_NOTICE, goal: persistence.getGoal() };
     }
-    return { ok: true, message: `Memory revision ${memory.revision} recorded.`, goal: next };
+    return {
+      ok: true,
+      message:
+        credited > 0
+          ? `Memory revision ${memory.revision} recorded; ${credited} verified evidence ref(s) credited.`
+          : `Memory revision ${memory.revision} recorded.`,
+      goal: next,
+      credited,
+    };
   };
 
   registerGoalTools(pi, {
@@ -434,6 +615,50 @@ export function registerMultiGoal(pi: ExtensionAPI): void {
     chargeAtProviderEntry(ctx);
     // No payload replacement and no denial: the host provides no deny channel
     // (qa/evidence/host-capabilities.txt probe 1).
+  });
+
+  // The isolation boundary (F06/A08), built on probe 3: a context handler's
+  // returned { messages } replaces the provider-visible list. After a persisted
+  // step transition, every message at or before the boundary belongs to the
+  // completed step (its transcript, its tool results, its memory snapshot) and
+  // is dropped; extension goal messages that are not the CURRENT step's
+  // snapshot are dropped in all cases, so the model view holds exactly one
+  // current goal context. Paused/restored goals keep filtering through the
+  // persisted boundary; while pi-orchestrate owns the session the extension
+  // never touches the context at all. There is no newSession fallback: if this
+  // filter could not be proven, the next kickoff would stay withheld instead.
+  const isNonCurrentGoalMessage = (message: unknown, goal: MultiGoal): boolean => {
+    if (!message || typeof message !== "object") {
+      return false;
+    }
+    const record = message as { role?: unknown; customType?: unknown; details?: unknown };
+    if (record.role !== "custom" || record.customType !== CUSTOM_ENTRY_TYPE) {
+      return false;
+    }
+    if (goal.status === "complete") {
+      return true;
+    }
+    const details = (record.details ?? {}) as { goalId?: unknown; stage?: unknown };
+    return details.goalId !== goal.goalId || details.stage !== goal.index + 1;
+  };
+
+  pi.on("context", (event, ctx) => {
+    const goal = persistence.getGoal();
+    if (!goal || yielding(ctx)) {
+      return undefined;
+    }
+    const cutoff = goal.isolationCutoff ?? 0;
+    const stampOf = (message: unknown): number => {
+      const stamp = (message as { timestamp?: unknown } | null)?.timestamp;
+      return typeof stamp === "number" ? stamp : 0;
+    };
+    const messages = event.messages.filter(
+      (message) => stampOf(message) > cutoff && !isNonCurrentGoalMessage(message, goal),
+    );
+    if (messages.length === event.messages.length) {
+      return undefined;
+    }
+    return { messages };
   });
 
   pi.on("session_before_compact", (_event, ctx) => {
