@@ -1,0 +1,23 @@
+# Pi host capability probes — Phase 0 (goal-memory-and-limits Task 1)
+
+Date: 2026-09-06T15:37:37.009Z
+Node: v24.10.0
+Peer: @earendil-works/pi-coding-agent 0.84.4
+Live agent-loop helper: unavailable — createAgentSession exists but performs real provider requests (credentials/network required); there is no offline-drivable live agent loop, so end-to-end retry/admission behavior is NOT behaviorally verified. Downstream tasks must not claim admission or isolation guarantees on these probes alone.
+
+Probe (1) deny-including-retries: [fail]
+  before_provider_request observes the provider payload (true) and may REPLACE it (true), but a throwing deny handler is swallowed by ExtensionRunner and the request still proceeds (returned payload: {"model":"probe-model","messages":[{"role":"user","content":"multi-goal-probe"}],"tools":[],"multiGoalProbe":"replaced-b). The hook fires once per agent-loop request BEFORE the provider's internal retry loop (installed pi-ai: onPayload precedes retryProviderRequest — source inspection, not a live loop), so HTTP-level retries are not gated and no deny channel exists. Admission must not be claimed on this API; the Task 5 fallback (stop scheduling once the allowance is exhausted) applies.
+
+Probe (2) abort: [pass]
+  ctx.abort() exists on the ExtensionContext handed to extensions and invokes the host abort action (verified via the real ExtensionRunner with a counting stub). Which work abort() cancels (process-global scope) is NOT verified here; Task 6 must prove ownership before aborting.
+
+Probe (3) context-filter: [pass]
+  a context handler's returned { messages } replaces the provider-visible list: ExtensionRunner.emitContext dropped the filtered entry (verified by driving the real runner). The SDK wires emitContext as the request transformContext feeding the provider payload; end-to-end confirmation in a live agent loop: unavailable.
+
+Probe (4) tool-ctx-has-no-newSession: [pass]
+  createContext() — the context passed to tool execute — has no newSession; createCommandContext() does (verified against the installed runner). Session replacement is unreachable from a tool callback.
+
+Policy: missing peer or missing live agent-loop helper is recorded as
+[unavailable]; a faked passing admission barrier is a test failure. These
+probes drive the installed peer's ExtensionRunner dispatch paths directly
+(boundary probes); they are not full provider/agent-loop tests.

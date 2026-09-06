@@ -20,6 +20,7 @@ import {
 } from "./stall.js";
 import { registerGoalTools } from "./tools.js";
 import type { GoalContinuationKind, GoalEntrySource, MultiGoal } from "./types.js";
+import { CUSTOM_ENTRY_TYPE } from "./types.js";
 import { sessionOwnsLiveOrchestrateFeature, type SessionIdentity } from "./yield.js";
 
 function sessionIdentity(ctx: ExtensionContext): SessionIdentity {
@@ -57,10 +58,11 @@ export function registerMultiGoal(pi: ExtensionAPI): void {
     shouldYield: yielding,
   });
 
-  const refresh = (ctx: { ui: { setStatus?: (status?: string) => void } } & Partial<ExtensionContext>): void => {
+  const refresh = (ctx: { ui: { setStatus?: (key: string, text: string | undefined) => void } } & Partial<ExtensionContext>): void => {
     const goal = persistence.getGoal();
     const isYielding = ctx.sessionManager ? yielding(ctx as ExtensionContext) : false;
     ctx.ui.setStatus?.(
+      CUSTOM_ENTRY_TYPE,
       formatFooterStatus(goal, { yielding: isYielding, stallReason: goal?.status === "paused" ? stallReason : null }),
     );
   };
