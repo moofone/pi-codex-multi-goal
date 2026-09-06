@@ -31,13 +31,19 @@ export function emptyMemory(): GoalMemory {
   return { revision: 0, proved: [], unresolved: [], next: "" };
 }
 
-export function freshExecution(): GoalExecution {
-  return {
-    generation: 0,
-    noProgressRemaining: DEFAULT_NO_PROGRESS_LIMIT,
-    totalRemaining: DEFAULT_TOTAL_LIMIT,
+/** A bounded grant: finite limits only, no unlimited mode. */
+export function freshExecution(
+  limits: { noProgressLimit: number; totalLimit: number } = {
     noProgressLimit: DEFAULT_NO_PROGRESS_LIMIT,
     totalLimit: DEFAULT_TOTAL_LIMIT,
+  },
+): GoalExecution {
+  return {
+    generation: 0,
+    noProgressRemaining: limits.noProgressLimit,
+    totalRemaining: limits.totalLimit,
+    noProgressLimit: limits.noProgressLimit,
+    totalLimit: limits.totalLimit,
     lifetimeRequests: 0,
     tokenUsage: null,
   };
@@ -97,7 +103,11 @@ export function createGoal(titles: string[], now = unixSeconds()): MultiGoal {
   };
 }
 
-function createGoalFromSteps(steps: GoalStep[], now = unixSeconds()): MultiGoal {
+function createGoalFromSteps(
+  steps: GoalStep[],
+  now = unixSeconds(),
+  limits?: { noProgressLimit: number; totalLimit: number },
+): MultiGoal {
   return {
     goalId: randomUUID(),
     status: "active",
@@ -105,7 +115,7 @@ function createGoalFromSteps(steps: GoalStep[], now = unixSeconds()): MultiGoal 
     createdAt: now,
     updatedAt: now,
     memory: emptyMemory(),
-    execution: freshExecution(),
+    execution: freshExecution(limits),
     pauseReason: null,
     stages: steps.map((step, index) => ({
       id: randomUUID(),
@@ -116,12 +126,15 @@ function createGoalFromSteps(steps: GoalStep[], now = unixSeconds()): MultiGoal 
   };
 }
 
-export function replaceGoalFromSteps(steps: GoalStep[]): GoalResult {
+export function replaceGoalFromSteps(
+  steps: GoalStep[],
+  limits?: { noProgressLimit: number; totalLimit: number },
+): GoalResult {
   const validated = validateSteps(steps);
   if (!validated.ok) {
     return { ok: false, message: validated.message, goal: null };
   }
-  const goal = createGoalFromSteps(validated.steps);
+  const goal = createGoalFromSteps(validated.steps, unixSeconds(), limits);
   return { ok: true, message: formatSetMessage(goal), goal };
 }
 

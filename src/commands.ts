@@ -1,5 +1,6 @@
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 
+import { applyResumeGrant } from "./allowance.js";
 import { formatHumanStatus } from "./prompts.js";
 import { formatStepsPreview, parseGoalContract, parseStageTitles } from "./parse.js";
 import { replaceGoalFromSteps, setGoalStatus } from "./state.js";
@@ -8,6 +9,8 @@ import { collectMultiGoalSteps } from "./wizard.js";
 
 export interface CommandHost {
   getGoal(): MultiGoal | null;
+  /** Finite limits for new-goal grants (settings-derived; no unlimited mode). */
+  limits?: { noProgressLimit: number; totalLimit: number };
   setGoal(goal: MultiGoal, source: GoalEntrySource, ctx: ExtensionCommandContext): void;
   clearGoal(source: GoalEntrySource, ctx: ExtensionCommandContext): void;
   requestContinuation(ctx: ExtensionCommandContext, kind?: GoalContinuationKind): boolean;
@@ -51,7 +54,7 @@ function startGoalFromSteps(
   ctx: ExtensionCommandContext,
   steps: GoalStep[],
 ): void {
-  const result = replaceGoalFromSteps(steps);
+  const result = replaceGoalFromSteps(steps, host.limits);
   if (!result.ok || !result.goal) {
     ctx.ui.notify(result.message, "error");
     return;
@@ -117,9 +120,12 @@ export async function handleGoalCommand(
       ctx.ui.notify(result.message, "warning");
       return;
     }
-    host.setGoal(result.goal, "command", ctx);
+    // An explicit user resume grants a fresh bounded no-progress allowance;
+    // the total budget and lifetime totals are never replenished.
+    const goal = trimmed === "resume" ? applyResumeGrant(result.goal) : result.goal;
+    host.setGoal(goal, "command", ctx);
     ctx.ui.notify(result.message);
-    if (trimmed === "resume" && result.goal.status === "active") {
+    if (trimmed === "resume" && goal.status === "active") {
       host.requestContinuation(ctx, "command_resume");
     }
     return;

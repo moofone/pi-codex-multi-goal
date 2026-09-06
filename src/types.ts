@@ -12,7 +12,9 @@ export const DEFAULT_TOTAL_LIMIT = 200;
 export type GoalStatus = "active" | "paused" | "blocked" | "complete";
 export type StageStatus = "pending" | "active" | "complete";
 export type GoalEntrySource = "command" | "tool" | "runtime";
-export type GoalContinuationKind = "continuation" | "command_start" | "command_resume" | "stage_advance";
+// No "stage_advance" kind: automatic multi-step kickoffs stay disabled — a
+// completed step never schedules a continuation for the next one.
+export type GoalContinuationKind = "continuation" | "command_start" | "command_resume";
 
 export interface Criterion {
   id: string;
