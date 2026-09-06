@@ -220,3 +220,42 @@ test("allowance three admits three never four", async t => {
     "exactly three goal-owned provider entries were recorded, never a fourth",
   );
 });
+
+// Task 9 maintained regression for the QA-01 probe ("repeated goal turns pause
+// without compaction"): under request accounting the equivalent contract is
+// that unproductive goal-owned provider entries exhaust the no-progress streak
+// and pause the goal at provider entry — no compaction ever fires — and
+// nothing further is admitted until an explicit resume grants a fresh bounded
+// streak (verified progress resetting the streak is test/progress-credit).
+test("no-progress exhaustion pauses without compaction", async t => {
+  const h = harness(t, { limits: { noProgressLimit: 3, totalLimit: 200 } });
+
+  await h.emit("session_start");
+  await h.command(JSON.stringify({ objective: "ship the fix", criteria: ["it ships"] }));
+  assert.equal(h.sent.length, 1, "the kickoff is scheduled once");
+  await h.providerRequest();
+  assertExecution(h, { noProgressRemaining: 2, totalRemaining: 199, lifetimeRequests: 1 });
+
+  // Three unproductive requests in, the no-progress streak is spent. No
+  // compaction event ever fired; the pause happens purely at provider entry.
+  await h.providerRequest();
+  await h.providerRequest();
+  assert.match(h.goalStatus(), /Status: paused/);
+  assert.match(h.goalStatus(), /no-progress/, "the pause reason names the no-progress allowance");
+  assertExecution(h, { noProgressRemaining: 0, totalRemaining: 197, lifetimeRequests: 3 });
+
+  // Nothing more is scheduled, and host-side requests the extension cannot
+  // deny (probe 1) record nothing: counters never go negative.
+  await h.emit("agent_end", { messages: [] });
+  await h.providerRequest();
+  assertExecution(h, { noProgressRemaining: 0, totalRemaining: 197, lifetimeRequests: 3 });
+  assert.equal(h.sent.length, 1, "no goal continuation is requested once the streak is spent");
+
+  // An explicit user resume grants a fresh bounded no-progress streak only.
+  await h.command("resume");
+  assertExecution(
+    h,
+    { noProgressRemaining: 3, totalRemaining: 197, lifetimeRequests: 3 },
+    "resume refills only the no-progress streak; total and lifetime never reset",
+  );
+});

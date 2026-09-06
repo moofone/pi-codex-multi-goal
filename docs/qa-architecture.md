@@ -1,9 +1,23 @@
 # Architecture QA — 2026-09-06
 
-**Verdict: not ready to claim compliance with [architecture.md](architecture.md).**
+**Verdict at review time: not ready to claim compliance with
+[architecture.md](architecture.md).**
 The helper suite passes, but execution safety, recovery, continuation, peer
 ownership, and step isolation have reproducible gaps. This review adds evidence
 and failing contract tests; it does not change production behavior.
+
+**Current dispositions (goal-memory-and-limits, updated after Tasks 1–9):**
+F01–F09 are fixed in code and each finding below carries a `Disposition:` line
+backed by maintained regressions in `test/*.test.ts`. The review-time outputs in
+`qa/evidence/` (`baseline.txt`, `runtime.txt`, `typecheck.txt`) are retained
+verbatim as historical evidence; `environment.json`, `source-sha256.txt`, and
+`host-capabilities.txt` are refreshed by `qa/run.mjs`. Two limitations remain
+explicitly open and are **not** advertised complete: (1) admission is a
+schedule-side fallback — `before_provider_request` cannot deny a request
+including retries (probe 1 `[fail]`), so A04's host-side admission barrier is
+not claimed; (2) no offline-drivable live agent loop exists, so end-to-end
+admission, delivery, and isolation behavior is not behaviorally verified. See
+[Remaining host limitations](#remaining-host-limitations).
 
 ## Scope and results
 
@@ -60,6 +74,17 @@ goal-owned model admission, with an explicit conservative progress rule. Validat
 kickoff, tool continuations, retries, and recovery through a controlled provider;
 the limit must hold without waiting for natural idle or compaction.
 
+**Disposition (fixed):** `src/allowance.ts` persists a finite no-progress/total
+grant per step and charges every goal-owned request exactly once at provider
+entry (kickoff, continuations, retries, recovery); reloads never refund,
+lifetime totals never reset, and settings no longer accept unlimited values
+(`test/admission.test.ts`, `test/stall.test.ts`). Verified evidence resets only
+the no-progress streak, once per novel ref (`test/progress-credit.test.ts`); a
+spent streak pauses at provider entry without compaction (`test/admission.test.ts`,
+`no-progress exhaustion pauses without compaction`). Remaining gap: the host hook
+cannot deny retries (probe 1), so exhaustion stops goal scheduling rather than
+walling off the host — A04's barrier is not claimed.
+
 ### F02 — P1: pause changes state without stopping submitted execution
 
 **Evidence:** [commands.ts](../src/commands.ts), `setGoal` and the compaction pause
@@ -77,6 +102,14 @@ owned in-flight work without aborting pi-orchestrate or user-owned work. Verify
 the actual host queue and provider entry boundary, including races with delivery.
 Calling a global abort indiscriminately would not satisfy peer coexistence.
 
+**Disposition (fixed):** pause, clear, block, replacement, and shutdown
+invalidate goal work, drop the queued follow-up, and abort goal-owned in-flight
+work exactly once; user-owned turns are never aborted (`test/continuation.test.ts`,
+`pause withdraws goal work not peer`). Because `ctx.abort()` is process-global
+(probe 2), abort is called only after the ownership decision, so peer and user
+work stay untouched. End-to-end queue/delivery races in a live host remain
+unverified (no offline live agent loop).
+
 ### F03 — P1: restart replenishes the stall allowance
 
 **Evidence:** `session_start` in [runtime.ts](../src/runtime.ts), persisted
@@ -90,6 +123,12 @@ existing, weaker safety fuse and loses a safety pause's explanation.
 
 **Required outcome:** persist and restore safety accounting and pause reason;
 restart and compaction must not grant new work allowance.
+
+**Disposition (fixed):** `execution` counters and `pauseReason` are persisted in
+the v2 entry; `session_start`/`session_tree` restore the selected branch paused
+with the charged grant unchanged (`test/runtime-recovery.test.ts`,
+`selected branch restore stays paused without refill`; persisted-failure admits
+no goal work).
 
 ### F04 — P1: the sent marker permanently suppresses continuation
 
@@ -112,6 +151,12 @@ unconditional agent-end scheduling and introduce repeated reminders.
 states with minimal explicit state. Prove one kickoff, no routine per-turn
 reminders, and exactly one continuation at an eligible context boundary.
 
+**Disposition (fixed):** `src/continuation.ts` tracks queued / delivered /
+eligible-for-next-boundary with delivery acknowledgement on the supported host
+message events; at most one continuation is pending, ordinary `agent_end` turns
+never send, and each eligible boundary sends exactly one snapshot
+(`test/continuation.test.ts`, `one kickoff one boundary no per-turn spam`).
+
 ### F05 — P1: duplicate completion skips a step
 
 **Evidence:** `execute` in [tools.ts](../src/tools.ts), `completeCurrentStage` in
@@ -125,6 +170,11 @@ completion can therefore finish work that was never performed.
 **Required outcome:** bind terminal actions to their originating goal and step,
 reject stale actions, and make replay of the same completion idempotent. Test
 duplicate calls in one response as well as delayed/replayed calls after advance.
+
+**Disposition (fixed):** `update_goal` is bound to the originating
+goal/step/generation; replaying the same tool-call id is a no-op and two
+terminal calls in one response advance exactly one step
+(`test/completion-isolation.test.ts`, `duplicate complete does not skip`).
 
 ### F06 — P1: step advance retains old context and exposes the next objective
 
@@ -143,6 +193,16 @@ titles. It does not establish transcript isolation.
 **Required outcome:** close old-step execution, establish an isolated context,
 then introduce the next objective. Transfer only deliberate factual artifacts or
 handoffs. Inspect the messages actually sent to the provider at the transition.
+
+**Disposition (fixed):** completion is bound to goal/step/generation and is
+idempotent under replay and duplicate same-response calls; the tool result
+acknowledges only the old step; the accepted transition persists, drops
+pre-cutoff messages via the `context` filter (probe 3 `[pass]`), clears old
+memory, and admits exactly one stage-advance kickoff
+(`test/completion-isolation.test.ts`). If the filter capability were missing,
+the kickoff is withheld and execution stays paused instead of falling back to
+the old transcript. Live provider-payload confirmation remains unavailable
+(no offline live agent loop).
 
 ### F07 — P1: pi-orchestrate ownership guards only follow-up scheduling
 
@@ -166,6 +226,13 @@ finding; not a separate runtime probe).
 terminal tools, cancellation, and handoff. Prove an ownership change cannot leak
 queued goal work or affect the peer. Live coexistence is not yet validated.
 
+**Disposition (fixed):** one `shouldYield` decision now gates scheduling,
+admission accounting, terminal tools, cancellation, and handoff: peer-owned
+compactions and provider entries neither spend nor reset the allowance,
+`update_goal complete` refuses to advance, and withdraw never aborts the peer
+(`test/continuation.test.ts`, ownership section; `test/progress-credit.test.ts`).
+Live coexistence in a real session with both extensions loaded remains unvalidated.
+
 ### F08 — P1: tree navigation restores state from other branches
 
 **Evidence:** `session_start`/`session_tree` in [runtime.ts](../src/runtime.ts),
@@ -180,6 +247,10 @@ An off-branch clear or status change can likewise affect reconstruction.
 **Required outcome:** define branch recovery explicitly, read the authoritative
 branch, and fence old callbacks and accounting across navigation. Validate using
 the real session-tree API in addition to the controlled branch probe.
+
+**Disposition (fixed):** reconstruction reads `getBranch()` (selected ancestry),
+skips malformed snapshots, restores that branch paused without refill, and
+fences outstanding continuations (`test/runtime-recovery.test.ts`).
 
 ### F09 — P2: status integration and project type-checking fail
 
@@ -199,23 +270,67 @@ peer dependencies, so a supported Pi API range is not documented/enforced.
 **Required outcome:** use a stable status key, correct the TypeScript configuration,
 and add a repeatable typecheck against supported installed peers.
 
+**Disposition (fixed):** status uses `ui.setStatus(CUSTOM_ENTRY_TYPE, text)` and
+clears with the key (`test/runtime-status.test.ts`); `allowImportingTsExtensions`
+lands with a `typecheck` script, and `npm test` now runs `tsc --noEmit` before
+the suite (`test/npm-test-script.test.ts`), so typecheck is on the normal
+verification path (A12).
+
 ## Additional source observations
 
-- `isMultiGoal` checks only numeric index range, not integer index or consistent
-  stage statuses. A malformed persisted snapshot can pass validation and later
-  fail in `currentStage`, or represent multiple active stages. This is a P2
-  recovery-hardening gap, not a reproduced corruption in a real session.
-- README says `/goal` is single-objective, but `parseStageTitles` and an existing
-  passing test accept `one || two`. Align the documented command contract.
+- ~~`isMultiGoal` checks only numeric index range, not integer index or
+  consistent stage statuses.~~ Resolved in goal-memory-and-limits Task 2: v2
+  validation requires integer index, a consistent unique active stage, unique
+  IDs, and the 8 KiB memory bound; malformed snapshots are skipped on restore.
+- ~~README says `/goal` is single-objective, but `parseStageTitles` and an
+  existing passing test accept `one || two`.~~ Resolved in Task 3: the
+  undocumented ` || ` splitting is retired (`test/parse.test.ts`), `/goal` is
+  single-objective, and the README documents the JSON headless contract
+  (`test/readme-contract.test.ts`).
 - The wizard confirms ordered titles and handles cancellation; normal completion
   advances one step and blocking preserves the index. These passing paths do not
   cover replay, context isolation, or cancellation of ongoing execution.
+  Superseded by the maintained regressions in `test/wizard.test.ts`,
+  `test/completion-isolation.test.ts`, and `test/continuation.test.ts`.
+
+## Remaining host limitations
+
+Recorded by `qa/host-capabilities.test.ts` against the installed peer (currently
+Pi 0.84.4) in [`qa/evidence/host-capabilities.txt`](../qa/evidence/host-capabilities.txt),
+refreshed by `qa/run.mjs`. Until these change, the affected capabilities stay
+disabled or fallback-only and are not advertised complete:
+
+- **No deny-including-retries (probe 1: fail).** `before_provider_request`
+  observes and may replace the payload, but a denying handler is swallowed and
+  the request proceeds; the hook also fires before the provider's internal retry
+  loop. Enforcement is therefore a schedule-side fallback: goal continuations
+  stop being requested once the allowance reaches 0, and every goal-owned
+  request is charged durably once at provider entry. A04's host-side admission
+  barrier is NOT claimed.
+- **No offline live agent loop (unavailable).** `createAgentSession` performs
+  real provider requests; there is no offline-drivable loop, so admission,
+  retry, delivery, and isolation behavior is not behaviorally verified
+  end-to-end. An isolated real-Pi two-extension session remains future work.
+- **`ctx.abort()` is process-global (probe 2: pass, scope unproven).** The
+  extension aborts only after proving goal ownership (Task 6), never peer or
+  user work.
+- **Context filter (probe 3: pass at boundary level).** A `context` handler's
+  returned `messages` replaces the provider-visible list, which is the isolation
+  mechanism for step transitions; its behavior inside a live agent loop is
+  unconfirmed, so `test/completion-isolation.test.ts` withholds the next
+  kickoff and stays paused if the recorded probe stops passing.
+- **No `newSession` from tool callbacks (probe 4: pass).** Session replacement
+  is unreachable from a tool context, so isolation never uses `newSession`.
 
 ## Reproduction and acceptance gate
 
-The added tests intentionally assert required behavior and currently fail. They
-live outside `test/*.test.ts` so the original baseline remains independently
-measurable. Do not interpret its green result as architecture acceptance.
+At review time, the added tests intentionally asserted required behavior and
+failed; they lived outside `test/*.test.ts` so the original baseline remained
+independently measurable. They have since been converted into maintained
+regressions under `test/*.test.ts` (green, run by `npm test` together with
+`tsc --noEmit`); the historical probe suite `qa/runtime.test.ts` and its
+retained outputs assert the pre-fix semantics and are kept verbatim as review
+evidence — failing requirements are documented, not deleted.
 
 Run the isolated QA harness with an installed Pi package and an existing toolchain:
 

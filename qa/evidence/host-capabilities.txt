@@ -1,6 +1,6 @@
 # Pi host capability probes — Phase 0 (goal-memory-and-limits Task 1)
 
-Date: 2026-09-06T15:38:59.993Z
+Date: 2026-09-06T18:28:44.655Z
 Node: v24.10.0
 Peer: @earendil-works/pi-coding-agent 0.84.4
 Live agent-loop helper: unavailable — createAgentSession exists but performs real provider requests (credentials/network required); there is no offline-drivable live agent loop, so end-to-end retry/admission behavior is NOT behaviorally verified. Downstream tasks must not claim admission or isolation guarantees on these probes alone.
