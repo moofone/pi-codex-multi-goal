@@ -1,5 +1,5 @@
 import { currentStage } from "./state.js";
-import type { MultiGoal } from "./types.js";
+import type { GoalMemory, MultiGoal } from "./types.js";
 
 export function escapeXmlText(value: string): string {
   return value
@@ -12,40 +12,124 @@ export function formatGoalWrapper(goal: MultiGoal): string {
   const stage = currentStage(goal);
   const k = goal.index + 1;
   const n = goal.stages.length;
-  return [
+  // Exactly one current contract + memory snapshot (A06): this step's
+  // objective, criteria, working memory, and k/n — never other steps'
+  // titles, instructions, or memory. The memory block carries the goal/step
+  // identity, execution generation, and revision that update_goal_memory
+  // validates against.
+  const lines = [
     "<goal>",
     "<objective>",
     escapeXmlText(stage.title),
     "</objective>",
     `<stage>${k}/${n}</stage>`,
+  ];
+  if (stage.criteria.length > 0) {
+    lines.push("<criteria>");
+    for (const criterion of stage.criteria) {
+      const decision = criterion.requiresHumanDecision ? " (needs human decision)" : "";
+      // Criterion ids are stable: evidence refs associate by id.
+      lines.push(`- ${criterion.id}: ${escapeXmlText(criterion.text)}${decision}`);
+    }
+    lines.push("</criteria>");
+  }
+  lines.push(
+    `<memory goal="${escapeXmlText(goal.goalId)}" step="${k}" ` +
+      `generation="${goal.execution.generation}" revision="${goal.memory.revision}">`,
+  );
+  if (goal.memory.proved.length > 0) {
+    lines.push("<proved>");
+    for (const item of goal.memory.proved) {
+      lines.push(`- ${escapeXmlText(item)}`);
+    }
+    lines.push("</proved>");
+  }
+  if (goal.memory.unresolved.length > 0) {
+    lines.push("<unresolved>");
+    for (const item of goal.memory.unresolved) {
+      lines.push(`- ${escapeXmlText(item)}`);
+    }
+    lines.push("</unresolved>");
+  }
+  if (goal.memory.next.length > 0) {
+    lines.push("<next>");
+    lines.push(escapeXmlText(goal.memory.next));
+    lines.push("</next>");
+  }
+  lines.push("</memory>");
+  lines.push(
     "<instructions>",
     "You are working on this active goal stage.",
     "Keep making concrete progress on THIS stage only.",
     "Do not work on other stages. Do not redefine this stage.",
     "Before declaring this stage done, verify it against current evidence.",
-    'When THIS stage is fully achieved, call update_goal with {"status":"complete"}.',
-    'If this stage cannot proceed without user input, call update_goal with {"status":"blocked"}.',
+    "Evidence refs are project-relative: { operation: the tool run that produced the artifact, artifact: its path, fingerprint: first 16 hex chars of the artifact's sha256, criteria: the criterion ids above }.",
+    'To record memory or report verified progress, call update_goal_memory with the goal, step, generation, and revision from this snapshot; optional evidence refs earn progress credit once per novel verified ref. It replaces the whole memory record.',
+    'When THIS stage is fully achieved and every criterion is covered by valid evidence, call update_goal with {"status":"complete", goalId, step, generation, evidence}.',
+    'If this stage cannot proceed without user input, call update_goal with {"status":"blocked", goalId, step, generation}.',
     "</instructions>",
     "</goal>",
-  ].join("\n");
+  );
+  return lines.join("\n");
 }
 
 export function otherStageTitles(goal: MultiGoal): string[] {
   return goal.stages.filter((_, index) => index !== goal.index).map((stage) => stage.title);
 }
 
+function formatMemoryLine(memory: GoalMemory): string {
+  if (
+    memory.revision === 0 &&
+    memory.proved.length === 0 &&
+    memory.unresolved.length === 0 &&
+    memory.next === ""
+  ) {
+    return "  Memory: none recorded yet";
+  }
+  const parts = [`revision ${memory.revision}`];
+  if (memory.proved.length > 0) {
+    parts.push(`proved: ${memory.proved.length}`);
+  }
+  if (memory.unresolved.length > 0) {
+    parts.push(`unresolved: ${memory.unresolved.length}`);
+  }
+  if (memory.next.length > 0) {
+    parts.push(`next: ${memory.next}`);
+  }
+  return `  Memory: ${parts.join("; ")}`;
+}
+
 export function formatHumanStatus(goal: MultiGoal | null): string {
   if (!goal) {
-    return ["Usage: /goal <objective>   or   /goal-multi", "No goal is currently set."].join("\n");
+    return [
+      "No goal is currently set.",
+      "Usage: /goal <objective>   or   /goal-multi",
+      'Headless (no TUI): /goal {"objective":"...","criteria":["..."]} — plain text never starts a goal.',
+    ].join("\n");
   }
   const lines = [
     `Status: ${goal.status}`,
     `Stage: ${goal.index + 1}/${goal.stages.length}`,
-    ...goal.stages.map((stage, index) => {
-      const mark = stage.status === "complete" ? "x" : stage.status === "active" ? ">" : " ";
-      return `  [${mark}] ${index + 1}. ${stage.title}`;
-    }),
   ];
+  goal.stages.forEach((stage, index) => {
+    const mark = stage.status === "complete" ? "x" : stage.status === "active" ? ">" : " ";
+    lines.push(`  [${mark}] ${index + 1}. ${stage.title}`);
+    if (stage.criteria.length === 0) {
+      lines.push("        Criteria: (awaiting confirmation)");
+    } else {
+      for (const criterion of stage.criteria) {
+        const decision = criterion.requiresHumanDecision ? " (needs human decision)" : "";
+        lines.push(`        - ${criterion.text}${decision}`);
+      }
+    }
+  });
+  lines.push(formatMemoryLine(goal.memory));
+  lines.push(
+    `Allowance: no-progress ${goal.execution.noProgressRemaining}/${goal.execution.noProgressLimit}, total ${goal.execution.totalRemaining}/${goal.execution.totalLimit}`,
+  );
+  if (goal.pauseReason) {
+    lines.push(`Paused: ${goal.pauseReason}`);
+  }
   if (goal.status === "active") {
     lines.push("Hint: /goal pause, /goal clear");
   } else if (goal.status === "paused" || goal.status === "blocked") {

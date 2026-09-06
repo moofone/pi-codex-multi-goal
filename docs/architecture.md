@@ -1,7 +1,13 @@
 # Architecture invariants
 
-Status: initial design contract. These invariants describe the intended behavior;
-they are not a claim that the current implementation satisfies them.
+Status: implemented by the goal-memory-and-limits feature. Invariants 1–6 are
+enforced in code and covered by maintained regressions in `test/*.test.ts`
+(run with typecheck via `npm test`); findings F01–F09 from
+[qa-architecture.md](qa-architecture.md) carry current dispositions. The
+implementation choices below (20/200 allowances, 8 KiB memory) are provisional
+constants, and the recorded host limitations in qa-architecture.md bound what is
+claimed: admission is a schedule-side fallback, and end-to-end behavior in a
+live agent loop is not behaviorally verified.
 
 `pi-codex-multi-goal` is a small goal controller for Pi. It keeps an objective
 moving, stops unproductive execution, and optionally advances through an ordered
@@ -152,18 +158,41 @@ runtime tests, including controlled model responses:
 - Completing a step clears its working memory before the next step runs. Stale
   updates and old transcripts cannot repopulate it; explicit handoffs remain small.
 
-## Initial implementation gaps and decisions
+## Implementation status and decisions
 
-The current code counts full context windows without successful
-`edit`/`write`/`apply_patch` calls, resets that counter on session start, requests
-continuation at `agent_end`, and advances steps within the existing session.
-Those mechanisms do not yet establish the turn bound, useful-progress semantics,
-review cadence, or context isolation required above. The current stage model has
-titles and statuses, but no separate human-defined success criteria or persisted
-step working memory.
+Implemented in the goal-memory-and-limits feature, replacing the earlier
+compaction/mutation counting described at design time:
 
-Before implementation, choose the default turn limit, the smallest reliable
-progress-evidence rule, the context-boundary trigger, a small memory size limit,
-and Pi's mechanism for starting an isolated step context. Keep these choices
-explicit; avoid a general semantic scoring system or a second scheduler to
-implement them.
+- **State (invariants 2, 5, 6):** validated v2 custom entries with per-stage
+  stable IDs, human-authored criteria, one current-step memory record
+  (`proved`/`unresolved`/`next`, revision-bound, 8 KiB UTF-8 JSON cap), a finite
+  execution grant (`generation`, no-progress/total remaining, lifetime totals,
+  credited-evidence dedupe keys), `pauseReason`, and an isolation cutoff. v1
+  snapshots migrate paused with titles and completed statuses preserved; no
+  criteria are ever invented.
+- **Human setup (invariant 6):** `/goal` collects criteria with an explicit
+  contract confirm (blank means "objective as sole criterion", still confirmed);
+  `/goal-multi` collects per-step criteria behind one sequence confirm; headless
+  starts only from the documented JSON contract. The undocumented ` || `
+  splitting is retired.
+- **Accounting (invariant 1):** request-based, durable, charged once at provider
+  entry; no unlimited settings; verified evidence — validated on the same path
+  as completion — resets only the no-progress streak, once per novel ref.
+  Explicit resume grants a fresh bounded no-progress streak; totals never
+  refill.
+- **Continuation (invariants 3, 4):** queued / delivered /
+  eligible-for-next-boundary with delivery acknowledgement; one kickoff, zero
+  per-turn reminders, one snapshot per eligible boundary; peer-owned sessions
+  are neither charged nor advanced and never aborted.
+- **Transitions (invariant 5):** terminal tools bound to goal/step/generation,
+  idempotent under replay; completion requires criterion coverage from valid
+  evidence (human-decision criteria block); accepted completion persists, drops
+  pre-cutoff messages via the host `context` filter, clears old memory, and
+  admits exactly one stage-advance kickoff — or, if isolation is unavailable,
+  withholds the kickoff paused instead of running the next step in the old
+  transcript.
+
+Explicit provisional choices: 20 no-progress / 200 total requests per grant,
+8 KiB memory record, validated in fixtures before being treated as product
+numbers; bytes are not tokens. Recovery reads the selected session branch and
+never silently resumes or refills.

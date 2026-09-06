@@ -12,7 +12,8 @@
     "extensions": ["./index.ts"]
   },
   "scripts": {
-    "test": "npx tsx --test test/*.test.ts"
+    "test": "tsc --noEmit && npx tsx --test test/*.test.ts",
+    "typecheck": "tsc --noEmit"
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",

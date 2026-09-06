@@ -1,4 +1,4 @@
-import { cpSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, symlinkSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, symlinkSync, writeFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -14,7 +14,13 @@ const pi = resolve(piArg);
 const toolchain = resolve(toolchainArg);
 const project = dirname(dirname(fileURLToPath(import.meta.url)));
 const sandbox = mkdtempSync(join(tmpdir(), "multi-goal-qa-run-"));
-for (const path of ["src", "test", "qa/runtime.test.ts", "index.ts", "package.json", "tsconfig.json"]) {
+// Copy README and qa/evidence too: the maintained tests read them (the JSON
+// contract in the README; the recorded host-capability probes).
+const hostProbe = "qa/host-capabilities.test.ts";
+const copyPaths = ["src", "test", "qa/runtime.test.ts", "README.md", "qa/evidence",
+  ...(existsSync(join(project, hostProbe)) ? [hostProbe] : []),
+  "index.ts", "package.json", "tsconfig.json"];
+for (const path of copyPaths) {
   mkdirSync(dirname(join(sandbox, path)), { recursive: true });
   cpSync(join(project, path), join(sandbox, path), { recursive: true });
 }
@@ -39,6 +45,9 @@ writeFileSync(join(evidence, "source-sha256.txt"), auditedFiles.map(path =>
 ).join("\n") + "\n");
 let failed = false;
 for (const [name, args] of [
+  // Refresh the capability evidence first so the baseline run reads the
+  // probes recorded against this exact peer.
+  ...(existsSync(join(sandbox, hostProbe)) ? [["host-capabilities", [join(toolchain, "tsx/dist/cli.mjs"), "--test", hostProbe]]] : []),
   ["baseline", [join(toolchain, "tsx/dist/cli.mjs"), "--test",
     ...readdirSync(join(sandbox, "test")).filter(name => name.endsWith(".test.ts")).map(name => `test/${name}`)]],
   ["runtime", [join(toolchain, "tsx/dist/cli.mjs"), "--test", "qa/runtime.test.ts"]],
@@ -49,6 +58,12 @@ for (const [name, args] of [
   writeFileSync(join(evidence, `${name}.txt`), output);
   console.log(`${name}: exit ${result.status}; evidence: ${join(evidence, `${name}.txt`)}`);
   failed ||= result.status !== 0;
+}
+// The probe test writes its evidence inside the sandbox (relative to its own
+// path); copy the fresh record back into the project's qa/evidence.
+const sandboxProbeEvidence = join(sandbox, "qa/evidence/host-capabilities.txt");
+if (existsSync(sandboxProbeEvidence)) {
+  cpSync(sandboxProbeEvidence, join(evidence, "host-capabilities.txt"));
 }
 console.log(`Isolated source/dependency snapshot retained at ${sandbox}`);
 process.exitCode = failed ? 1 : 0;

@@ -1,14 +1,62 @@
 import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 
-import { formatStagePreview, parseStepCount } from "./parse.js";
-import { MAX_STAGES, MIN_WIZARD_STAGES } from "./types.js";
+import { formatStepsPreview, parseStepCount } from "./parse.js";
+import { MAX_STAGES, MIN_WIZARD_STAGES, type GoalStep } from "./types.js";
 
 export type WizardUi = Pick<ExtensionCommandContext["ui"], "input" | "confirm" | "notify">;
 
-export async function collectMultiGoalTitles(
+async function promptStepObjective(
+  ui: WizardUi,
+  index: number,
+  count: number,
+): Promise<string | undefined> {
+  while (true) {
+    const raw = await ui.input(`Step ${index + 1}/${count} objective:`, "");
+    if (raw === undefined) {
+      return undefined;
+    }
+    const objective = raw.trim();
+    if (objective.length === 0) {
+      ui.notify("Step objective must not be empty.", "warning");
+      continue;
+    }
+    return objective;
+  }
+}
+
+async function promptStepCriteria(
+  ui: WizardUi,
+  index: number,
+  count: number,
+): Promise<string[] | undefined> {
+  const criteria: string[] = [];
+  while (true) {
+    const raw = await ui.input(
+      criteria.length === 0
+        ? `Step ${index + 1}/${count} success criteria (one per entry; required):`
+        : `Step ${index + 1}/${count}: another criterion (blank to finish):`,
+      "",
+    );
+    if (raw === undefined) {
+      return undefined;
+    }
+    const criterion = raw.trim();
+    if (criterion.length === 0) {
+      if (criteria.length > 0) {
+        return criteria;
+      }
+      ui.notify("Enter at least one criterion for this step.", "warning");
+      continue;
+    }
+    criteria.push(criterion);
+  }
+}
+
+/** Collects a nonempty criteria list per step; starts only after one sequence confirm. */
+export async function collectMultiGoalSteps(
   ui: WizardUi,
   options: { hasUI: boolean },
-): Promise<{ ok: true; titles: string[] } | { ok: false; message: string }> {
+): Promise<{ ok: true; steps: GoalStep[] } | { ok: false; message: string }> {
   if (!options.hasUI) {
     return { ok: false, message: "/goal-multi needs the TUI. Run it interactively." };
   }
@@ -30,27 +78,22 @@ export async function collectMultiGoalTitles(
     count = parsed.count;
   }
 
-  const titles: string[] = [];
+  const steps: GoalStep[] = [];
   for (let i = 0; i < count; i++) {
-    while (true) {
-      const raw = await ui.input(`Step ${i + 1}/${count}:`, "");
-      if (raw === undefined) {
-        return { ok: false, message: "Multi-goal cancelled." };
-      }
-      const title = raw.trim();
-      if (title.length === 0) {
-        ui.notify("Step title must not be empty.", "warning");
-        continue;
-      }
-      titles.push(title);
-      break;
+    const objective = await promptStepObjective(ui, i, count);
+    if (objective === undefined) {
+      return { ok: false, message: "Multi-goal cancelled." };
     }
+    const criteria = await promptStepCriteria(ui, i, count);
+    if (criteria === undefined) {
+      return { ok: false, message: "Multi-goal cancelled." };
+    }
+    steps.push({ objective, criteria });
   }
 
-  const preview = formatStagePreview(titles);
-  const accepted = await ui.confirm("Start this multi-goal?", preview);
+  const accepted = await ui.confirm("Start this multi-goal?", formatStepsPreview(steps));
   if (!accepted) {
     return { ok: false, message: "Multi-goal rejected." };
   }
-  return { ok: true, titles };
+  return { ok: true, steps };
 }
