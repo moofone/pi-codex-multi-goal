@@ -26,15 +26,29 @@ export function createPersistence(deps: PersistenceDeps = {}) {
     if (lastPersisted && goalsEquivalent(goal, lastPersisted)) {
       return false;
     }
-    deps.pi?.appendEntry(CUSTOM_ENTRY_TYPE, setEntry(goal, source));
-    lastPersisted = cloneGoal(goal);
+    const pending = goal;
+    try {
+      deps.pi?.appendEntry(CUSTOM_ENTRY_TYPE, setEntry(pending, source));
+    } catch {
+      // Persistence failed: retain the last committed snapshot and report
+      // failure. The uncommitted in-memory snapshot is discarded.
+      goal = lastPersisted ? cloneGoal(lastPersisted) : null;
+      return false;
+    }
+    lastPersisted = cloneGoal(pending);
     return true;
   };
 
-  const appendClear = (clearedGoalId: string | null, source: GoalEntrySource): void => {
-    deps.pi?.appendEntry(CUSTOM_ENTRY_TYPE, clearEntry(clearedGoalId, source));
+  const appendClear = (clearedGoalId: string | null, source: GoalEntrySource): boolean => {
+    try {
+      deps.pi?.appendEntry(CUSTOM_ENTRY_TYPE, clearEntry(clearedGoalId, source));
+    } catch {
+      // Persistence failed: keep the current committed state and report failure.
+      return false;
+    }
     goal = null;
     lastPersisted = null;
+    return true;
   };
 
   return { appendClear, flush, getGoal, setGoalSnapshot, syncPersistedSnapshot };
