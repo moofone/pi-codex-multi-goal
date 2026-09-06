@@ -1,0 +1,251 @@
+✖ QA-01: repeated goal turns pause without compaction (3.412583ms)
+✖ QA-02: delivered kickoff permits a later boundary continuation (0.981625ms)
+✔ control: deferred kickoff is delivered once when orchestrate releases ownership (1.372916ms)
+✖ QA-04: repeated completion ID cannot finish the next step (1.0475ms)
+✖ QA-05: completion does not expose the next objective in the old tool result (0.882375ms)
+✖ QA-06: pause withdraws already submitted goal follow-up (0.875584ms)
+✖ QA-07: pause stops goal execution (0.804375ms)
+✖ QA-08: reload preserves partially consumed stall allowance (1.302208ms)
+✖ QA-09: orchestrate compactions do not spend the goal allowance (1.319292ms)
+✖ QA-10: orchestrate ownership prevents goal step transitions (1.270333ms)
+✖ QA-11: status uses the Pi key/text signature (0.992125ms)
+✖ QA-12: session-tree reconstruction follows the selected branch (0.97075ms)
+✖ QA-13: orchestrate writes do not reset the goal stall streak (1.26575ms)
+✖ QA-14: next-step model context excludes previous-step transcript (2.058041ms)
+✔ control: normal completion advances exactly one step (0.759ms)
+✔ control: five sterile compactions pause without reload (0.946458ms)
+ℹ tests 16
+ℹ suites 0
+ℹ pass 3
+ℹ fail 13
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 495.063666
+
+✖ failing tests:
+
+test at qa/runtime.test.ts:3:159
+✖ QA-01: repeated goal turns pause without compaction (3.412583ms)
+  AssertionError [ERR_ASSERTION]: 100 no-progress turns must not remain active
+  
+  'active' !== 'paused'
+  
+      at TestContext.<anonymous> (/private/var/folders/d_/yhb_23jn541gkzgzcm__0pmc0000gn/T/multi-goal-qa-run-Z86wfV/qa/runtime.test.ts:89:10)
+      at async Test.run (node:internal/test_runner/test:1113:7)
+      at async startSubtestAfterBootstrap (node:internal/test_runner/harness:358:3) {
+    generatedMessage: false,
+    code: 'ERR_ASSERTION',
+    actual: 'active',
+    expected: 'paused',
+    operator: 'strictEqual',
+    diff: 'simple'
+  }
+
+test at qa/runtime.test.ts:3:618
+✖ QA-02: delivered kickoff permits a later boundary continuation (0.981625ms)
+  AssertionError [ERR_ASSERTION]: Expected values to be strictly equal:
+  
+  1 !== 2
+  
+      at TestContext.<anonymous> (/private/var/folders/d_/yhb_23jn541gkzgzcm__0pmc0000gn/T/multi-goal-qa-run-Z86wfV/qa/runtime.test.ts:95:10)
+      at async Test.run (node:internal/test_runner/test:1113:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:788:7) {
+    generatedMessage: true,
+    code: 'ERR_ASSERTION',
+    actual: 1,
+    expected: 2,
+    operator: 'strictEqual',
+    diff: 'simple'
+  }
+
+test at qa/runtime.test.ts:3:1169
+✖ QA-04: repeated completion ID cannot finish the next step (1.0475ms)
+  AssertionError [ERR_ASSERTION]: Expected values to be strictly equal:
+  
+  2 !== 1
+  
+      at TestContext.<anonymous> (/private/var/folders/d_/yhb_23jn541gkzgzcm__0pmc0000gn/T/multi-goal-qa-run-Z86wfV/qa/runtime.test.ts:109:10)
+      at async Test.run (node:internal/test_runner/test:1113:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:788:7) {
+    generatedMessage: true,
+    code: 'ERR_ASSERTION',
+    actual: 2,
+    expected: 1,
+    operator: 'strictEqual',
+    diff: 'simple'
+  }
+
+test at qa/runtime.test.ts:3:1385
+✖ QA-05: completion does not expose the next objective in the old tool result (0.882375ms)
+  AssertionError [ERR_ASSERTION]: Expected values to be strictly equal:
+  
+  true !== false
+  
+      at TestContext.<anonymous> (/private/var/folders/d_/yhb_23jn541gkzgzcm__0pmc0000gn/T/multi-goal-qa-run-Z86wfV/qa/runtime.test.ts:115:10)
+      at async Test.run (node:internal/test_runner/test:1113:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:788:7) {
+    generatedMessage: true,
+    code: 'ERR_ASSERTION',
+    actual: true,
+    expected: false,
+    operator: 'strictEqual',
+    diff: 'simple'
+  }
+
+test at qa/runtime.test.ts:3:1649
+✖ QA-06: pause withdraws already submitted goal follow-up (0.875584ms)
+  AssertionError [ERR_ASSERTION]: Expected values to be strictly equal:
+  
+  1 !== 0
+  
+      at TestContext.<anonymous> (/private/var/folders/d_/yhb_23jn541gkzgzcm__0pmc0000gn/T/multi-goal-qa-run-Z86wfV/qa/runtime.test.ts:122:10)
+      at async Test.run (node:internal/test_runner/test:1113:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:788:7) {
+    generatedMessage: true,
+    code: 'ERR_ASSERTION',
+    actual: 1,
+    expected: 0,
+    operator: 'strictEqual',
+    diff: 'simple'
+  }
+
+test at qa/runtime.test.ts:3:1906
+✖ QA-07: pause stops goal execution (0.804375ms)
+  AssertionError [ERR_ASSERTION]: Expected values to be strictly equal:
+  
+  0 !== 1
+  
+      at TestContext.<anonymous> (/private/var/folders/d_/yhb_23jn541gkzgzcm__0pmc0000gn/T/multi-goal-qa-run-Z86wfV/qa/runtime.test.ts:128:10)
+      at async Test.run (node:internal/test_runner/test:1113:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:788:7) {
+    generatedMessage: true,
+    code: 'ERR_ASSERTION',
+    actual: 0,
+    expected: 1,
+    operator: 'strictEqual',
+    diff: 'simple'
+  }
+
+test at qa/runtime.test.ts:3:2129
+✖ QA-08: reload preserves partially consumed stall allowance (1.302208ms)
+  AssertionError [ERR_ASSERTION]: Expected values to be strictly equal:
+  
+  'active' !== 'paused'
+  
+      at TestContext.<anonymous> (/private/var/folders/d_/yhb_23jn541gkzgzcm__0pmc0000gn/T/multi-goal-qa-run-Z86wfV/qa/runtime.test.ts:135:29)
+      at async Test.run (node:internal/test_runner/test:1113:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:788:7) {
+    generatedMessage: true,
+    code: 'ERR_ASSERTION',
+    actual: 'active',
+    expected: 'paused',
+    operator: 'strictEqual',
+    diff: 'simple'
+  }
+
+test at qa/runtime.test.ts:3:2462
+✖ QA-09: orchestrate compactions do not spend the goal allowance (1.319292ms)
+  AssertionError [ERR_ASSERTION]: Expected values to be strictly equal:
+  
+  'paused' !== 'active'
+  
+      at TestContext.<anonymous> (/private/var/folders/d_/yhb_23jn541gkzgzcm__0pmc0000gn/T/multi-goal-qa-run-Z86wfV/qa/runtime.test.ts:141:10)
+      at async Test.run (node:internal/test_runner/test:1113:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:788:7) {
+    generatedMessage: true,
+    code: 'ERR_ASSERTION',
+    actual: 'paused',
+    expected: 'active',
+    operator: 'strictEqual',
+    diff: 'simple'
+  }
+
+test at qa/runtime.test.ts:3:2695
+✖ QA-10: orchestrate ownership prevents goal step transitions (1.270333ms)
+  AssertionError [ERR_ASSERTION]: Expected values to be strictly equal:
+  
+  1 !== 0
+  
+      at TestContext.<anonymous> (/private/var/folders/d_/yhb_23jn541gkzgzcm__0pmc0000gn/T/multi-goal-qa-run-Z86wfV/qa/runtime.test.ts:147:10)
+      at async Test.run (node:internal/test_runner/test:1113:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:788:7) {
+    generatedMessage: true,
+    code: 'ERR_ASSERTION',
+    actual: 1,
+    expected: 0,
+    operator: 'strictEqual',
+    diff: 'simple'
+  }
+
+test at qa/runtime.test.ts:3:2909
+✖ QA-11: status uses the Pi key/text signature (0.992125ms)
+  AssertionError [ERR_ASSERTION]: Expected values to be strictly deep-equal:
+  + actual - expected
+  
+    [
+  -   'pi-codex-multi-goal',
+      'Pursuing 1/3'
+    ]
+  
+      at TestContext.<anonymous> (/private/var/folders/d_/yhb_23jn541gkzgzcm__0pmc0000gn/T/multi-goal-qa-run-Z86wfV/qa/runtime.test.ts:152:10)
+      at async Test.run (node:internal/test_runner/test:1113:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:788:7) {
+    generatedMessage: true,
+    code: 'ERR_ASSERTION',
+    actual: [ 'Pursuing 1/3' ],
+    expected: [ 'pi-codex-multi-goal', 'Pursuing 1/3' ],
+    operator: 'deepStrictEqual',
+    diff: 'simple'
+  }
+
+test at qa/runtime.test.ts:3:3093
+✖ QA-12: session-tree reconstruction follows the selected branch (0.97075ms)
+  AssertionError [ERR_ASSERTION]: Expected values to be strictly equal:
+  
+  2 !== 1
+  
+      at TestContext.<anonymous> (/private/var/folders/d_/yhb_23jn541gkzgzcm__0pmc0000gn/T/multi-goal-qa-run-Z86wfV/qa/runtime.test.ts:160:49)
+      at async Test.run (node:internal/test_runner/test:1113:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:788:7) {
+    generatedMessage: true,
+    code: 'ERR_ASSERTION',
+    actual: 2,
+    expected: 1,
+    operator: 'strictEqual',
+    diff: 'simple'
+  }
+
+test at qa/runtime.test.ts:3:3426
+✖ QA-13: orchestrate writes do not reset the goal stall streak (1.26575ms)
+  AssertionError [ERR_ASSERTION]: Expected values to be strictly equal:
+  
+  'active' !== 'paused'
+  
+      at TestContext.<anonymous> (/private/var/folders/d_/yhb_23jn541gkzgzcm__0pmc0000gn/T/multi-goal-qa-run-Z86wfV/qa/runtime.test.ts:167:44)
+      at async Test.run (node:internal/test_runner/test:1113:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:788:7) {
+    generatedMessage: true,
+    code: 'ERR_ASSERTION',
+    actual: 'active',
+    expected: 'paused',
+    operator: 'strictEqual',
+    diff: 'simple'
+  }
+
+test at qa/runtime.test.ts:3:3775
+✖ QA-14: next-step model context excludes previous-step transcript (2.058041ms)
+  AssertionError [ERR_ASSERTION]: Expected values to be strictly equal:
+  
+  true !== false
+  
+      at TestContext.<anonymous> (/private/var/folders/d_/yhb_23jn541gkzgzcm__0pmc0000gn/T/multi-goal-qa-run-Z86wfV/qa/runtime.test.ts:179:10)
+      at async Test.run (node:internal/test_runner/test:1113:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:788:7) {
+    generatedMessage: true,
+    code: 'ERR_ASSERTION',
+    actual: true,
+    expected: false,
+    operator: 'strictEqual',
+    diff: 'simple'
+  }

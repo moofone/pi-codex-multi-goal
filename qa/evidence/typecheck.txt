@@ -1,0 +1,34 @@
+src/runtime.ts(75,15): error TS2345: Argument of type 'ExtensionContext' is not assignable to parameter of type '{ ui: { setStatus?: ((status?: string | undefined) => void) | undefined; }; } & Partial<ExtensionContext>'.
+  Type 'ExtensionContext' is not assignable to type '{ ui: { setStatus?: ((status?: string | undefined) => void) | undefined; }; }'.
+    The types of 'ui.setStatus' are incompatible between these types.
+      Type '(key: string, text: string | undefined) => void' is not assignable to type '(status?: string | undefined) => void'.
+        Target signature provides too few arguments. Expected 2 or more, but got 1.
+src/runtime.ts(92,13): error TS2345: Argument of type 'ExtensionContext' is not assignable to parameter of type '{ ui: { setStatus?: ((status?: string | undefined) => void) | undefined; }; } & Partial<ExtensionContext>'.
+  Type 'ExtensionContext' is not assignable to type '{ ui: { setStatus?: ((status?: string | undefined) => void) | undefined; }; }'.
+    The types of 'ui.setStatus' are incompatible between these types.
+      Type '(key: string, text: string | undefined) => void' is not assignable to type '(status?: string | undefined) => void'.
+        Target signature provides too few arguments. Expected 2 or more, but got 1.
+src/runtime.ts(142,13): error TS2345: Argument of type 'ExtensionContext' is not assignable to parameter of type '{ ui: { setStatus?: ((status?: string | undefined) => void) | undefined; }; } & Partial<ExtensionContext>'.
+  Type 'ExtensionContext' is not assignable to type '{ ui: { setStatus?: ((status?: string | undefined) => void) | undefined; }; }'.
+    The types of 'ui.setStatus' are incompatible between these types.
+      Type '(key: string, text: string | undefined) => void' is not assignable to type '(status?: string | undefined) => void'.
+        Target signature provides too few arguments. Expected 2 or more, but got 1.
+src/runtime.ts(153,13): error TS2345: Argument of type 'ExtensionContext' is not assignable to parameter of type '{ ui: { setStatus?: ((status?: string | undefined) => void) | undefined; }; } & Partial<ExtensionContext>'.
+  Type 'ExtensionContext' is not assignable to type '{ ui: { setStatus?: ((status?: string | undefined) => void) | undefined; }; }'.
+    The types of 'ui.setStatus' are incompatible between these types.
+      Type '(key: string, text: string | undefined) => void' is not assignable to type '(status?: string | undefined) => void'.
+        Target signature provides too few arguments. Expected 2 or more, but got 1.
+src/runtime.ts(183,13): error TS2345: Argument of type 'ExtensionContext' is not assignable to parameter of type '{ ui: { setStatus?: ((status?: string | undefined) => void) | undefined; }; } & Partial<ExtensionContext>'.
+  Type 'ExtensionContext' is not assignable to type '{ ui: { setStatus?: ((status?: string | undefined) => void) | undefined; }; }'.
+    The types of 'ui.setStatus' are incompatible between these types.
+      Type '(key: string, text: string | undefined) => void' is not assignable to type '(status?: string | undefined) => void'.
+        Target signature provides too few arguments. Expected 2 or more, but got 1.
+test/parse.test.ts(4,34): error TS5097: An import path can only end with a '.ts' extension when 'allowImportingTsExtensions' is enabled.
+test/prompts.test.ts(4,53): error TS5097: An import path can only end with a '.ts' extension when 'allowImportingTsExtensions' is enabled.
+test/prompts.test.ts(5,50): error TS5097: An import path can only end with a '.ts' extension when 'allowImportingTsExtensions' is enabled.
+test/stall.test.ts(9,8): error TS5097: An import path can only end with a '.ts' extension when 'allowImportingTsExtensions' is enabled.
+test/stall.test.ts(10,31): error TS5097: An import path can only end with a '.ts' extension when 'allowImportingTsExtensions' is enabled.
+test/state.test.ts(4,78): error TS5097: An import path can only end with a '.ts' extension when 'allowImportingTsExtensions' is enabled.
+test/wizard.test.ts(4,52): error TS5097: An import path can only end with a '.ts' extension when 'allowImportingTsExtensions' is enabled.
+test/wizard.test.ts(5,40): error TS5097: An import path can only end with a '.ts' extension when 'allowImportingTsExtensions' is enabled.
+test/yield.test.ts(7,76): error TS5097: An import path can only end with a '.ts' extension when 'allowImportingTsExtensions' is enabled.

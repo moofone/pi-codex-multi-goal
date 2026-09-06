@@ -1,0 +1,69 @@
+# Dependencies
+node_modules/
+
+# Secrets and credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt
+id_rsa
+id_rsa.*
+id_ed25519
+id_ed25519.*
+credentials.json
+secrets.json
+*.secret
+auth.json
+.npmrc
+.pypirc
+*.token
+
+# Local / machine-specific config
+*.local
+*.local.*
+*.local.json
+config.local.yaml
+.pi/
+.claude/
+.codex/
+
+# OS
+.DS_Store
+.DS_Store?
+._*
+Thumbs.db
+Desktop.ini
+
+# Editors
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Logs, coverage, build
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+coverage/
+.nyc_output/
+dist/
+build/
+*.tsbuildinfo
+
+# Test / tool caches
+.cache/
+.turbo/
+.eslintcache
+
+# Temp
+tmp/
+temp/
+*.tmp

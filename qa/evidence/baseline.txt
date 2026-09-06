@@ -1,0 +1,23 @@
+✔ single stage (0.755709ms)
+✔ splits on space-pipe-pipe-space only (0.09025ms)
+✔ rejects empty and oversized lists (0.081291ms)
+✔ wrapper contains only the current stage title (0.756834ms)
+✔ five sterile compactons pause; mutation and advance reset (0.585167ms)
+✔ settings default 5; 0/null disable (0.066417ms)
+✔ complete advances then finishes (0.488041ms)
+✔ block does not advance (0.07375ms)
+✔ replaceGoal parses stages (0.105042ms)
+✔ parseStepCount accepts 2–24 only (0.591792ms)
+✔ formatStagePreview numbers titles (0.05575ms)
+✔ wizard collects titles then accepts (0.145417ms)
+✔ wizard reject and cancel (0.081375ms)
+✔ live phase + matching parent yields; done does not (0.348834ms)
+✔ walks orchestrator root for matching live Feature (0.56ms)
+ℹ tests 15
+ℹ suites 0
+ℹ pass 15
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 107.613291

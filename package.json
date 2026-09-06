@@ -1,0 +1,30 @@
+{
+  "name": "pi-codex-multi-goal",
+  "version": "0.1.0",
+  "description": "Codex-style /goal with harness-owned stages and no context pollution.",
+  "type": "module",
+  "license": "MIT",
+  "main": "./index.ts",
+  "exports": "./index.ts",
+  "files": ["index.ts", "src", "README.md"],
+  "keywords": ["pi-package", "pi-extension", "goal", "codex"],
+  "pi": {
+    "extensions": ["./index.ts"]
+  },
+  "scripts": {
+    "test": "npx tsx --test test/*.test.ts"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  },
+  "peerDependenciesMeta": {
+    "@earendil-works/pi-ai": { "optional": true },
+    "@earendil-works/pi-coding-agent": { "optional": true },
+    "typebox": { "optional": true }
+  },
+  "engines": {
+    "node": ">=22.19.0"
+  }
+}
