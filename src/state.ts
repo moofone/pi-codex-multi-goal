@@ -267,6 +267,25 @@ export function setGoalStatus(
   if (status === "blocked" && current.status !== "active") {
     return { ok: false, message: `Goal is ${current.status}.`, goal: current };
   }
+  // A01/A10: a goal whose runnable stages lack accepted criteria — e.g. a
+  // migrated v1 snapshot — can never be activated. It stays paused awaiting
+  // criteria confirmation; /goal and /goal-multi start a fresh goal identity
+  // with human-confirmed criteria instead.
+  if (status === "active") {
+    const runnableStagesHaveCriteria = current.stages.every(
+      (stage) =>
+        (stage.status !== "pending" && stage.status !== "active") || stage.criteria.length > 0,
+    );
+    if (!runnableStagesHaveCriteria) {
+      return {
+        ok: false,
+        message:
+          current.pauseReason ??
+          "Cannot resume: a runnable stage has no accepted criteria. Confirm criteria to resume via /goal or /goal-multi; the goal stays paused.",
+        goal: current,
+      };
+    }
+  }
 
   const next = cloneGoal(current);
   next.status = status;

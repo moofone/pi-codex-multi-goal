@@ -17,6 +17,8 @@ import { CUSTOM_ENTRY_TYPE } from "../src/types.ts";
 interface HarnessOptions {
   entries: unknown[];
   branch: unknown[];
+  /** Default true; headless JSON-contract tests set false. */
+  hasUI?: boolean;
 }
 
 function harness(t: any, options: HarnessOptions) {
@@ -41,7 +43,7 @@ function harness(t: any, options: HarnessOptions) {
   let lastNotified: string | null = null;
   let appendBroken = false;
   const ctx: any = {
-    hasUI: true,
+    hasUI: options.hasUI ?? true,
     isIdle: () => true,
     hasPendingMessages: () => false,
     abort: () => {},
@@ -260,4 +262,66 @@ test("persist failure admits no goal work and notifies", async t => {
   }
   assert.equal(h.appendedGoal()?.index, 0, "goal work stays disabled while persistence is broken");
   void acknowledged;
+});
+
+test("v1 restore resume without criteria stays paused", async t => {
+  // A v1 unfinished snapshot migrates to paused with empty criteria (A10);
+  // humans confirm criteria through /goal or /goal-multi, which starts a new
+  // goal identity. /goal resume must never activate the criteria-less goal.
+  const v1Entry = {
+    type: "custom",
+    customType: CUSTOM_ENTRY_TYPE,
+    data: {
+      version: 1,
+      kind: "set",
+      source: "command",
+      at: 5,
+      goal: {
+        goalId: "v1-unfinished",
+        status: "active",
+        index: 0,
+        createdAt: 1,
+        updatedAt: 2,
+        stages: [{ title: "stage one", status: "active" }],
+      },
+    },
+  };
+  const h = harness(t, { entries: [v1Entry], branch: [v1Entry], hasUI: false });
+
+  await h.emit("session_start");
+  assert.match(h.goalStatus(), /Status: paused/, "the migrated v1 goal is paused");
+  assert.match(h.goalStatus(), /confirm criteria/i, "the pause reason names criteria confirmation");
+  assert.equal(h.sent.length, 0, "restore itself schedules nothing");
+
+  const sentBefore = h.sent.length;
+  await h.command("resume");
+
+  // Refused: the goal stays paused with the criteria-confirmation reason, no
+  // continuation is scheduled, and nothing is persisted (A01, A10).
+  const status = h.goalStatus();
+  assert.match(status, /Status: paused/, "resume must not activate a goal without accepted criteria");
+  assert.match(status, /confirm criteria/i, "the pause reason still names criteria confirmation");
+  assert.match(status, /Criteria: \(awaiting confirmation\)/, "criteria stay unaccepted");
+  assert.equal(h.sent.length, sentBefore, "a refused resume must not schedule a continuation");
+  assert.equal(h.appendedGoal(), v1Entry.data.goal, "a refused resume persists no new snapshot");
+  assert.ok(
+    h.notifications.some(([text]) => typeof text === "string" && /criteria/i.test(text)),
+    "the refusal names criteria confirmation to the user",
+  );
+
+  // A valid JSON contract can replace the criteria-less goal and start it.
+  await h.command(
+    JSON.stringify({ objective: "confirmed objective", criteria: ["confirmed criterion"] }),
+  );
+  const replaced = h.appendedGoal();
+  assert.ok(replaced);
+  assert.equal(replaced.status, "active", "the confirmed contract starts a new active goal");
+  assert.notEqual(replaced.goalId, "v1-unfinished", "the replacement is a new goal identity");
+  assert.deepEqual(
+    replaced.stages.map((stage: any) => stage.criteria.map((criterion: any) => criterion.text)),
+    [["confirmed criterion"]],
+    "the new goal carries the confirmed criteria, none fabricated",
+  );
+  assert.equal(h.sent.length, sentBefore + 1, "the replacement kickoff is scheduled");
+  assert.match(h.goalStatus(), /Status: active/);
 });
