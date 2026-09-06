@@ -19,7 +19,7 @@ import {
   unixSeconds,
 } from "./state.js";
 import { registerGoalTools } from "./tools.js";
-import type { GoalContinuationKind, GoalEntrySource, MultiGoal } from "./types.js";
+import type { GoalContinuationKind, GoalEntrySource, GoalResult, MultiGoal } from "./types.js";
 import { CUSTOM_ENTRY_TYPE } from "./types.js";
 import { sessionOwnsLiveOrchestrateFeature, type SessionIdentity } from "./yield.js";
 
@@ -51,14 +51,15 @@ const RESTORE_PAUSE_REASON =
 const PERSIST_FAILURE_NOTICE =
   "Goal persistence failed: the session log rejected the write, so goal execution is disabled until an entry can be saved.";
 
+// F07: the same ownership decision that gates scheduling and accounting gates
+// the model-facing terminal tools.
+const ORCHESTRATE_TRANSITION_REFUSAL =
+  "pi-orchestrate owns this session: goal stage transitions are paused until it hands back control.";
+
 export function registerMultiGoal(pi: ExtensionAPI): void {
   const settings = loadSettings();
   const persistence = createPersistence({ pi });
   let persistenceBroken = false;
-  // Set when a step advances without user re-involvement: the trailing
-  // agent_end of the completing turn must not kick off the next step.
-  // Automatic multi-step stays disabled.
-  let suppressNextContinuation = false;
 
   const trackPersistence = (ctx: ExtensionContext | null): void => {
     if (persistence.lastWriteFailed()) {
@@ -116,13 +117,27 @@ export function registerMultiGoal(pi: ExtensionAPI): void {
     }
   };
 
-  const setGoal = (goal: MultiGoal, source: GoalEntrySource, ctx: ExtensionContext): void => {
+  // F02/A05: pause, clear, block, and replacement invalidate future goal work
+  // and withdraw what was already submitted — but only provably goal-owned
+  // work. continuation.outstanding() is true exactly when a queued goal
+  // continuation (with no user message in front of it) or a goal-owned
+  // in-flight loop exists, so the process-global abort (probe 2) can never
+  // cancel peer or user work. One abort drains both the queued follow-up and
+  // the in-flight loop; it is never called twice for one withdraw.
+  const withdrawGoalWork = (ctx: ExtensionContext): void => {
+    if (continuation.outstanding()) {
+      ctx.abort();
+    }
     continuation.clear();
+  };
+
+  const setGoal = (goal: MultiGoal, source: GoalEntrySource, ctx: ExtensionContext): void => {
+    withdrawGoalWork(ctx);
     persist(goal, source, ctx);
   };
 
   const clearGoal = (source: GoalEntrySource, ctx: ExtensionContext): void => {
-    continuation.clear();
+    withdrawGoalWork(ctx);
     const id = persistence.getGoal()?.goalId ?? null;
     persistence.appendClear(id, source);
     trackPersistence(ctx);
@@ -131,7 +146,10 @@ export function registerMultiGoal(pi: ExtensionAPI): void {
 
   // Exhaustion pauses goal execution with a visible, persisted reason. The
   // user resume path may grant a fresh bounded no-progress allowance, but the
-  // total budget never refills.
+  // total budget never refills. This is an accounting pause: future scheduling
+  // is invalidated, and the loop already in flight keeps its goal ownership
+  // (a later user withdraw must still recognize it) — no abort is issued here,
+  // so the request that was just charged is not thrown away.
   const pauseForExhaustion = (
     ctx: ExtensionContext,
     goal: MultiGoal,
@@ -145,7 +163,7 @@ export function registerMultiGoal(pi: ExtensionAPI): void {
       return;
     }
     paused.goal.pauseReason = allowancePauseReason(paused.goal.execution, exhaustion);
-    continuation.clear();
+    continuation.clearSchedule();
     persist(paused.goal, "runtime", ctx);
     if (!persistenceBroken) {
       ctx.ui.notify(paused.goal.pauseReason, "warning");
@@ -154,7 +172,11 @@ export function registerMultiGoal(pi: ExtensionAPI): void {
 
   // Persistence failure admits no goal work: no completions, no blocks, and no
   // continuations for state that cannot be committed.
-  const requestContinuation = (ctx: ExtensionContext, kind?: GoalContinuationKind): boolean => {
+  const requestContinuation = (
+    ctx: ExtensionContext,
+    kind?: GoalContinuationKind,
+    options?: { atContextBoundary?: boolean },
+  ): boolean => {
     if (persistenceBroken) {
       return false;
     }
@@ -170,14 +192,16 @@ export function registerMultiGoal(pi: ExtensionAPI): void {
         return false;
       }
     }
-    return continuation.request(ctx, kind);
+    return continuation.request(ctx, kind, options);
   };
 
   // Persisted request accounting at provider entry (probe 1: the hook observes
   // every goal-owned agent-loop request before the provider's retry loop).
   // Charge durably exactly once per request; reloads and retries never refund.
-  // A host-issued request this extension cannot deny is left uncharged rather
-  // than negative — the A04 gap is documented, not claimed solved.
+  // Revalidation at provider admission: ownership (yielding), goal status, and
+  // a non-exhausted allowance — a host-issued request this extension cannot
+  // deny is left uncharged rather than negative — the A04 gap is documented,
+  // not claimed solved.
   const chargeAtProviderEntry = (ctx: ExtensionContext): void => {
     const goal = persistence.getGoal();
     if (!goal || goal.status !== "active" || yielding(ctx) || persistenceBroken) {
@@ -194,7 +218,7 @@ export function registerMultiGoal(pi: ExtensionAPI): void {
     if (outcome.type === "charged-exhausted") {
       next.status = "paused";
       next.pauseReason = allowancePauseReason(next.execution, outcome.exhaustion);
-      continuation.clear();
+      continuation.clearSchedule();
     }
     persist(next, "runtime", ctx);
     if (next.status === "paused" && next.pauseReason && !persistenceBroken) {
@@ -202,7 +226,10 @@ export function registerMultiGoal(pi: ExtensionAPI): void {
     }
   };
 
-  const completeStage = (source: GoalEntrySource, ctx: ExtensionContext) => {
+  const completeStage = (source: GoalEntrySource, ctx: ExtensionContext): GoalResult => {
+    if (yielding(ctx)) {
+      return { ok: false, message: ORCHESTRATE_TRANSITION_REFUSAL, goal: persistence.getGoal() };
+    }
     if (persistenceBroken) {
       return { ok: false, message: PERSIST_FAILURE_NOTICE, goal: persistence.getGoal() };
     }
@@ -210,21 +237,23 @@ export function registerMultiGoal(pi: ExtensionAPI): void {
     if (!result.ok || !result.goal) {
       return result;
     }
-    continuation.clear();
+    // A step advanced: the old step's queued/delivered continuation line is
+    // invalidated, and the loop that reported completion keeps running so its
+    // tool result can land. There is no continuation.request on stage_advance —
+    // automatic multi-step stays disabled, and the next step waits for an
+    // explicit user decision.
+    continuation.clearSchedule();
     persist(result.goal, source, ctx);
     if (persistenceBroken) {
       return { ok: false, message: PERSIST_FAILURE_NOTICE, goal: persistence.getGoal() };
     }
-    if (result.goal.status === "active") {
-      // A step advanced: no continuation.request on stage_advance. The next
-      // step waits for an explicit user decision (automatic multi-step stays
-      // disabled); the trailing agent_end of this turn must not schedule it.
-      suppressNextContinuation = true;
-    }
     return result;
   };
 
-  const blockGoal = (source: GoalEntrySource, ctx: ExtensionContext) => {
+  const blockGoal = (source: GoalEntrySource, ctx: ExtensionContext): GoalResult => {
+    if (yielding(ctx)) {
+      return { ok: false, message: ORCHESTRATE_TRANSITION_REFUSAL, goal: persistence.getGoal() };
+    }
     if (persistenceBroken) {
       return { ok: false, message: PERSIST_FAILURE_NOTICE, goal: persistence.getGoal() };
     }
@@ -232,7 +261,7 @@ export function registerMultiGoal(pi: ExtensionAPI): void {
     if (!result.ok || !result.goal) {
       return result;
     }
-    continuation.clear();
+    withdrawGoalWork(ctx);
     persist(result.goal, source, ctx);
     if (persistenceBroken) {
       return { ok: false, message: PERSIST_FAILURE_NOTICE, goal: persistence.getGoal() };
@@ -256,6 +285,42 @@ export function registerMultiGoal(pi: ExtensionAPI): void {
   };
   registerGoalCommand(pi, commandHost);
   registerGoalMultiCommand(pi, commandHost);
+
+  // Delivery acknowledgement runs on the supported host message events: our
+  // continuation messages arm the next eligible boundary (after revalidation),
+  // user messages take precedence for loop ownership.
+  const classifyDeliveredMessage = (message: unknown, ctx: ExtensionContext): void => {
+    if (!message || typeof message !== "object") {
+      return;
+    }
+    const record = message as { customType?: unknown; role?: unknown };
+    if (record.customType === CUSTOM_ENTRY_TYPE) {
+      continuation.goalMessageDelivered(ctx);
+      return;
+    }
+    if (record.role === "user") {
+      continuation.userMessageDelivered();
+    }
+  };
+
+  pi.on("message_start", (event, ctx) => {
+    classifyDeliveredMessage(event.message, ctx);
+  });
+
+  pi.on("message_end", (event, ctx) => {
+    // Idempotent: only the one queued continuation is acknowledged, once.
+    classifyDeliveredMessage(event.message, ctx);
+  });
+
+  // In-flight goal ownership: the loop (and each turn inside it) is goal-owned
+  // when it was triggered by the delivered goal continuation.
+  pi.on("agent_start", (_event, _ctx) => {
+    continuation.agentLoopStarted();
+  });
+
+  pi.on("turn_start", (_event, _ctx) => {
+    continuation.agentLoopStarted();
+  });
 
   pi.on("session_start", (_event, ctx) => {
     const restored = restoreBranchGoal(ctx);
@@ -292,16 +357,23 @@ export function registerMultiGoal(pi: ExtensionAPI): void {
     persistence.flush("runtime");
     trackPersistence(ctx);
     refresh(ctx);
-    // Recovery after context loss is a goal continuation like any other; the
-    // admission gate and the provider-entry charge apply to it.
-    requestContinuation(ctx);
+    // The one context-boundary snapshot: eligible only after the previous
+    // continuation was delivered, and still gated by ownership, status, and
+    // allowance. Recovery after context loss is a goal continuation like any
+    // other; the provider-entry charge applies to it.
+    requestContinuation(ctx, undefined, { atContextBoundary: true });
   });
 
   pi.on("agent_end", (event, ctx) => {
+    // Ownership of the abort is decided before the loop bookkeeping resets:
+    // only a goal-owned turn's abort invalidates goal execution. A peer or
+    // user turn aborting is not ours to act on (F07).
+    const goalOwnedTurn = continuation.goalTurnInFlight();
+    continuation.agentLoopEnded();
     const aborted = event.messages.some(
       (message) => message.role === "assistant" && "stopReason" in message && message.stopReason === "aborted",
     );
-    if (aborted) {
+    if (aborted && goalOwnedTurn) {
       const goal = persistence.getGoal();
       if (goal?.status === "active") {
         const paused = setGoalStatus(goal, "paused");
@@ -310,18 +382,15 @@ export function registerMultiGoal(pi: ExtensionAPI): void {
           persist(paused.goal, "runtime", ctx);
         }
       }
-      return;
     }
-    if (suppressNextContinuation) {
-      suppressNextContinuation = false;
-      return;
-    }
-    requestContinuation(ctx);
+    // No continuation request on ordinary turn ends: model-facing snapshots
+    // are scheduled at step start and eligible context boundaries only (A06).
   });
 
   pi.on("session_shutdown", (_event, ctx) => {
     persistence.flush("runtime");
     trackPersistence(ctx);
+    // Invalidate future goal work. No abort: the process is going down.
     continuation.clear();
   });
 }
