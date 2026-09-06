@@ -38,10 +38,12 @@ Plain text never starts a goal headless — an agent cannot fabricate criteria.
 /goal { "objective": "pin the duplicate SUBMIT", "criteria": ["duplicate SUBMIT pin documented"] }
 ```
 
-Multi-step goals pass `steps` (every step needs an objective and nonempty criteria):
+Multi-step goals add a nonempty `steps` array to the same contract: the
+object still needs its own top-level `objective` and nonempty `criteria`, and
+every step needs an objective and nonempty criteria too:
 
 ```json
-/goal { "steps": [ { "objective": "pin the duplicate", "criteria": ["lockfile updated"] }, { "objective": "document the pin", "criteria": ["README section merged"] } ] }
+/goal { "objective": "ship the duplicate SUBMIT pin", "criteria": ["duplicate SUBMIT pin documented"], "steps": [ { "objective": "pin the duplicate", "criteria": ["lockfile updated"] }, { "objective": "document the pin", "criteria": ["README section merged"] } ] }
 ```
 
 Missing or empty `criteria` refuse to start. In the TUI, leaving the criteria
