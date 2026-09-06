@@ -21,6 +21,9 @@ import { CUSTOM_ENTRY_TYPE } from "../src/types.ts";
 //     artifact toggles invalid -> valid again;
 //   - a passing check resets ONLY the no-progress streak: totalRemaining and
 //     lifetimeRequests are untouched;
+//   - identical memory content carrying one NOVEL verified evidence ref still
+//     credits exactly once — credit rides the evidence path, not a memory
+//     rewrite, so the unchanged-memory short-circuit must not swallow it;
 //   - memory rewrites, successful tool exits, and bare edit/write/apply_patch
 //     operation names still earn nothing without a verifying evidence ref.
 
@@ -176,6 +179,34 @@ test("verified evidence resets no-progress once", async t => {
     { noProgressRemaining: 17, totalRemaining: 197, lifetimeRequests: 3 },
     "a memory rewrite resets nothing",
   );
+
+  // --- identical memory plus one NOVEL verified evidence ref must still
+  // credit once: the unchanged-memory short-circuit must not skip evidence
+  // validation when evidence is attached (credit is not a memory rewrite).
+  const identicalMemory = {
+    proved: ["proved: mirror configured (artifact: docs/finding.md)"],
+    unresolved: [],
+    next: "verify the mirror",
+  };
+  const revisionAfterFirst = h.identity().revision;
+  const identicalEvidence = h.evidenceRef("qa/identical-note.md", "identical memory, novel evidence\n", "read");
+  const identical = await h.memory({ ...h.identity(), ...identicalMemory, evidence: [identicalEvidence] });
+  assert.equal(identical.ok !== false, true, "identical memory with verified evidence is accepted");
+  assert.equal(h.ack(identical).credited, 1, "novel evidence on identical memory still credits once");
+  assert.equal(h.counters()!.noProgressRemaining, grantLimit, "the credit resets the no-progress streak");
+  assert.equal(h.counters()!.totalRemaining, 197, "the credit never refills the total allowance");
+  assert.equal(h.counters()!.lifetimeRequests, 3, "the credit never touches lifetime requests");
+  assert.equal(h.identity().revision, revisionAfterFirst, "crediting identical memory does not bump the revision");
+
+  // Repeating that same evidence on the same identical memory: no second credit.
+  const repeatIdentical = await h.memory({ ...h.identity(), ...identicalMemory, evidence: [identicalEvidence] });
+  assert.equal(h.ack(repeatIdentical).credited, 0, "the same evidence on identical memory never credits twice");
+  assert.deepEqual(
+    h.counters(),
+    { noProgressRemaining: grantLimit, totalRemaining: 197, lifetimeRequests: 3 },
+    "the repeat neither resets nor refills anything",
+  );
+  assert.equal(h.identity().revision, revisionAfterFirst, "the repeat still does not bump the revision");
 
   // --- coding fixture: one novel verified evidence ref resets the streak once.
   const coding = h.evidenceRef("src/fix.ts", "the duplicate is pinned\n", "edit");

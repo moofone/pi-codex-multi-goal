@@ -488,8 +488,34 @@ export function registerMultiGoal(pi: ExtensionAPI): void {
         next: goal.memory.next,
       });
     if (sameContent) {
-      // Identical replay: already recorded, no revision bump, nothing persisted.
-      return { ok: true, message: "Memory already recorded; nothing changed.", goal };
+      // Identical replay without evidence: already recorded, no revision bump,
+      // nothing persisted.
+      if (input.evidence === undefined) {
+        return { ok: true, message: "Memory already recorded; nothing changed.", goal };
+      }
+      // Identical memory can still carry NOVEL verified evidence (invariant 1):
+      // credit rides the shared evidence-validation path, not a memory rewrite,
+      // so validate the refs and persist only the credit — the memory record
+      // (and its revision) is untouched. An invalid ref rejects the whole
+      // update, keeping the previous record and counters.
+      const evidence = validateEvidenceRefs(goal, input.evidence);
+      if (!evidence.ok) {
+        return { ok: false, message: evidence.message, goal };
+      }
+      const outcome = creditVerifiedEvidence(goal, evidence.refs.map((ref) => ref.key));
+      if (outcome.creditedKeys.length === 0) {
+        return { ok: true, message: "Memory already recorded; nothing changed.", goal, credited: 0 };
+      }
+      persist(outcome.goal, "tool", ctx);
+      if (persistenceBroken) {
+        return { ok: false, message: PERSIST_FAILURE_NOTICE, goal: persistence.getGoal() };
+      }
+      return {
+        ok: true,
+        message: `Memory already recorded; ${outcome.creditedKeys.length} verified evidence ref(s) credited.`,
+        goal: outcome.goal,
+        credited: outcome.creditedKeys.length,
+      };
     }
     if (input.revision !== goal.memory.revision) {
       return {
