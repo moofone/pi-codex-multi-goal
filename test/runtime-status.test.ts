@@ -66,7 +66,10 @@ test("status uses the Pi key/text signature", async t => {
   const h = harness(t);
   await h.emit("session_start");
   assert.ok(h.statuses.length > 0, "session_start must set the footer status");
-  assert.deepEqual(h.statuses.at(-1), [CUSTOM_ENTRY_TYPE, "Pursuing 1/3"]);
+  // Task 4 (branch restore): an active snapshot from the selected branch is
+  // restored paused for an explicit user decision, so the restored footer text
+  // is the paused prompt. The F09 signature proof is the (key, text) shape.
+  assert.deepEqual(h.statuses.at(-1), [CUSTOM_ENTRY_TYPE, "Goal paused (/goal resume)"]);
   for (const call of h.statuses) {
     assert.equal(call.length, 2, "setStatus must be called with a key and a text argument");
     assert.equal(call[0], CUSTOM_ENTRY_TYPE, "the status key must be CUSTOM_ENTRY_TYPE, not display text");

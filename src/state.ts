@@ -203,6 +203,11 @@ export function setGoalStatus(
   const next = cloneGoal(current);
   next.status = status;
   next.updatedAt = now;
+  if (status === "active") {
+    // An explicit resume clears the stored explanation; the goal is no longer
+    // waiting on a decision.
+    next.pauseReason = null;
+  }
   const message =
     status === "active" ? "Goal resumed." : status === "paused" ? "Goal paused." : "Goal blocked.";
   return { ok: true, message, goal: next };

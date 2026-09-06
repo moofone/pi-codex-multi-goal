@@ -6,6 +6,7 @@ import { createPersistence } from "./persistence.js";
 import { formatFooterStatus } from "./prompts.js";
 import { loadSettings } from "./settings.js";
 import {
+  cloneGoal,
   completeCurrentStage,
   reconstructGoal,
   setGoalStatus,
@@ -43,11 +44,46 @@ function sessionIdentity(ctx: ExtensionContext): SessionIdentity {
   return { id: id.trim() || undefined, file: file.trim() || undefined };
 }
 
+// Restored work never silently resumes (A10): an active snapshot from the
+// selected branch comes back paused and waits for an explicit user decision.
+const RESTORE_PAUSE_REASON =
+  "Restored from session history. Review the goal, then run /goal resume to continue.";
+
+const PERSIST_FAILURE_NOTICE =
+  "Goal persistence failed: the session log rejected the write, so goal execution is disabled until an entry can be saved.";
+
 export function registerMultiGoal(pi: ExtensionAPI): void {
   const settings = loadSettings();
   const stall = createStallState();
   let stallReason: string | null = null;
   const persistence = createPersistence({ pi });
+  let persistenceBroken = false;
+
+  const trackPersistence = (ctx: ExtensionContext | null): void => {
+    if (persistence.lastWriteFailed()) {
+      if (!persistenceBroken) {
+        persistenceBroken = true;
+        ctx?.ui.notify(PERSIST_FAILURE_NOTICE, "warning");
+      }
+      return;
+    }
+    // A successful write re-admits goal work.
+    persistenceBroken = false;
+  };
+
+  const restoreBranchGoal = (ctx: ExtensionContext): MultiGoal | null => {
+    // F08: the authoritative reconstruction source is the selected branch,
+    // never the whole append-only log. Malformed snapshots are skipped by
+    // reconstructGoal, keeping the last valid branch snapshot.
+    const reconstructed = reconstructGoal(ctx.sessionManager.getBranch());
+    if (!reconstructed || reconstructed.status !== "active") {
+      return reconstructed;
+    }
+    const restored = cloneGoal(reconstructed);
+    restored.status = "paused";
+    restored.pauseReason = RESTORE_PAUSE_REASON;
+    return restored;
+  };
 
   const yielding = (ctx: ExtensionContext): boolean =>
     sessionOwnsLiveOrchestrateFeature(sessionIdentity(ctx));
@@ -73,6 +109,7 @@ export function registerMultiGoal(pi: ExtensionAPI): void {
     }
     persistence.setGoalSnapshot(goal);
     persistence.flush(source);
+    trackPersistence(ctx);
     if (ctx) {
       refresh(ctx);
     }
@@ -91,10 +128,23 @@ export function registerMultiGoal(pi: ExtensionAPI): void {
     stallReason = null;
     const id = persistence.getGoal()?.goalId ?? null;
     persistence.appendClear(id, source);
+    trackPersistence(ctx);
     refresh(ctx);
   };
 
+  // Persistence failure admits no goal work: no completions, no blocks, and no
+  // continuations for state that cannot be committed.
+  const requestContinuation = (ctx: ExtensionContext, kind?: GoalContinuationKind): boolean => {
+    if (persistenceBroken) {
+      return false;
+    }
+    return continuation.request(ctx, kind);
+  };
+
   const completeStage = (source: GoalEntrySource, ctx: ExtensionContext) => {
+    if (persistenceBroken) {
+      return { ok: false, message: PERSIST_FAILURE_NOTICE, goal: persistence.getGoal() };
+    }
     const result = completeCurrentStage(persistence.getGoal());
     if (!result.ok || !result.goal) {
       return result;
@@ -103,19 +153,28 @@ export function registerMultiGoal(pi: ExtensionAPI): void {
     resetStallState(stall);
     stallReason = null;
     persist(result.goal, source, ctx);
+    if (persistenceBroken) {
+      return { ok: false, message: PERSIST_FAILURE_NOTICE, goal: persistence.getGoal() };
+    }
     if (result.goal.status === "active") {
-      continuation.request(ctx, "stage_advance");
+      requestContinuation(ctx, "stage_advance");
     }
     return result;
   };
 
   const blockGoal = (source: GoalEntrySource, ctx: ExtensionContext) => {
+    if (persistenceBroken) {
+      return { ok: false, message: PERSIST_FAILURE_NOTICE, goal: persistence.getGoal() };
+    }
     const result = setGoalStatus(persistence.getGoal(), "blocked");
     if (!result.ok || !result.goal) {
       return result;
     }
     continuation.clear();
     persist(result.goal, source, ctx);
+    if (persistenceBroken) {
+      return { ok: false, message: PERSIST_FAILURE_NOTICE, goal: persistence.getGoal() };
+    }
     return result;
   };
 
@@ -130,37 +189,36 @@ export function registerMultiGoal(pi: ExtensionAPI): void {
     setGoal,
     clearGoal,
     requestContinuation: (ctx: ExtensionContext, kind?: GoalContinuationKind) =>
-      continuation.request(ctx, kind),
+      requestContinuation(ctx, kind),
   };
   registerGoalCommand(pi, commandHost);
   registerGoalMultiCommand(pi, commandHost);
 
   pi.on("session_start", (_event, ctx) => {
-    const reconstructed = reconstructGoal(ctx.sessionManager.getEntries());
-    persistence.setGoalSnapshot(reconstructed);
-    persistence.syncPersistedSnapshot(reconstructed);
+    const restored = restoreBranchGoal(ctx);
+    persistence.setGoalSnapshot(restored);
+    persistence.syncPersistedSnapshot(restored);
+    continuation.clear();
     resetStallState(stall);
     stallReason = null;
     refresh(ctx);
-    if (reconstructed?.status === "active") {
-      continuation.request(ctx);
-    }
+    // No continuation request: restored work waits for an explicit user
+    // decision, and restart never grants a new allowance (A10, F03).
   });
 
   pi.on("session_tree", (_event, ctx) => {
-    const reconstructed = reconstructGoal(ctx.sessionManager.getEntries());
-    persistence.setGoalSnapshot(reconstructed);
-    persistence.syncPersistedSnapshot(reconstructed);
+    const restored = restoreBranchGoal(ctx);
+    persistence.setGoalSnapshot(restored);
+    persistence.syncPersistedSnapshot(restored);
     continuation.clear();
     refresh(ctx);
-    if (reconstructed?.status === "active") {
-      continuation.request(ctx);
-    }
+    // No continuation request: tree navigation restores the selected branch
+    // paused and must not silently resume off-branch work.
   });
 
   pi.on("session_before_compact", (_event, ctx) => {
     persistence.flush("runtime");
-    void ctx;
+    trackPersistence(ctx);
   });
 
   pi.on("session_compact", (event, ctx) => {
@@ -183,7 +241,7 @@ export function registerMultiGoal(pi: ExtensionAPI): void {
       return;
     }
     refresh(ctx);
-    continuation.request(ctx);
+    requestContinuation(ctx);
   });
 
   pi.on("tool_execution_end", (event, ctx) => {
@@ -208,12 +266,12 @@ export function registerMultiGoal(pi: ExtensionAPI): void {
       }
       return;
     }
-    continuation.request(ctx);
+    requestContinuation(ctx);
   });
 
   pi.on("session_shutdown", (_event, ctx) => {
     persistence.flush("runtime");
+    trackPersistence(ctx);
     continuation.clear();
-    void ctx;
   });
 }

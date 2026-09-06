@@ -8,6 +8,7 @@ interface PersistenceDeps {
 export function createPersistence(deps: PersistenceDeps = {}) {
   let goal: MultiGoal | null = null;
   let lastPersisted: MultiGoal | null = null;
+  let lastWriteFailed = false;
 
   const getGoal = (): MultiGoal | null => goal;
 
@@ -32,9 +33,11 @@ export function createPersistence(deps: PersistenceDeps = {}) {
     } catch {
       // Persistence failed: retain the last committed snapshot and report
       // failure. The uncommitted in-memory snapshot is discarded.
+      lastWriteFailed = true;
       goal = lastPersisted ? cloneGoal(lastPersisted) : null;
       return false;
     }
+    lastWriteFailed = false;
     lastPersisted = cloneGoal(pending);
     return true;
   };
@@ -44,14 +47,16 @@ export function createPersistence(deps: PersistenceDeps = {}) {
       deps.pi?.appendEntry(CUSTOM_ENTRY_TYPE, clearEntry(clearedGoalId, source));
     } catch {
       // Persistence failed: keep the current committed state and report failure.
+      lastWriteFailed = true;
       return false;
     }
+    lastWriteFailed = false;
     goal = null;
     lastPersisted = null;
     return true;
   };
 
-  return { appendClear, flush, getGoal, setGoalSnapshot, syncPersistedSnapshot };
+  return { appendClear, flush, getGoal, lastWriteFailed: () => lastWriteFailed, setGoalSnapshot, syncPersistedSnapshot };
 }
 
 export type GoalPersistence = ReturnType<typeof createPersistence>;
