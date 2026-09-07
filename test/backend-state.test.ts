@@ -657,6 +657,37 @@ test("B16: a retained record must carry what its outcome claims", () => {
       "committed whose receipt is from another protocol version",
       bound([committedRecord({ receipt: receipt({ protocolVersion: 99 }) })]),
     ],
+    // The exploitable half: a retained record whose receipt belongs to another
+    // scope is handed back as a successful replay without the peer being asked.
+    [
+      "committed whose receipt is for another consumer",
+      bound([committedRecord({ receipt: receipt({ scope: { ...SCOPE, consumer: "pi-research" } }) })]),
+    ],
+    [
+      "committed whose receipt is for another work scope",
+      bound([committedRecord({ receipt: receipt({ scope: { ...SCOPE, scopeId: "goal:theirs:stage:theirs" } }) })]),
+    ],
+    [
+      "committed whose receipt is for another execution epoch",
+      bound([committedRecord({ receipt: receipt({ scope: { ...SCOPE, epoch: 9 } }) })]),
+    ],
+    [
+      "committed whose receipt is for another branch selection",
+      bound([
+        committedRecord({
+          receipt: receipt({ scope: { ...SCOPE, selection: { sessionId: "session-a", branchAnchorId: "anchor-99" } } }),
+        }),
+      ]),
+    ],
+    [
+      "committed whose receipt is for another contract revision",
+      bound([committedRecord({ receipt: receipt({ scope: { ...SCOPE, contractRevision: "f".repeat(64) } }) })]),
+    ],
+    // Shape, via the predicate the verifier uses when it decides to persist.
+    ["committed whose receipt has no commit timestamp", bound([committedRecord({ receipt: receipt({ committedAt: undefined }) })])],
+    ["committed whose receipt has a non-numeric timestamp", bound([committedRecord({ receipt: receipt({ committedAt: "soon" }) })])],
+    ["committed whose receipt selected only whitespace", bound([committedRecord({ receipt: receipt({ selectedRevision: "   " }) })])],
+    ["committed whose receipt has no scope at all", bound([committedRecord({ receipt: receipt({ scope: undefined }) })])],
     ["quarantined carrying a receipt", bound([quarantinedRecord({ receipt: receipt() })])],
     ["quarantined with no reason", bound([quarantinedRecord({ reason: null })])],
     [

@@ -214,3 +214,60 @@ test("B19: a misconfigured settings file cannot mint an unloadable goal", () => 
   });
   assert.equal(isMultiGoal(goal), true, "a goal built from clamped settings loads");
 });
+
+/**
+ * B28: the limit-ordering rule had three implementations — parseSettings when
+ * a goal is configured, freshExecution when one is minted, and effectiveLimits
+ * when an older snapshot is loaded. Three copies of a rule is the defect; the
+ * field one of them forgets is only the symptom. They must agree for every
+ * input, or a goal minted by one path fails the validator fed by another.
+ */
+test("B28: every path that fills in the D4 limits produces the same ordering", () => {
+  const totals = [1, 2, 5, 39, 40, 41, 400, 999, 1000, 1001, 5000];
+
+  for (const totalLimit of totals) {
+    const configured = parseSettings({ totalLimit }, "/tmp/settings.json");
+    assert.ok(
+      configured.turnLimit <= configured.totalLimit,
+      `parseSettings: turn bound above the working total at ${totalLimit}`,
+    );
+    assert.ok(
+      configured.lifetimeCeiling >= configured.totalLimit,
+      `parseSettings: ceiling below the working total at ${totalLimit}`,
+    );
+
+    // A goal minted from those settings must load.
+    const minted = replaceGoalFromSteps([{ objective: "x", criteria: ["y"] }], {
+      noProgressLimit: configured.noProgressLimit,
+      totalLimit: configured.totalLimit,
+    });
+    assert.ok(minted.ok && minted.goal, minted.message);
+    assert.equal(isMultiGoal(minted.goal), true, `a goal minted at totalLimit ${totalLimit} must load`);
+
+    // And the three paths must agree with each other, not merely each be legal.
+    assert.equal(
+      minted.goal.execution.turnLimit,
+      configured.turnLimit,
+      `minting and configuring disagree on the turn bound at ${totalLimit}`,
+    );
+    assert.equal(
+      minted.goal.execution.lifetimeCeiling,
+      configured.lifetimeCeiling,
+      `minting and configuring disagree on the ceiling at ${totalLimit}`,
+    );
+
+    // The migration path fills the same fields in for an older snapshot.
+    const migrated = reloadRaw(preD4(goalWith({ totalLimit, totalRemaining: Math.min(1, totalLimit) })));
+    assert.ok(migrated, `a pre-D4 snapshot at totalLimit ${totalLimit} must migrate`);
+    assert.equal(
+      migrated.execution.turnLimit,
+      configured.turnLimit,
+      `migrating and configuring disagree on the turn bound at ${totalLimit}`,
+    );
+    assert.equal(
+      migrated.execution.lifetimeCeiling,
+      configured.lifetimeCeiling,
+      `migrating and configuring disagree on the ceiling at ${totalLimit}`,
+    );
+  }
+});

@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
+import { clampedLimits } from "./state.js";
 import {
   DEFAULT_EVIDENCE_GRANT,
   DEFAULT_LIFETIME_CEILING,
@@ -61,24 +62,21 @@ export function parseSettings(raw: unknown, path: string): MultiGoalSettings {
   };
   const legacy = parsePositiveInteger(record.maxCompactionsWithoutMutation);
   const totalLimit = parsePositiveInteger(record.totalLimit) ?? DEFAULT_TOTAL_LIMIT;
-  // The four fuses are checked hardest-first (lifetime, total, turn,
-  // no-progress) and that ordering is only meaningful if the limits are ordered
-  // too: a turn bound above the working total can never fire, and a working
-  // total above the lifetime ceiling is unreachable. A snapshot carrying such a
-  // combination is rejected as malformed on load, so clamp a misconfiguration
-  // here rather than letting it mint a goal that cannot be reloaded.
-  const turnLimit = Math.min(parsePositiveInteger(record.turnLimit) ?? DEFAULT_TURN_LIMIT, totalLimit);
-  const lifetimeCeiling = Math.max(
-    parsePositiveInteger(record.lifetimeCeiling) ?? DEFAULT_LIFETIME_CEILING,
-    totalLimit,
-  );
+  // A misconfiguration is clamped here rather than allowed to mint a goal that
+  // the snapshot validator refuses on its own next load. The ordering rule
+  // itself lives in one place (orderedLimits): configuring, minting and
+  // migrating must fill these fields in identically, or a goal made by one path
+  // fails the check fed by another.
   return {
     noProgressLimit:
       parsePositiveInteger(record.noProgressLimit) ?? legacy ?? DEFAULT_NO_PROGRESS_LIMIT,
     totalLimit,
-    turnLimit,
-    evidenceGrant: parsePositiveInteger(record.evidenceGrant) ?? DEFAULT_EVIDENCE_GRANT,
-    lifetimeCeiling,
+    ...clampedLimits({
+      totalLimit,
+      turnLimit: parsePositiveInteger(record.turnLimit),
+      evidenceGrant: parsePositiveInteger(record.evidenceGrant),
+      lifetimeCeiling: parsePositiveInteger(record.lifetimeCeiling),
+    }),
     settingsPath: path,
   };
 }

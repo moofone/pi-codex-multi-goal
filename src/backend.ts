@@ -3,6 +3,7 @@ import {
   PEER_PROTOCOL_VERSION,
   callPeer,
   canonicalDigest,
+  isWellFormedReceipt,
   scopesEqual,
   selectionsEqual,
   verifyReceipt,
@@ -164,24 +165,30 @@ function isPendingOperation(value: unknown): value is PendingOperation {
 }
 
 /**
- * A receipt is only proof of a commit if it is complete. A retained record that
- * says `committed` is what answers an identical replay WITHOUT contacting the
- * peer, so a record whose receipt is missing, malformed, or about some other
- * operation would let a replay return success out of nothing.
+ * A receipt is only proof of a commit if it is complete AND it belongs to the
+ * operation it is retained under.
+ *
+ * A retained `committed` record is what answers an identical replay WITHOUT
+ * contacting the peer, so a record carrying someone else's receipt would hand
+ * that foreign receipt back as success — the third route to answering a replay
+ * out of nothing, after a missing receipt and a too-narrow replay identity.
+ *
+ * The shape check is not re-implemented here: it CALLS isWellFormedReceipt, the
+ * same predicate verifyReceipt applies when it decides whether a receipt may be
+ * persisted at all. A second copy of a rule is the defect and the field it
+ * forgets is only the symptom — a weaker copy here is exactly the drift that
+ * predicate was introduced to prevent.
  */
 function isCompleteReceipt(value: unknown, record: RetainedOperation): boolean {
-  if (!value || typeof value !== "object") {
+  if (!isWellFormedReceipt(value)) {
     return false;
   }
   const receipt = value as PeerReceipt;
   return (
-    receipt.protocolVersion === PEER_PROTOCOL_VERSION &&
     receipt.operationId === record.operationId &&
-    isScope(receipt.scope) &&
-    typeof receipt.selectedRevision === "string" &&
-    receipt.selectedRevision.length > 0 &&
     receipt.payloadDigest === record.payloadDigest &&
-    typeof receipt.committedAt === "number"
+    isScope(receipt.scope) &&
+    scopesEqual(receipt.scope, record.scope)
   );
 }
 
@@ -643,7 +650,20 @@ export function beginOperation(goal: MultiGoal, params: OperationParams): BeginR
   }
   if (replay.verdict === "identical") {
     // Already acknowledged: hand back the retained result without touching the
-    // peer and without re-running anything.
+    // peer and without re-running anything — but only if the retained receipt
+    // actually belongs to the record. A snapshot validated on load cannot carry
+    // an inconsistent one; this is the in-memory belt to that braces, so no
+    // path returns a foreign receipt as this operation's success.
+    if (!isCompleteReceipt(replay.record.receipt, replay.record)) {
+      return {
+        ok: false,
+        goal,
+        code: "refused",
+        message:
+          `operation ${params.operationId} is retained as committed but its receipt does not belong to it; ` +
+          "re-plan it under a new operation ID",
+      };
+    }
     return { ok: true, goal, request: requestOf(pendingFrom(params, goal, digest)), replayed: true, receipt: replay.record.receipt };
   }
   if (replay.verdict === "quarantined") {

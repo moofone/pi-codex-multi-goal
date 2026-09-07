@@ -21,8 +21,10 @@ import {
 import {
   callPeer,
   canonicalDigest,
+  scopesEqual,
   verifyReceipt,
   type PeerRequest,
+  type PeerScope,
   type PeerSelection,
 } from "../src/peer.ts";
 import {
@@ -1721,4 +1723,104 @@ test("B26: availability is restored only by a verified peer answer", async () =>
     );
     assert.equal(isMultiGoal(attempt), true, `and the snapshot stays loadable: ${label}`);
   }
+});
+
+// --- B27: a retained receipt must belong to the operation it is retained for
+
+/**
+ * Review finding (P1, src/backend.ts): isCompleteReceipt validated the
+ * receipt's operation id and digest but never that its SCOPE matched the record
+ * it is retained under — and it carried its own weaker copy of the shape check
+ * instead of calling isWellFormedReceipt, which was introduced precisely so the
+ * writer and the reader could not drift.
+ *
+ * The predicate that was meant to close drift left one reader out of the
+ * arrangement, which is the drift it was designed to prevent, one level down.
+ * The consequence is the third distinct route to answering a replay out of
+ * nothing, after the missing-receipt case and the too-narrow replay identity.
+ */
+test("B27: a replay never returns a receipt that does not belong to its record", async () => {
+  const peer = createFakePeer();
+  const bound = await bind(twoStepGoal(), peer);
+  const honest = bound.backend.operations.find((record) => record.outcome === "committed");
+  assert.ok(honest, "sanity: the bind left a committed record");
+  assert.ok(honest.receipt, "sanity: with a receipt");
+
+  // A record whose own identity is impeccable, carrying a receipt for someone
+  // else's scope. Only the receipt is forged, so replay identity matches.
+  const forged: MultiGoal = {
+    ...bound,
+    backend: {
+      ...bound.backend,
+      operations: [
+        {
+          ...honest,
+          receipt: { ...honest.receipt!, scope: { ...honest.receipt!.scope, consumer: "pi-research" } },
+        },
+      ],
+    },
+  };
+  assert.equal(
+    isGoalBackend(forged.backend),
+    false,
+    "a record whose receipt belongs to another scope makes the snapshot malformed",
+  );
+
+  // Defence in depth: even reached in memory, the replay must not hand it back.
+  const callsBefore = peer.calls.length;
+  const replay = beginOperation(forged, bindParams(forged, honest.operationId));
+  if (replay.ok && replay.replayed) {
+    assert.equal(
+      replay.receipt,
+      null,
+      "a retained receipt inconsistent with its record is not a result to return",
+    );
+  } else {
+    assert.equal(replay.ok, false, "or the replay is refused outright");
+  }
+  assert.equal(peer.calls.length, callsBefore, "and either way the peer was not consulted");
+});
+
+test("B27: scopesEqual and verifyReceipt agree on what makes two scopes differ", () => {
+  // Both express "same scope"; they differ only in that verifyReceipt reports
+  // WHICH field differed, so it can return a precise code. If a scope field is
+  // ever added and only one of them learns about it, they drift — and the one
+  // that forgets becomes a hole. Every single-field difference must be caught
+  // by both.
+  const goal = twoStepGoal();
+  const base = goalScope(goal, SELECTION_A);
+  const differences: Array<[string, PeerScope]> = [
+    ["consumer", { ...base, consumer: "pi-research" }],
+    ["scopeId", { ...base, scopeId: "goal:theirs:stage:theirs" }],
+    ["contractRevision", { ...base, contractRevision: "f".repeat(64) }],
+    ["epoch", { ...base, epoch: base.epoch + 1 }],
+    ["selection", { ...base, selection: SELECTION_B }],
+  ];
+
+  for (const [field, other] of differences) {
+    assert.equal(scopesEqual(base, other), false, `scopesEqual must see a different ${field}`);
+
+    const request: PeerRequest = {
+      protocolVersion: 1,
+      operationId: "op-drift",
+      kind: "write",
+      scope: base,
+      expectedRevision: "rev-1",
+      payload: { memory: null },
+    };
+    const checked = verifyReceipt(request, {
+      status: "committed",
+      receipt: {
+        protocolVersion: 1,
+        operationId: "op-drift",
+        scope: other,
+        selectedRevision: "rev-2",
+        payloadDigest: canonicalDigest(request.payload),
+        committedAt: 1,
+      },
+    });
+    assert.equal(checked.ok, false, `verifyReceipt must see a different ${field}`);
+  }
+
+  assert.equal(scopesEqual(base, { ...base }), true, "sanity: an identical scope is equal");
 });

@@ -427,12 +427,18 @@ Retained operation records:
 
 | Outcome | Requires | Forbids |
 |---|---|---|
-| `committed` | a complete receipt: this protocol version, the record's own `operationId`, a valid scope, a non-empty `selectedRevision`, and a `payloadDigest` equal to the record's | — |
+| `committed` | a complete receipt — the SAME well-formedness predicate the verifier applies before persisting one — whose `operationId` and `payloadDigest` are the record's and whose **scope equals the record's scope** | — |
 | `quarantined` | a `reason` | a receipt |
 
 A `committed` record is what answers an identical replay **without contacting
 the peer**, so an incomplete one would let a replay return success out of
-nothing. A `quarantined` record exists to refuse a late receipt and to tell the
+nothing — and one carrying another scope's receipt would return that foreign
+receipt as this operation's success. The scope check is what closes the second
+case. Nothing re-implements the well-formedness rule: one predicate is applied
+by the verifier deciding whether a receipt may be persisted and by the validator
+deciding whether a persisted one loads, so the two cannot accept what the other
+rejects. A second copy of a rule is the defect; the field it forgets is only the
+symptom. A `quarantined` record exists to refuse a late receipt and to tell the
 user why, so it must carry a reason and must not carry proof of a commit.
 
 Operation IDs are unique across the retained list, and a pending intent's ID may

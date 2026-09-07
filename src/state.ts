@@ -56,13 +56,63 @@ export interface ExecutionLimits {
 }
 
 /**
- * A bounded grant: finite limits only, no unlimited mode.
+ * THE ordering rule, stated once — as two functions, because filling in an
+ * ABSENT limit and repairing a PRESENT one are different jobs and must stay
+ * different.
  *
- * The fuses the caller does not specify are filled from the defaults, but
- * CLAMPED into the ordering the validator enforces (turn bound <= working total
- * <= lifetime ceiling). A caller asking for a working total of 5 would
- * otherwise get the default turn bound of 40 and mint a goal that its own
- * validator refuses on the next load.
+ * The four fuses are checked hardest-first (lifetime, total, turn, no-progress)
+ * and that order only means something if the limits are ordered too: a turn
+ * bound above the working total can never fire, and a working total above the
+ * lifetime ceiling is unreachable.
+ *
+ * `orderedLimits` supplies the DEFAULT an absent field takes, consistent with
+ * the working total the snapshot already declares. It never touches a value
+ * that is present, because the reader must not silently repair a forged grant —
+ * a snapshot that contradicts its own limits is malformed, and clamping it on
+ * load would launder it into a valid one.
+ *
+ * `clampedLimits` is for the paths that MINT a grant — configuring a goal and
+ * creating one — where a value out of order is a misconfiguration to correct
+ * before it becomes a snapshot the validator would refuse.
+ *
+ * `evidenceGrant` is deliberately unclamped in both: creditVerifiedEvidence
+ * caps the renewal at totalLimit, so an oversized grant is a full refill rather
+ * than an unbounded one.
+ */
+export interface FillableLimits {
+  totalLimit: number;
+  turnLimit?: number;
+  evidenceGrant?: number;
+  lifetimeCeiling?: number;
+}
+
+export interface FilledLimits {
+  turnLimit: number;
+  evidenceGrant: number;
+  lifetimeCeiling: number;
+}
+
+export function orderedLimits(limits: FillableLimits): FilledLimits {
+  return {
+    turnLimit: limits.turnLimit ?? Math.min(DEFAULT_TURN_LIMIT, limits.totalLimit),
+    evidenceGrant: limits.evidenceGrant ?? DEFAULT_EVIDENCE_GRANT,
+    lifetimeCeiling: limits.lifetimeCeiling ?? Math.max(DEFAULT_LIFETIME_CEILING, limits.totalLimit),
+  };
+}
+
+export function clampedLimits(limits: FillableLimits): FilledLimits {
+  const filled = orderedLimits(limits);
+  return {
+    turnLimit: Math.min(filled.turnLimit, limits.totalLimit),
+    evidenceGrant: filled.evidenceGrant,
+    lifetimeCeiling: Math.max(filled.lifetimeCeiling, limits.totalLimit),
+  };
+}
+
+/**
+ * A bounded grant: finite limits only, no unlimited mode. The fuses the caller
+ * does not specify are filled in by orderedLimits, so a goal is never minted
+ * with limits its own validator refuses on the next load.
  */
 export function freshExecution(
   limits: ExecutionLimits = {
@@ -77,10 +127,8 @@ export function freshExecution(
     turnRequests: 0,
     noProgressLimit: limits.noProgressLimit,
     totalLimit: limits.totalLimit,
-    turnLimit: Math.min(limits.turnLimit ?? DEFAULT_TURN_LIMIT, limits.totalLimit),
-    evidenceGrant: limits.evidenceGrant ?? DEFAULT_EVIDENCE_GRANT,
+    ...clampedLimits(limits),
     lifetimeRequests: 0,
-    lifetimeCeiling: Math.max(limits.lifetimeCeiling ?? DEFAULT_LIFETIME_CEILING, limits.totalLimit),
     tokenUsage: null,
     creditedEvidence: [],
   };
@@ -101,16 +149,10 @@ export function freshExecution(
  * isGoalExecution, so a snapshot is never validated against limits different
  * from the ones it will be loaded with.
  */
-function effectiveLimits(execution: GoalExecution): {
-  turnLimit: number;
-  evidenceGrant: number;
-  lifetimeCeiling: number;
-} {
-  return {
-    turnLimit: execution.turnLimit ?? Math.min(DEFAULT_TURN_LIMIT, execution.totalLimit),
-    evidenceGrant: execution.evidenceGrant ?? DEFAULT_EVIDENCE_GRANT,
-    lifetimeCeiling: execution.lifetimeCeiling ?? Math.max(DEFAULT_LIFETIME_CEILING, execution.totalLimit),
-  };
+function effectiveLimits(execution: GoalExecution): FilledLimits {
+  // Defaults only. A present-but-out-of-order limit must reach the validator
+  // unrepaired, or a forged grant would be laundered into a valid one on load.
+  return orderedLimits(execution);
 }
 
 /**
