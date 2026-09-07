@@ -162,6 +162,16 @@ durable operation, and a bounded list of retained operation receipts.
   `contractRevision`, and the session/branch selection. A receipt is verified
   against the intent it answers, so a late response after a pause, a generation
   change, or a branch move quarantines itself instead of publishing state.
+- A binding is scoped to one stage, so it ends with the stage it belonged to,
+  along with that stage's pending intent and retained receipts. The next stage
+  starts unbound and runnable, with the empty memory record a transition
+  mandates, and the recorded reason names the peer it was previously bound to.
+  No state reachable today is permanently unrecoverable.
+- Which operations are legal for which backend state is enforced before an
+  intent is persisted, not delegated to the peer: `bind` is the only operation
+  legal from unbound, a second bind over a live binding is refused, and every
+  other mutation requires a bound and available backend planned against its
+  selected revision. No receipt can install a binding that no bind created.
 - Recovery is a persisted intent plus idempotent replay, not a shared
   transaction. The four partial-write boundaries — after the intent, after the
   peer commit, after the receipt, before Goal's acknowledgement — all recover to

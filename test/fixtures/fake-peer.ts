@@ -50,6 +50,13 @@ export interface FakePeerOptions {
   throws?: string;
   /** Answer `pending`: committed to its own store but not durably selected. */
   alwaysPending?: boolean;
+  /**
+   * A peer that is lax about scope ownership: it will happily create a scope on
+   * a `write` that no `bind` ever claimed. Real peers should not, but the Goal
+   * side must not DEPEND on that — operation legality is Goal's own check, made
+   * before the intent is persisted.
+   */
+  laxScope?: boolean;
 }
 
 interface CommittedOperation {
@@ -221,7 +228,17 @@ export function createFakePeer(options: FakePeerOptions = {}): FakePeer {
       }
 
       if (!held) {
-        return error("scope-conflict", `scope ${request.scope.scopeId} is not bound`, request.operationId);
+        if (!options.laxScope) {
+          return error("scope-conflict", `scope ${request.scope.scopeId} is not bound`, request.operationId);
+        }
+        // Lax mode: create the scope implicitly, as an over-eager peer would.
+        const payload = (request.payload ?? {}) as { memory?: unknown };
+        return commit(request, {
+          owner: request.scope.consumer,
+          revision: "",
+          contract: null,
+          memory: payload.memory ?? null,
+        });
       }
       if (request.expectedRevision !== null && request.expectedRevision !== held.revision) {
         return error(

@@ -300,8 +300,61 @@ unbound ──bind intent──▶ binding-pending ──receipt──▶ bound-
 ```
 
 `detached` is terminal for that binding; a later bind starts a new one.
-A stage transition on a bound goal returns to `binding-pending` for the new
-stage's contract (task 5.3 owns the transition operation itself).
+
+**A binding is scoped to one stage.** Its `scopeId` is
+`goal:<goalId>:stage:<Stage.id>`, so a stage transition moves to a scope that
+nothing has bound. The binding therefore ends with the stage it belonged to:
+the next stage starts `unbound`, with the empty working-memory record §8 of the
+Goal spec mandates, and the backend `reason` records which peer, task and
+revision the previous stage was bound to so the change is visible rather than
+silent. The pending intent and the retained receipts are cleared with it —
+neither can address the new `scopeId` and `contractRevision` — which also
+satisfies "a stage transition invalidates old reviews and active selections
+before admitting the next stage" (PI_DAG_COMPACT §1).
+
+The next stage is therefore always runnable. **No state reachable within P0 may
+be permanently unrecoverable**, and P0 has neither a transition operation nor a
+runtime path that submits one: moving the new stage to `binding-pending` would
+persist a switch that nothing could complete, `abandonOperation` could not act
+on it because no intent would exist, and the goal would be wedged with no
+user-reachable exit. Task 5.3 replaces this rule with the durable transition
+operation that archives the old stage and installs the next stage's protected
+contract in one scoped mutation, and carries the binding across as part of it.
+
+### 6.1 Operation legality
+
+The state machine above is enforced by the caller **before the intent is
+persisted**, never delegated to the peer. A peer that would happily accept an
+illegal operation must not be able to promote Goal into `bound-available`
+without a bind, so these checks are Goal's own.
+
+| Kind | Legal from | Required `expectedState` | Required `expectedRevision` |
+|---|---|---|---|
+| `bind` | `unbound`, `detached`, `binding-pending` | `bound-available` | `null` — a bind is what selects the first revision, so it cannot claim one |
+| `write` | `bound-available` | `bound-available` | the binding's current `selectedRevision` |
+| `transition` | `bound-available` | `bound-available` | the binding's current `selectedRevision` |
+| `detach` | `bound-available` | `detached` | the binding's current `selectedRevision` |
+| `read` | any | — | — (no intent is persisted; reads mutate nothing) |
+
+Consequences worth stating explicitly:
+
+- A second `bind` over a live binding is refused. Replacing an authority without
+  detaching from it would lose the export §3 requires.
+- `write`, `transition` and `detach` require a binding with a non-null
+  `selectedRevision`. There is no path on which a receipt installs a binding
+  that no `bind` created.
+- `detach` requires `bound-available`, because the export must be read and
+  validated before authority is released; there is nothing to read from an
+  unavailable peer.
+- No mutation may be planned while the backend is `bound-unavailable`. The
+  binding is preserved and execution is paused; planning new work against an
+  authority that is not answering would only manufacture intents to quarantine.
+
+Legality is checked on the **novel** path only. A replay — the same operation ID
+with the same payload — is resolved first and answered from the pending intent
+or the retained receipt, because idempotent recovery must still work after the
+state has legitimately moved on (a `bind` replayed after its own acknowledgement
+would otherwise be rejected as "already bound").
 
 **Budgets.** Neither binding, detachment, reload, nor branch selection refills
 any execution budget (§3, invariant 6). Every function in `src/backend.ts`

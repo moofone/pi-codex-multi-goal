@@ -132,7 +132,9 @@ export function formatHumanStatus(goal: MultiGoal | null): string {
   // Which working-memory authority is in force. An unbound goal shows nothing
   // here: that is today's view, and P0 does not add noise to a Goal-only
   // session (invariant 1).
-  if (goal.backend.state !== "unbound") {
+  // A reason without a state change still matters: a binding that ended with
+  // the stage it belonged to must not disappear silently.
+  if (goal.backend.state !== "unbound" || goal.backend.reason !== null) {
     lines.push(`Backend: ${goal.backend.state}`);
     if (goal.backend.reason) {
       lines.push(`  Reason: ${goal.backend.reason}`);

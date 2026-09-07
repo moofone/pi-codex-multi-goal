@@ -295,6 +295,95 @@ function retain(backend: GoalBackend, record: RetainedOperation): RetainedOperat
   return kept.slice(-MAX_RETAINED_OPERATIONS);
 }
 
+// --- operation legality (docs/peer-protocol.md §6.1) ----------------------
+
+/** The one backend state each kind of operation can actually reach. */
+const REACHABLE_STATE: Record<Exclude<PeerOperationKind, "read">, GoalBackendState> = {
+  bind: "bound-available",
+  write: "bound-available",
+  transition: "bound-available",
+  detach: "detached",
+};
+
+/** Where a `bind` may start: nothing is bound, or a previous binding ended. */
+const BINDABLE_FROM: GoalBackendState[] = ["unbound", "detached", "binding-pending"];
+
+export type LegalityCheck = { ok: true } | { ok: false; message: string };
+
+/**
+ * Is this operation legal for the backend as it stands? Enforced BEFORE the
+ * intent is persisted and never delegated to the peer, because a peer that
+ * accepts an illegal operation must not be able to promote Goal into
+ * `bound-available` without a bind. The protocol's own guarantee cannot rest on
+ * the peer being well behaved.
+ *
+ * Checked on the novel path only: a replay is resolved from the pending intent
+ * or the retained receipt first, so idempotent recovery still works after the
+ * state has legitimately moved on (a `bind` replayed after its own
+ * acknowledgement would otherwise be rejected as "already bound").
+ */
+export function checkOperationLegality(
+  backend: GoalBackend,
+  params: { kind: PeerOperationKind; expectedState: GoalBackendState; expectedRevision: string | null },
+): LegalityCheck {
+  if (params.kind === "read") {
+    return { ok: false, message: "a read mutates nothing and persists no intent" };
+  }
+  const reachable = REACHABLE_STATE[params.kind];
+  if (params.expectedState !== reachable) {
+    return {
+      ok: false,
+      message: `a ${params.kind} operation reaches ${reachable}, not ${params.expectedState}`,
+    };
+  }
+
+  if (params.kind === "bind") {
+    if (!BINDABLE_FROM.includes(backend.state)) {
+      return {
+        ok: false,
+        message:
+          `this goal is already ${backend.state}; a second bind would replace the working-memory ` +
+          "authority without detaching from it. Detach first.",
+      };
+    }
+    if (params.expectedRevision !== null) {
+      return {
+        ok: false,
+        message: "a bind is what selects the first revision, so it cannot claim an expected revision",
+      };
+    }
+    return { ok: true };
+  }
+
+  // write, transition and detach all act on a live binding.
+  if (backend.state !== "bound-available") {
+    return {
+      ok: false,
+      message:
+        `a ${params.kind} operation needs a bound and available backend; this goal is ${backend.state}. ` +
+        (backend.state === "unbound" || backend.state === "detached"
+          ? "Bind first."
+          : "The bound backend is not answering; nothing new can be planned against it."),
+    };
+  }
+  const selected = backend.binding?.selectedRevision ?? null;
+  if (!selected) {
+    return {
+      ok: false,
+      message: `a ${params.kind} operation needs a binding with a selected revision; none is recorded`,
+    };
+  }
+  if (params.expectedRevision !== selected) {
+    return {
+      ok: false,
+      message:
+        `a ${params.kind} operation must be planned against the selected revision ${selected}; ` +
+        `the supplied expected revision is ${params.expectedRevision ?? "null"}`,
+    };
+  }
+  return { ok: true };
+}
+
 // --- step 1: persist the intent -------------------------------------------
 
 export interface OperationParams {
@@ -375,6 +464,12 @@ export function beginOperation(goal: MultiGoal, params: OperationParams): BeginR
     // the peer sees byte-identical input and can answer idempotently.
     return { ok: true, goal, request: requestOf(replay.pending), replayed: false };
   }
+  // Novel work: the state machine is enforced here, before anything is
+  // persisted and before the peer is asked (docs/peer-protocol.md §6.1).
+  const legality = checkOperationLegality(backend, params);
+  if (!legality.ok) {
+    return { ok: false, goal, code: "refused", message: legality.message };
+  }
   if (backend.pending) {
     return {
       ok: false,
@@ -392,7 +487,9 @@ export function beginOperation(goal: MultiGoal, params: OperationParams): BeginR
     ...next.backend,
     // The intended migration is persisted BEFORE the peer is asked, and the
     // state moves with it so execution is withheld during the switch (§3).
-    state: pending.expectedState === "bound-available" && backend.state === "unbound" ? "binding-pending" : backend.state,
+    // Only a bind switches authority; an ordinary write against a live binding
+    // does not withhold execution.
+    state: pending.kind === "bind" ? "binding-pending" : backend.state,
     pending,
     reason: null,
   };
@@ -558,6 +655,15 @@ export function acceptReceipt(
     return { ok: true, goal: next, receipt, projection: response.status === "committed" ? response.projection : undefined };
   }
 
+  if (pending.kind !== "bind" && !goal.backend.binding) {
+    // Defence in depth: no receipt may install a binding that no bind created.
+    return {
+      ok: false,
+      goal: quarantine(goal, pending, "a receipt cannot install a binding that no bind operation created"),
+      code: "refused",
+      message: "a receipt cannot install a binding that no bind operation created",
+    };
+  }
   const stage = currentStage(goal);
   next.backend = {
     ...next.backend,
@@ -691,23 +797,47 @@ export function markPeerAvailable(goal: MultiGoal, selectedRevision: string): Mu
 }
 
 /**
- * A stage transition changes `Stage.id` and `contractRevision`, so no operation
- * planned for the old stage can address the new one: retention is cleared here,
- * which is exactly "the lifetime in which an operation can be retried". A bound
- * goal returns to `binding-pending` because the next stage's protected contract
- * has not been installed yet (that operation is task 5.3). `unbound` and
- * `detached` are unaffected — a Goal-only session transitions as it always did.
+ * End the stage's binding.
+ *
+ * A binding is scoped to ONE stage: its `scopeId` is
+ * `goal:<goalId>:stage:<Stage.id>`, so a transition moves to a scope nothing
+ * has bound. The pending intent and the retained receipts go with it — neither
+ * can address the new `scopeId` and `contractRevision`, which is exactly "the
+ * lifetime in which an operation can be retried" (§4) and satisfies "a stage
+ * transition invalidates old reviews and active selections before admitting the
+ * next stage" (PI_DAG_COMPACT §1).
+ *
+ * The next stage therefore starts `unbound`, which is runnable, and pairs with
+ * the empty working-memory record §8 mandates — there is no stale blob here to
+ * downgrade to, so invariant 8 is not in play. The `reason` records which peer,
+ * task and revision the previous stage was bound to, so the change is visible
+ * rather than silent.
+ *
+ * This deliberately does NOT move to `binding-pending`. P0 has no transition
+ * operation and no runtime path that submits one, so a pending switch would be
+ * a switch nothing could complete: `requestContinuation` would refuse forever,
+ * `abandonOperation` would have no intent to act on, and a bound goal would be
+ * wedged after stage 1 with no user-reachable exit. No state reachable within
+ * P0 may be permanently unrecoverable. Task 5.3 replaces this rule with the
+ * durable transition operation that archives the old stage, installs the next
+ * stage's protected contract in one scoped mutation, and carries the binding
+ * across as part of it.
  */
-export function advanceBackendToNextStage(backend: GoalBackend): GoalBackend {
-  if (backend.state === "unbound" || backend.state === "detached") {
+export function endStageBinding(backend: GoalBackend): GoalBackend {
+  if (backend.state === "unbound" && !backend.binding) {
     return { ...backend, pending: null, operations: [], reason: null };
   }
+  const previous = backend.binding;
   return {
-    state: "binding-pending",
-    binding: backend.binding ? { ...backend.binding } : null,
+    state: "unbound",
+    binding: null,
     pending: null,
     operations: [],
-    reason: "the next stage's contract is not installed on the bound backend yet",
+    reason: previous
+      ? `the previous stage's binding to ${previous.peerId} (task ${previous.taskId}, ` +
+        `selected revision ${previous.selectedRevision ?? "none"}) ended with that stage; ` +
+        "this stage starts unbound because the durable stage-transition operation is not implemented yet"
+      : null,
   };
 }
 

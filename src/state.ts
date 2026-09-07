@@ -1,8 +1,8 @@
 import { randomUUID } from "node:crypto";
 
 import {
-  advanceBackendToNextStage,
   emptyBackend,
+  endStageBinding,
   isGoalBackend,
   normalizeBackend,
 } from "./backend.js";
@@ -286,7 +286,10 @@ export function acceptCompletion(
   const next = completed.goal;
   if (next.status === "complete") {
     // Last step: keep the completion receipt in the stages, drop active memory.
+    // The stage scope is over here too, so no completed goal is left holding a
+    // live binding to a scope nothing will ever write to again.
     next.memory = emptyMemory();
+    next.backend = endStageBinding(next.backend);
     next.pauseReason = null;
     return { ok: true, message: "Goal complete.", goal: next };
   }
@@ -312,12 +315,14 @@ export function acceptCompletion(
     creditedEvidence: [],
   };
   next.isolationCutoff = isolationCutoffMs;
-  // The new stage has a different Stage.id and contractRevision, so no
-  // operation planned for the old one can address it: the pending intent and
-  // the retained receipts are cleared with the stage they belonged to (§4
-  // "operation retention"). A bound goal waits for the next stage's protected
-  // contract before it is authoritative again.
-  next.backend = advanceBackendToNextStage(next.backend);
+  // A binding is scoped to one stage, so it ends with the stage it belonged
+  // to, along with its pending intent and retained receipts — none of them can
+  // address the new Stage.id and contractRevision (§4 "operation retention";
+  // PI_DAG_COMPACT §1 "a stage transition invalidates old reviews and active
+  // selections before admitting the next stage"). The next stage starts
+  // unbound and runnable; task 5.3 replaces this with the durable transition
+  // operation that carries the binding across.
+  next.backend = endStageBinding(next.backend);
   next.pauseReason = null;
   return {
     ok: true,

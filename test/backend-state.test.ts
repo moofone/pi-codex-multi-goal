@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import test from "node:test";
 
+import { backendAdmitsExecution } from "../src/backend.ts";
 import { registerMultiGoal } from "../src/runtime.ts";
 import { cloneGoal, createGoal, reconstructGoal, replaceGoalFromSteps, setEntry } from "../src/state.ts";
 import { CUSTOM_ENTRY_TYPE, type GoalBackend, type MultiGoal } from "../src/types.ts";
@@ -135,6 +137,11 @@ function harness(t: any, options: HarnessOptions = {}) {
   process.env.PI_ORCHESTRATOR_ROOT = join(root, "orchestrator");
   mkdirSync(join(root, "orchestrator"), { recursive: true });
   writeFileSync(join(root, "pi-codex-multi-goal.json"), JSON.stringify({}));
+  // Evidence artifacts are project-relative files resolved against the working
+  // directory, so the harness chdirs into its own root (same seam as
+  // test/completion-isolation.test.ts).
+  const previousCwd = process.cwd();
+  process.chdir(root);
 
   const branch: any[] = [...(options.seed ?? [])];
   const entries: any[] = [...branch];
@@ -177,6 +184,7 @@ function harness(t: any, options: HarnessOptions = {}) {
   const emit = async (name: string, event: any = {}) => handlers.get(name)?.({ type: name, ...event }, ctx);
   t.after(async () => {
     await emit("session_shutdown");
+    process.chdir(previousCwd);
     if (oldAgent === undefined) delete process.env.PI_AGENT_DIR;
     else process.env.PI_AGENT_DIR = oldAgent;
     if (oldOrchestrator === undefined) delete process.env.PI_ORCHESTRATOR_ROOT;
@@ -190,6 +198,18 @@ function harness(t: any, options: HarnessOptions = {}) {
       tools.get("update_goal_memory").execute(id, params, new AbortController().signal, undefined, ctx),
     updateGoal: (params: any, id = "terminal-call") =>
       tools.get("update_goal").execute(id, params, new AbortController().signal, undefined, ctx),
+    /** One evidence ref bound to the given criteria, backed by a real artifact. */
+    evidence: (criteria: string[], artifact = "src/fix.ts", content = "the fix, applied\n", operation = "edit") => {
+      const absolute = join(root, artifact);
+      mkdirSync(dirname(absolute), { recursive: true });
+      writeFileSync(absolute, content);
+      return {
+        operation,
+        artifact,
+        fingerprint: createHash("sha256").update(content).digest("hex").slice(0, 16),
+        criteria,
+      };
+    },
     providerRequest: () =>
       emit("before_provider_request", {
         payload: { model: "fake-model", messages: [], tools: [] },
@@ -341,4 +361,74 @@ test("B01: an unbound goal shows no backend noise in /goal status", async (t) =>
   const status = h.goalStatus();
   assert.match(status, /Stage: 1\/2/, "sanity: the status rendered");
   assert.equal(/Backend:/.test(status), false, "unbound is today's view, unchanged");
+});
+
+/**
+ * B11 (review finding 1): no state reachable within P0 may be permanently
+ * unrecoverable.
+ *
+ * Completing a stage on a bound goal used to move the backend to
+ * `binding-pending` for the next stage's contract — but P0 has no transition
+ * operation and no runtime path that submits one, so the pending switch could
+ * never complete. `requestContinuation` refuses while the switch is pending and
+ * `abandonOperation` needs a pending intent that was never created, which left
+ * a bound multi-stage goal wedged after stage 1 with no user-reachable exit.
+ *
+ * The binding is scoped to a stage: `goal:<goalId>:stage:<Stage.id>`. A
+ * transition moves to a DIFFERENT scope that nothing ever bound, so the honest
+ * answer for the new stage is that it has no backend. It starts unbound —
+ * runnable, with the empty memory record §8 mandates — and says why.
+ */
+test("B11: a bound goal that completes stage 1 can still run stage 2, user-reachable only", async (t) => {
+  const h = harness(t, { seed: [boundSnapshot("bound-available", null)] });
+  await h.emit("session_start");
+  await h.command("resume");
+
+  const active = h.current();
+  assert.equal(active.backend.state, "bound-available", "sanity: stage 1 is bound");
+  assert.equal(active.stages.length, 2, "sanity: there is a stage 2 to get stuck before");
+  const criterionIds = active.stages[0]!.criteria.map((criterion: any) => criterion.id);
+
+  await h.updateGoal({
+    status: "complete",
+    goalId: active.goalId,
+    step: active.index + 1,
+    generation: active.execution.generation,
+    evidence: [h.evidence(criterionIds)],
+  });
+
+  const advanced = h.current();
+  assert.equal(advanced.index, 1, "sanity: the goal advanced to stage 2");
+  assert.equal(advanced.status, "active");
+
+  // The whole point: stage 2 is runnable with no external state surgery.
+  assert.equal(
+    backendAdmitsExecution(advanced.backend),
+    true,
+    "stage 2 must not start in a state nothing can leave",
+  );
+  assert.equal(advanced.backend.pending, null, "no unsubmittable intent was invented");
+  assert.equal(
+    advanced.backend.binding,
+    null,
+    "§1: a stage transition invalidates the old stage's active selection before admitting the next",
+  );
+
+  // Goal owns the new stage's record, and the memory tool proves it end to end.
+  await h.memory({
+    goalId: advanced.goalId,
+    step: advanced.index + 1,
+    generation: advanced.execution.generation,
+    revision: advanced.memory.revision,
+    proved: [],
+    unresolved: [],
+    next: "start stage 2",
+  });
+  assert.equal(h.current().memory.revision, 1, "stage 2's memory record is writable");
+
+  // Not silent: the human can see the binding ended with the stage it belonged to.
+  const status = h.goalStatus();
+  assert.match(status, /Backend: unbound/);
+  assert.match(status, /ended with that stage/);
+  assert.match(status, /fake-dag-peer/, "and which peer it was bound to");
 });

@@ -15,7 +15,13 @@ import {
   type OperationParams,
 } from "../src/backend.ts";
 import { callPeer, canonicalDigest, verifyReceipt, type PeerSelection } from "../src/peer.ts";
-import { currentStage, reconstructGoal, replaceGoalFromSteps, setEntry } from "../src/state.ts";
+import {
+  acceptCompletion,
+  currentStage,
+  reconstructGoal,
+  replaceGoalFromSteps,
+  setEntry,
+} from "../src/state.ts";
 import { CUSTOM_ENTRY_TYPE, type MultiGoal } from "../src/types.ts";
 import { createFakePeer, operationId } from "./fixtures/fake-peer.ts";
 
@@ -577,4 +583,133 @@ test("B03: an operation cannot be planned against a generation the goal has left
   );
   assert.equal(stale.ok, false);
   assert.equal(stale.ok === false ? stale.code : null, "stale-epoch");
+});
+
+// --- B11: a stage transition must not leave an unrecoverable state --------
+
+test("B11: a stage transition ends the stage's binding and leaves the next stage runnable", async () => {
+  const peer = createFakePeer();
+  const goal = twoStepGoal();
+  const bound = await bind(goal, peer);
+
+  // Leave a pending intent AND a retained receipt behind, so the test proves
+  // both are cleared rather than carried into a scope they cannot address.
+  const begun = beginOperation(bound, writeParams(bound, { revision: 1, proved: ["x"], unresolved: [], next: "" }));
+  assert.ok(begun.ok);
+  assert.ok(begun.goal.backend.pending, "sanity: an operation is in flight for stage 1");
+  assert.equal(begun.goal.backend.operations.length, 1, "sanity: the bind receipt is retained");
+
+  const advanced = acceptCompletion(begun.goal, Date.now(), {});
+  assert.ok(advanced.ok && advanced.goal, advanced.message);
+  assert.equal(advanced.goal.index, 1, "sanity: the goal advanced");
+
+  assert.equal(
+    backendAdmitsExecution(advanced.goal.backend),
+    true,
+    "no state reachable in P0 may be permanently unrecoverable",
+  );
+  assert.equal(goalOwnsMemory(advanced.goal.backend), true, "and the new stage's empty record is writable");
+  assert.equal(advanced.goal.backend.state, "unbound");
+  assert.equal(advanced.goal.backend.binding, null, "the old stage's selection is not carried forward");
+  assert.equal(advanced.goal.backend.pending, null, "an intent for the old scope cannot address the new one");
+  assert.deepEqual(advanced.goal.backend.operations, [], "retention ends with the stage it protected");
+  assert.match(
+    advanced.goal.backend.reason ?? "",
+    /ended with that stage/,
+    "and the change is visible rather than silent",
+  );
+  assert.equal(advanced.goal.memory.revision, 0, "sanity: §8 — the next stage starts with empty memory");
+});
+
+// --- B12: operation legality is enforced before the intent is persisted ---
+
+test("B12: beginOperation refuses operations that are illegal for the current state", async () => {
+  const peer = createFakePeer();
+  const goal = twoStepGoal();
+
+  // From `unbound`, only `bind` is legal.
+  for (const kind of ["write", "transition", "detach"] as const) {
+    const attempt = beginOperation(goal, {
+      operationId: operationId(kind),
+      kind,
+      expectedState: kind === "detach" ? "detached" : "bound-available",
+      payload: { memory: null },
+      selection: SELECTION_A,
+      expectedRevision: null,
+    });
+    assert.equal(attempt.ok, false, `${kind} cannot be planned while unbound`);
+    assert.equal(attempt.ok === false ? attempt.code : null, "refused");
+    assert.match(attempt.ok === false ? attempt.message : "", /unbound|bind/i);
+  }
+
+  // A bind cannot claim a selected revision: it is what selects the first one.
+  const claiming = beginOperation(goal, { ...bindParams(goal), expectedRevision: "rev-1" });
+  assert.equal(claiming.ok, false, "a bind that claims an existing revision is refused");
+  assert.match(claiming.ok === false ? claiming.message : "", /revision/i);
+
+  const bound = await bind(goal, peer);
+  const selected = bound.backend.binding?.selectedRevision ?? null;
+  assert.ok(selected, "sanity: the binding selected a revision");
+
+  // A non-bind mutation must be planned against the selected revision.
+  const unanchored = beginOperation(bound, {
+    ...writeParams(bound, { revision: 1, proved: [], unresolved: [], next: "" }),
+    expectedRevision: null,
+  });
+  assert.equal(unanchored.ok, false, "a write with no expected revision is refused");
+  assert.match(unanchored.ok === false ? unanchored.message : "", /revision/i);
+
+  const misanchored = beginOperation(bound, {
+    ...writeParams(bound, { revision: 1, proved: [], unresolved: [], next: "" }),
+    expectedRevision: "rev-does-not-exist",
+  });
+  assert.equal(misanchored.ok, false, "a write against a revision that is not selected is refused");
+  assert.match(misanchored.ok === false ? misanchored.message : "", /revision/i);
+
+  // The intended end state must be the one the operation can actually reach.
+  const wrongTarget = beginOperation(bound, {
+    ...writeParams(bound, { revision: 1, proved: [], unresolved: [], next: "" }),
+    expectedState: "detached",
+  });
+  assert.equal(wrongTarget.ok, false, "a write cannot intend to reach `detached`");
+
+  // Binding twice would replace an authority without detaching from it.
+  const rebind = beginOperation(bound, bindParams(bound, operationId("bind")));
+  assert.equal(rebind.ok, false, "a second bind over a live binding is refused");
+  assert.match(rebind.ok === false ? rebind.message : "", /bound|detach/i);
+
+  // Nothing illegal is written to the snapshot, and nothing reached the peer.
+  assert.equal(bound.backend.pending, null, "no illegal intent was persisted");
+  assert.equal(peer.commits, 1, "only the legal bind committed");
+
+  // A mutation cannot be planned while the bound authority is unavailable.
+  const lost = markPeerUnavailable(bound, "the peer was unloaded");
+  const whileLost = beginOperation(lost, writeParams(bound, { revision: 1, proved: [], unresolved: [], next: "" }));
+  assert.equal(whileLost.ok, false, "a write cannot be planned against an unavailable backend");
+  assert.equal(lost.backend.pending, null);
+});
+
+test("B12: a permissive peer cannot promote Goal to bound-available without a bind", async () => {
+  // The peer here is lax about scope ownership — a buggy or over-eager peer is
+  // exactly the case the Goal side must not depend on. Legality is Goal's own
+  // check, made before the intent is persisted, never delegated to the peer.
+  const peer = createFakePeer({ laxScope: true });
+  const goal = twoStepGoal();
+  assert.equal(goal.backend.state, "unbound", "sanity: nothing has bound this goal");
+
+  const result = await runPeerOperation(goal, peer, {
+    operationId: operationId("write"),
+    kind: "write",
+    expectedState: "bound-available",
+    payload: { memory: { revision: 1, proved: ["smuggled"], unresolved: [], next: "" } },
+    selection: SELECTION_A,
+    expectedRevision: null,
+  });
+
+  assert.equal(result.ok, false, "the operation is refused");
+  assert.equal(peer.calls.length, 0, "and it never reaches the peer");
+  assert.equal(peer.commits, 0, "so nothing is committed for a scope that was never bound");
+  assert.equal(result.goal.backend.state, "unbound", "the goal is still unbound");
+  assert.equal(result.goal.backend.binding, null, "no binding was installed by a receipt");
+  assert.equal(result.goal.backend.pending, null, "and no intent was left behind");
 });
