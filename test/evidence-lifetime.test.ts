@@ -107,3 +107,45 @@ test("P4: a credit never refunds lifetime requests", () => {
     "the working total is renewed, which is the point of the credit",
   );
 });
+
+test("P4: credit grants are capped so the dedupe record can never age out", () => {
+  // The eviction replay: submit MAX_CREDITED_EVIDENCE+1 distinct valid keys,
+  // evict the first digest, then resubmit that artifact for another grant with
+  // no new work. lifetimeRequests does NOT bound this — creditVerifiedEvidence
+  // never touches it, and one memory update can carry many refs, so credits are
+  // not coupled to admitted requests at all.
+  const { goal } = fixture();
+  const ceiling = goal.execution.lifetimeCeiling;
+
+  let current = cloneGoal(goal);
+  let granted = 0;
+  for (let index = 0; index < 5000; index += 1) {
+    const outcome = creditVerifiedEvidence(current, [
+      `read#docs/f-${index}.md#${index.toString(16).padStart(16, "0")}`,
+    ]);
+    if (outcome.creditedKeys.length === 0) {
+      break;
+    }
+    current = outcome.goal;
+    granted += 1;
+  }
+
+  assert.ok(
+    granted <= ceiling,
+    `credit grants must be capped for the goal's lifetime; got ${granted}`,
+  );
+  assert.ok(
+    granted < 4096,
+    "and the cap must bite before the dedupe record could ever evict an entry",
+  );
+  assert.equal(
+    current.creditedEvidence.length,
+    granted,
+    "so every key ever credited is still remembered",
+  );
+
+  // Past the cap nothing more is granted, and the working total stops moving.
+  const exhausted = creditVerifiedEvidence(current, ["read#docs/one-more.md#0123456789abcdef"]);
+  assert.deepEqual(exhausted.creditedKeys, [], "no grant past the cap");
+  assert.equal(exhausted.goal.execution.totalRemaining, current.execution.totalRemaining);
+});

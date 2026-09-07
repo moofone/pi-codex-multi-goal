@@ -205,8 +205,8 @@ function migrateCreditedEvidence(goal: MultiGoal): string[] {
 }
 
 /** Stamp a freshly constructed goal with the identity of its current contract. */
-function sealGoal(goal: Omit<MultiGoal, "contractRevision" | "creditedEvidence">): MultiGoal {
-  return { ...goal, contractRevision: currentContractRevision(goal), creditedEvidence: [] };
+function sealGoal(goal: Omit<MultiGoal, "contractRevision" | "creditedEvidence" | "creditGrants">): MultiGoal {
+  return { ...goal, contractRevision: currentContractRevision(goal), creditedEvidence: [], creditGrants: 0 };
 }
 
 export function cloneGoal(goal: MultiGoal): MultiGoal {
@@ -216,6 +216,7 @@ export function cloneGoal(goal: MultiGoal): MultiGoal {
     index: goal.index,
     contractRevision: currentContractRevision(goal),
     creditedEvidence: migrateCreditedEvidence(goal),
+    creditGrants: goal.creditGrants ?? 0,
     createdAt: goal.createdAt,
     updatedAt: goal.updatedAt,
     isolationCutoff: goal.isolationCutoff ?? null,
@@ -648,6 +649,11 @@ export function isMultiGoal(value: unknown): value is MultiGoal {
     !(goal.backend === undefined || isGoalBackend(goal.backend)) ||
     !(goal.pauseReason === null || typeof goal.pauseReason === "string")
   ) {
+    return false;
+  }
+  // Monotonic and optional on older snapshots; materialized as 0 on load.
+  const grants = goal.creditGrants;
+  if (grants !== undefined && !(Number.isInteger(grants) && grants >= 0)) {
     return false;
   }
   // The credited-evidence record is optional on older snapshots and is

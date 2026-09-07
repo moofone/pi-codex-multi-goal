@@ -39,6 +39,12 @@ export const BUDGET_WARNING_FRACTION = 0.8;
  */
 export const MAX_CREDITED_EVIDENCE = 4096;
 
+/**
+ * Digests kept in reserve above the credit-grant cap, so the dedupe record is
+ * strictly larger than the number of credits a goal can ever receive.
+ */
+export const MAX_CREDIT_GRANT_HEADROOM = 96;
+
 /** Hex characters of the stored dedupe digest. */
 export const CREDIT_DIGEST_HEX_CHARS = 16;
 
@@ -239,6 +245,18 @@ export interface MultiGoal {
    * another grant, with no new work done.
    */
   creditedEvidence: string[];
+  /**
+   * Credits granted over this goal's whole life. Monotonic: nothing resets it,
+   * not a step transition and not `/goal resume`.
+   *
+   * It exists to make eviction from `creditedEvidence` unreachable rather than
+   * merely unlikely. `lifetimeRequests` does not bound crediting — it is only
+   * charged at provider entry, while one memory update can carry many refs — so
+   * without this counter an agent could credit past `MAX_CREDITED_EVIDENCE`,
+   * age out the earliest digest, and replay that artifact for another grant
+   * having done no new work.
+   */
+  creditGrants: number;
   createdAt: number;
   updatedAt: number;
   memory: GoalMemory;
