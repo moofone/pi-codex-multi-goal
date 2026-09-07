@@ -104,6 +104,14 @@ export interface MultiGoal {
   status: GoalStatus;
   stages: Stage[];
   index: number;
+  /**
+   * Deterministic identity of the current step's human contract: sha256 of the
+   * objective, the ordered criterion IDs and text, and the human-decision
+   * flags. Derived from the criteria, never authored, and recomputed on every
+   * load, so a stale or tampered stored value cannot make a bound peer trust
+   * the wrong contract. See `computeContractRevision`.
+   */
+  contractRevision: string;
   createdAt: number;
   updatedAt: number;
   memory: GoalMemory;
