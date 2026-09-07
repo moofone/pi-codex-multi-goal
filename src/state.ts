@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import {
   emptyBackend,
   endStageBinding,
+  isBackendConsistentWithGoal,
   isGoalBackend,
   normalizeBackend,
 } from "./backend.js";
@@ -684,6 +685,26 @@ export function isMultiGoal(value: unknown): value is MultiGoal {
         (stage.status !== "pending" && stage.status !== "active") || stage.criteria.length > 0,
     );
     if (!runnableStagesHaveCriteria) {
+      return false;
+    }
+  }
+
+  // Containment: the backend is validated in isolation above, which cannot see
+  // the goal it belongs to. A binding for another goal — or an intent or
+  // retained record naming another stage's work — is a valid backend on its own
+  // and would reload as authoritative here. The contract revision is recomputed
+  // rather than read from the snapshot, because the stored value is derived
+  // state that a forged or stale snapshot may disagree with.
+  if (goal.backend !== undefined) {
+    const stage = goal.stages[goal.index]!;
+    if (
+      !isBackendConsistentWithGoal(goal.backend, {
+        goalId: goal.goalId,
+        stageId: stage.id,
+        contractRevision: computeContractRevision(stage),
+        generation: goal.execution.generation,
+      })
+    ) {
       return false;
     }
   }

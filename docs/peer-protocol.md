@@ -448,6 +448,29 @@ which is not an identity. Payload digests are sha256 hex.
 A pending intent's `expectedState` must be the state its kind can reach (§6.1),
 because that field is what the acknowledgement promotes on.
 
+**Containment: a component must also be consistent with its container.** The
+rules above are internal — a backend consistent with its own fields, a receipt
+consistent with its own record — and a standalone predicate cannot see the goal
+it belongs to, so a binding for a *different goal entirely* is a valid backend
+in isolation and would reload as authoritative, with subsequent operations using
+its selected revision while building a scope for the goal actually in hand.
+
+The split is between what a component says it is ABOUT and when or where it was
+made:
+
+| Field | Rule |
+|---|---|
+| `binding.goalId`, `binding.stageId` | must be the container's current goal and stage |
+| `binding.contractRevision` | must be the contract in force — the binding is the LIVE authority, and the peer mirrors that contract; a mirror of a superseded one is not something to keep executing against. Recomputed from the criteria, never read from the snapshot |
+| `binding.generation` | may LAG. §3: a resume may replace execution authority while retaining the memory scope. It may not exceed the container's |
+| `pending.scope.consumer`, `pending.scope.scopeId` | must name the container's current work |
+| `pending.scope.epoch`, `pending.scope.contractRevision` | may LAG — a stale-epoch intent is exactly what the acknowledgement quarantines, so it has to survive the reload to be quarantined at all; making it malformed would skip the snapshot and lose the intent §4 says to retain |
+| retained record `scope.consumer`, `scope.scopeId` | must name the container's current work |
+| retained record `scope.epoch`, `scope.contractRevision`, `scope.selection` | may DIFFER — a record keeps the branch it was planned on, and that is the record of a branch move, which is the replay protection it exists to provide |
+
+Read as one rule: **which work a component concerns must agree with the
+container; when and where it was made need not.**
+
 ### 6.1 Operation legality
 
 The state machine above is enforced by the caller **before the intent is

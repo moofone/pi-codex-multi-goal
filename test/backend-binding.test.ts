@@ -1488,6 +1488,41 @@ test("B23: no peer answer discards a pending intent unless it correlates and is 
 
   assert.ok(quarantines >= 5, `sanity: the space exercises the quarantine path (${quarantines} times)`);
   assert.ok(misdirected >= 10, `sanity: the space exercises misdirection (${misdirected} answers)`);
+
+  // The hole this guard had: it drove every answer at a goal with a PENDING
+  // intent, so the no-pending idempotency branch — which is the one that
+  // answers a replay from retention — was outside everything it covered. The
+  // same space, through the other path.
+  const settled = planned.goal.backend.pending
+    ? { ...bound }
+    : bound;
+  assert.equal(settled.backend.pending, null, "sanity: this goal has no intent in flight");
+  const genuine = settled.backend.operations.find((record) => record.outcome === "committed");
+  assert.ok(genuine?.receipt, "sanity: it has a retained receipt a replay could legitimately return");
+
+  for (const answer of space) {
+    let after: ReturnType<typeof acceptReceipt>;
+    try {
+      after = acceptReceipt(settled, answer.response, SELECTION_A);
+    } catch (error) {
+      assert.fail(`a malformed answer must be rejected, not thrown on: ${answer.label} (${String(error)})`);
+    }
+
+    assert.equal(
+      JSON.stringify(after.goal.backend),
+      JSON.stringify(settled.backend),
+      `an answer with no intent to attach to must change nothing: ${answer.label}`,
+    );
+    if (after.ok) {
+      // The only acceptable success is a genuine, complete replay of something
+      // already acknowledged — and it returns what was retained.
+      assert.deepEqual(
+        after.receipt,
+        genuine!.receipt,
+        `only a real retained receipt may be returned as success: ${answer.label}`,
+      );
+    }
+  }
 });
 
 // --- B24: replay identity is the whole intent ----------------------------
@@ -1823,4 +1858,269 @@ test("B27: scopesEqual and verifyReceipt agree on what makes two scopes differ",
   }
 
   assert.equal(scopesEqual(base, { ...base }), true, "sanity: an identical scope is equal");
+});
+
+// --- B29: the no-pending replay branch verifies like every other path ----
+
+/**
+ * Review finding (P1, src/backend.ts): with no intent pending, acceptReceipt
+ * accepted any committed response whose operation id, payload digest and scope
+ * matched a retained record — without calling verifyReceipt, and so without
+ * checking the receipt's shape, protocol version, selected revision or
+ * timestamp. It also read `response.receipt.operationId` before establishing
+ * that a receipt was there at all, so a malformed answer threw instead of being
+ * rejected.
+ */
+test("B29: a replay answered from retention is verified, not assumed", async () => {
+  const peer = createFakePeer();
+  const bound = await bind(twoStepGoal(), peer);
+  assert.equal(bound.backend.pending, null, "sanity: nothing is in flight");
+  const record = bound.backend.operations.find((entry) => entry.outcome === "committed");
+  assert.ok(record?.receipt, "sanity: there is a retained receipt");
+  const good = record!.receipt!;
+
+  // A genuine replay still succeeds, and returns what was retained.
+  const honest = acceptReceipt(bound, { status: "committed", receipt: good }, SELECTION_A);
+  assert.equal(honest.ok, true, honest.ok ? "" : honest.message);
+  assert.deepEqual(honest.ok ? honest.receipt : null, good);
+
+  // A malformed answer is rejected, never thrown on.
+  for (const [label, response] of [
+    ["a committed status with no receipt", { status: "committed" }],
+    ["a committed status with a null receipt", { status: "committed", receipt: null }],
+    ["a committed status with a non-object receipt", { status: "committed", receipt: "yes" }],
+  ] as Array<[string, any]>) {
+    let outcome: ReturnType<typeof acceptReceipt>;
+    try {
+      outcome = acceptReceipt(bound, response, SELECTION_A);
+    } catch (error) {
+      assert.fail(`${label} must be rejected, not thrown on (${String(error)})`);
+    }
+    assert.equal(outcome.ok, false, `${label} must not be accepted`);
+  }
+
+  // A forged answer that matches the record's identity but is not a valid
+  // receipt must not be acknowledged.
+  const forgeries: Array<[string, Record<string, unknown>]> = [
+    ["an unreadable protocol version", { protocolVersion: 99 }],
+    ["no commit timestamp", { committedAt: undefined }],
+    ["a non-numeric commit timestamp", { committedAt: "soon" }],
+    ["no selected revision", { selectedRevision: undefined }],
+    ["a blank selected revision", { selectedRevision: "   " }],
+  ];
+  for (const [label, override] of forgeries) {
+    const outcome = acceptReceipt(
+      bound,
+      { status: "committed", receipt: { ...good, ...override } } as any,
+      SELECTION_A,
+    );
+    assert.equal(outcome.ok, false, `a retained replay with ${label} must not be acknowledged`);
+  }
+});
+
+// --- B30: a component must be consistent with its container --------------
+
+/**
+ * Review finding (P1, src/state.ts): every consistency rule so far has been
+ * INTERNAL — a backend state consistent with its own fields, a receipt
+ * consistent with its own record. isGoalBackend is a standalone predicate, so
+ * by construction it cannot see the goal it belongs to, and a binding for a
+ * different goal entirely, or for a superseded stage, is a perfectly valid
+ * backend in isolation and reloads as authoritative.
+ *
+ * The rule this adds is containment: a component must also be consistent with
+ * its container. Which fields must match, and which may legitimately lag, is
+ * the whole content of the fix — see the second test.
+ */
+function scopeIdOf(goal: MultiGoal): string {
+  return goalScopeId(goal.goalId, currentStage(goal).id);
+}
+
+function bindingFor(goal: MultiGoal, overrides: Record<string, unknown> = {}): any {
+  return {
+    peerId: "fake-dag-peer",
+    taskId: "task-1",
+    goalId: goal.goalId,
+    stageId: currentStage(goal).id,
+    generation: goal.execution.generation,
+    contractRevision: goal.contractRevision,
+    sessionId: "session-a",
+    branchAnchorId: "anchor-1",
+    selectedRevision: "rev-3",
+    ...overrides,
+  };
+}
+
+test("B30: a binding that does not belong to its goal is malformed", () => {
+  const goal = twoStepGoal();
+  const boundGoal = (binding: any): MultiGoal => ({
+    ...goal,
+    backend: { state: "bound-available", binding, pending: null, operations: [], reason: null },
+  });
+
+  assert.equal(isMultiGoal(boundGoal(bindingFor(goal))), true, "sanity: an honest binding loads");
+
+  const foreign: Array<[string, Record<string, unknown>]> = [
+    ["another goal entirely", { goalId: "some-other-goal" }],
+    ["another stage of this goal", { stageId: goal.stages[1]!.id }],
+    ["a stage that does not exist", { stageId: "no-such-stage" }],
+    ["a superseded contract revision", { contractRevision: "f".repeat(64) }],
+    ["an execution generation from the future", { generation: goal.execution.generation + 1 }],
+  ];
+  for (const [label, override] of foreign) {
+    assert.equal(
+      isMultiGoal(boundGoal(bindingFor(goal, override))),
+      false,
+      `a binding for ${label} must not reload as authoritative`,
+    );
+  }
+});
+
+test("B30: the fields that may legitimately lag their container still load", () => {
+  // This is the substance of the rule, not a footnote. A component that records
+  // WHICH WORK it concerns must agree with the container. A component that
+  // records WHEN it was made may lag, because the recovery machinery exists to
+  // notice exactly that and quarantine it — making those snapshots malformed
+  // would skip the snapshot instead of recovering the operation, losing the
+  // intent §4 says to retain.
+  const goal = twoStepGoal();
+  const advanced: MultiGoal = { ...goal, execution: { ...goal.execution, generation: 3 } };
+  const scope = (overrides: Record<string, unknown> = {}) => ({
+    consumer: "pi-codex-multi-goal",
+    scopeId: scopeIdOf(goal),
+    contractRevision: goal.contractRevision,
+    epoch: 3,
+    selection: { sessionId: "session-a", branchAnchorId: "anchor-1" },
+    ...overrides,
+  });
+
+  // §3: a resume may replace execution authority while retaining the memory
+  // scope, so a binding made in an earlier generation is not stale state.
+  assert.equal(
+    isMultiGoal({
+      ...advanced,
+      backend: {
+        state: "bound-available",
+        binding: bindingFor(advanced, { generation: 0 }),
+        pending: null,
+        operations: [],
+        reason: null,
+      },
+    }),
+    true,
+    "a binding from an earlier generation is legitimate (§3), not malformed",
+  );
+
+  // A pending intent planned in an earlier generation is what acceptReceipt
+  // quarantines as stale-epoch. It must survive the reload to be quarantined.
+  assert.equal(
+    isMultiGoal({
+      ...advanced,
+      backend: {
+        state: "binding-pending",
+        binding: null,
+        pending: {
+          operationId: "op-old",
+          kind: "bind",
+          expectedState: "bound-available",
+          previousState: "unbound",
+          scope: scope({ epoch: 0 }),
+          expectedRevision: null,
+          payloadDigest: "a".repeat(64),
+          payload: {},
+          createdAt: 1,
+        },
+        operations: [],
+        reason: null,
+      },
+    }),
+    true,
+    "a pending intent from an earlier generation must reload so it can be quarantined",
+  );
+
+  // A retained record keeps the branch it was planned on — that IS the record
+  // of a branch move, and refusing it would discard replay protection.
+  assert.equal(
+    isMultiGoal({
+      ...advanced,
+      backend: {
+        state: "bound-available",
+        binding: bindingFor(advanced),
+        pending: null,
+        operations: [
+          {
+            operationId: "op-elsewhere",
+            kind: "write",
+            scope: scope({ epoch: 0, selection: { sessionId: "session-a", branchAnchorId: "anchor-99" } }),
+            expectedRevision: "rev-1",
+            payloadDigest: "b".repeat(64),
+            outcome: "quarantined",
+            receipt: null,
+            reason: "the branch moved",
+          },
+        ],
+        reason: null,
+      },
+    }),
+    true,
+    "a quarantined record for another branch is replay protection, not corruption",
+  );
+
+  // But WHICH WORK it concerns must still agree with the container.
+  for (const [label, wrong] of [
+    ["a pending intent for another stage", scope({ scopeId: goalScopeId(goal.goalId, goal.stages[1]!.id) })],
+    ["a pending intent for another goal", scope({ scopeId: goalScopeId("some-other-goal", currentStage(goal).id) })],
+    ["a pending intent for another consumer", scope({ consumer: "pi-research" })],
+  ] as Array<[string, any]>) {
+    assert.equal(
+      isMultiGoal({
+        ...advanced,
+        backend: {
+          state: "binding-pending",
+          binding: null,
+          pending: {
+            operationId: "op-foreign",
+            kind: "bind",
+            expectedState: "bound-available",
+            previousState: "unbound",
+            scope: wrong,
+            expectedRevision: null,
+            payloadDigest: "a".repeat(64),
+            payload: {},
+            createdAt: 1,
+          },
+          operations: [],
+          reason: null,
+        },
+      }),
+      false,
+      `${label} must not reload`,
+    );
+  }
+
+  assert.equal(
+    isMultiGoal({
+      ...advanced,
+      backend: {
+        state: "bound-available",
+        binding: bindingFor(advanced),
+        pending: null,
+        operations: [
+          {
+            operationId: "op-foreign",
+            kind: "write",
+            scope: scope({ scopeId: goalScopeId("some-other-goal", currentStage(goal).id) }),
+            expectedRevision: "rev-1",
+            payloadDigest: "b".repeat(64),
+            outcome: "quarantined",
+            receipt: null,
+            reason: "not ours",
+          },
+        ],
+        reason: null,
+      },
+    }),
+    false,
+    "a retained record for another goal must not reload",
+  );
 });

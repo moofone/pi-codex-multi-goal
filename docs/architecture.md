@@ -36,6 +36,11 @@ maintains a small evidence record, and reports completion or a blocker.
 - Compaction, reload, and retries preserve the current step's accounting. Only
   verified progress, an explicit user resume, or a legitimate new step starts a
   fresh no-progress allowance.
+- A component must be consistent with its container, not only with itself. A
+  binding, a pending operation, or a retained receipt that names another goal or
+  another stage is rejected on load rather than reloading as authoritative —
+  while the fields that record when or where it was made are allowed to lag,
+  because noticing that is what the recovery path is for.
 - Every writer must satisfy the invariant the reader enforces. A transition
   that produces a state the snapshot validator rejects leaves a goal running
   until it reloads and is then skipped as malformed, so state is derived from

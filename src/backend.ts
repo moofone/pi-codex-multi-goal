@@ -312,6 +312,73 @@ export function isGoalBackend(value: unknown): value is GoalBackend {
 }
 
 /**
+ * Identity of the goal a backend record must belong to. Supplied by the caller
+ * rather than read off the snapshot, because a stored `contractRevision` may be
+ * stale or tampered — the value that counts is the one recomputed from the
+ * criteria.
+ */
+export interface GoalIdentity {
+  goalId: string;
+  stageId: string;
+  contractRevision: string;
+  generation: number;
+}
+
+/**
+ * Containment: a component must be consistent with its CONTAINER, not only with
+ * itself.
+ *
+ * Every other rule in this file is internal — a backend state consistent with
+ * its own fields, a receipt consistent with its own record. isGoalBackend is a
+ * standalone predicate, so by construction it cannot see the goal it belongs
+ * to, and a binding for a different goal entirely is a perfectly valid backend
+ * in isolation. It would reload as authoritative, and subsequent operations
+ * would use its selected revision while building a scope for the goal actually
+ * in hand — authority and identity pointing at different things.
+ *
+ * Which fields must match is the substance here:
+ *
+ *  - WHICH WORK a component concerns must agree with the container. A binding's
+ *    goal and stage, and the `scopeId` of any intent or retained record, name
+ *    the work; naming someone else's is corruption, not history.
+ *  - WHEN a component was made may lag. §3 is explicit that a resume may
+ *    replace execution authority while retaining the memory scope, so a binding
+ *    from an earlier generation is legitimate. A pending intent from an earlier
+ *    generation is precisely what acceptReceipt quarantines as `stale-epoch` —
+ *    it has to survive the reload to be quarantined, or the snapshot would be
+ *    skipped and the intent §4 says to retain would be lost instead.
+ *  - WHERE a retained record was planned may differ. A record keeps the branch
+ *    it was planned on; that IS the record of a branch move, and refusing it
+ *    would discard the replay protection it exists to provide.
+ *
+ * The binding is held to the contract revision as well, because it is the LIVE
+ * authority: the peer mirrors the contract, and a mirror of a superseded one is
+ * not something to keep executing against. Intents and retained records are
+ * plans and history, so theirs may lag.
+ */
+export function isBackendConsistentWithGoal(backend: GoalBackend, goal: GoalIdentity): boolean {
+  const scopeId = goalScopeId(goal.goalId, goal.stageId);
+  const binding = backend.binding;
+  if (binding) {
+    if (
+      binding.goalId !== goal.goalId ||
+      binding.stageId !== goal.stageId ||
+      binding.contractRevision !== goal.contractRevision ||
+      !Number.isInteger(binding.generation) ||
+      binding.generation > goal.generation
+    ) {
+      return false;
+    }
+  }
+  const namesThisWork = (scope: PeerScope): boolean =>
+    scope.consumer === GOAL_CONSUMER && scope.scopeId === scopeId && scope.epoch <= goal.generation;
+  if (backend.pending && !namesThisWork(backend.pending.scope)) {
+    return false;
+  }
+  return backend.operations.every((record) => namesThisWork(record.scope));
+}
+
+/**
  * The stage's scope identity. `Stage.id` and not the displayed step number,
  * because the displayed number changes meaning at every transition while the id
  * does not (D7).
@@ -802,20 +869,24 @@ export function acceptReceipt(
 ): AcceptResult {
   const pending = goal.backend.pending;
   if (!pending) {
-    // No current intent. An identical, already-acknowledged operation is
-    // idempotent; anything else is a late callback with nothing to attach to.
-    if (response.status === "committed") {
+    // No current intent. An already-acknowledged operation replays
+    // idempotently; anything else is a late callback with nothing to attach to.
+    //
+    // This branch verifies exactly as hard as the pending one. It previously
+    // took an id, a digest and a scope as proof and skipped the receipt's shape
+    // entirely — and read `response.receipt.operationId` before establishing a
+    // receipt was there, so a malformed answer threw rather than being
+    // rejected. The shape check comes first, and the receipt is then held to
+    // the same isCompleteReceipt predicate the snapshot validator applies.
+    if (response.status === "committed" && isWellFormedReceipt(response.receipt)) {
       const record = goal.backend.operations.find(
         (entry) => entry.operationId === response.receipt.operationId && entry.outcome === "committed",
       );
-      // Identity is the whole intent here too: an id and a payload digest do
-      // not distinguish two operations that differ in scope or selection.
-      if (
-        record &&
-        record.payloadDigest === response.receipt.payloadDigest &&
-        scopesEqual(record.scope, response.receipt.scope)
-      ) {
-        return { ok: true, goal, receipt: response.receipt };
+      if (record && isCompleteReceipt(response.receipt, record) && isCompleteReceipt(record.receipt, record)) {
+        // Return what Goal ACKNOWLEDGED, not what the answer carried: the
+        // retained receipt is the one already verified and persisted, so a
+        // response cannot restate a committed operation with different content.
+        return { ok: true, goal, receipt: record.receipt! };
       }
     }
     return {
