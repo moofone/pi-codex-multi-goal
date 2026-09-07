@@ -581,6 +581,11 @@ export function beginOperation(goal: MultiGoal, params: OperationParams): BeginR
       message: "a read mutates nothing and needs no persisted intent; call the peer directly",
     };
   }
+  if (typeof params.operationId !== "string" || params.operationId.length === 0) {
+    // The validator requires a non-empty operation id, so the writer must too:
+    // an intent it refuses would make the whole snapshot unloadable.
+    return { ok: false, goal, code: "refused", message: "an operation needs a non-empty operation id" };
+  }
   const backend = goal.backend;
   const digest = canonicalDigest(params.payload);
   const replay = resolveReplay(backend, params.operationId, digest);
@@ -661,11 +666,27 @@ export type AcceptResult =
   | { ok: true; goal: MultiGoal; receipt: PeerReceipt; projection?: unknown }
   | { ok: false; goal: MultiGoal; code: ReceiptRejection; message: string };
 
+/**
+ * The state to settle into once an intent is gone.
+ *
+ * A recorded `previousState` is a memory of how things were, not a fact about
+ * how they are: restoring `binding-pending` after clearing the intent would
+ * assert a bind is in flight when none is, which isGoalBackend rejects. The
+ * answer is derived from what is actually true — a binding means bound, no
+ * binding means unbound — so a writer cannot mint a state the reader refuses.
+ */
+function settledState(preferred: GoalBackendState, binding: GoalBackend["binding"]): GoalBackendState {
+  if (preferred !== "binding-pending") {
+    return preferred;
+  }
+  return binding ? "bound-available" : "unbound";
+}
+
 function quarantine(goal: MultiGoal, pending: PendingOperation, reason: string, state?: GoalBackendState): MultiGoal {
   const next = cloneGoal(goal);
   next.backend = {
     ...next.backend,
-    state: state ?? pending.previousState,
+    state: settledState(state ?? pending.previousState, next.backend.binding),
     pending: null,
     operations: retain(next.backend, {
       operationId: pending.operationId,
@@ -966,9 +987,21 @@ export function markPeerUnavailable(goal: MultiGoal, reason: string): MultiGoal 
   return next;
 }
 
-/** The peer answered again on the revision Goal still believes is selected. */
+/**
+ * The peer answered again on the revision Goal still believes is selected.
+ *
+ * An empty revision is refused rather than written: `bound-available` admits
+ * execution, but checkOperationLegality reads an empty selected revision as
+ * missing, so the goal would be runnable and unable to plan a single backend
+ * operation — and isGoalBackend rejects that snapshot, so the goal would run
+ * until it reloaded and then be skipped as malformed. A writer that produces a
+ * state the reader refuses turns a live goal into an unloadable one.
+ */
 export function markPeerAvailable(goal: MultiGoal, selectedRevision: string): MultiGoal {
   if (goal.backend.state !== "bound-unavailable" || !goal.backend.binding) {
+    return goal;
+  }
+  if (typeof selectedRevision !== "string" || selectedRevision.trim().length === 0) {
     return goal;
   }
   const next = cloneGoal(goal);

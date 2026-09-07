@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { linkSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
@@ -162,4 +162,77 @@ test("B20: a dangling symlink is refused rather than crashing validation", (t) =
 
   const result = validateEvidenceRefs(goal, [ref(goal, "dangling.txt", "x\n")]);
   assert.equal(result.ok, false, "a link to nothing is not evidence");
+});
+
+/**
+ * B22 (review finding, P1, src/evidence.ts): returning the realpath'd STRING
+ * closes the gap between the two reads, not the gap between the resolution and
+ * the reads. A local writer can replace a checked directory or file with a link
+ * to an outside path in between, and the fingerprint then covers outside bytes.
+ *
+ * Node exposes no `openat`, and `O_NOFOLLOW` constrains only the final path
+ * component, so this is narrowed rather than eliminated. The mitigation opens
+ * once, pins the inode it opened, re-resolves and containment-checks the name,
+ * requires the resolved name to still be that same inode, and reads FROM the
+ * descriptor — so the bytes fingerprinted always come from an inode that was
+ * reachable at a contained path at check time. See resolveArtifactContent for
+ * the residual risk, and the two characterisation tests below.
+ */
+
+test("B22: a directory named as an artifact is refused", (t) => {
+  const ws = workspace(t);
+  const goal = oneStepGoal();
+  mkdirSync(join(ws.root, "src", "nested"), { recursive: true });
+
+  const result = validateEvidenceRefs(goal, [ref(goal, "src/nested", "x\n")]);
+  assert.equal(result.ok, false, "a directory has no bytes to fingerprint");
+});
+
+test("B22: the fingerprint covers the bytes actually read, not the name", (t) => {
+  const ws = workspace(t);
+  const goal = oneStepGoal();
+  const content = "measured output\n";
+  ws.write("out/run.json", content);
+  symlinkSync(join(ws.root, "out"), join(ws.root, "latest"));
+
+  // Both names reach one inode; both must fingerprint that inode's bytes.
+  const direct = validateEvidenceRefs(goal, [ref(goal, "out/run.json", content)]);
+  const linked = validateEvidenceRefs(goal, [ref(goal, "latest/run.json", content)]);
+  assert.equal(direct.ok, true, direct.ok ? "" : direct.message);
+  assert.equal(linked.ok, true, linked.ok ? "" : linked.message);
+
+  // And a stale fingerprint is still caught through the link.
+  const stale = validateEvidenceRefs(goal, [ref(goal, "latest/run.json", "different bytes\n")]);
+  assert.equal(stale.ok, false, "a fingerprint that does not match the read bytes is refused");
+});
+
+test("B22: KNOWN RESIDUAL — a hard link inside the workspace is indistinguishable", (t) => {
+  // Recorded deliberately so the limitation cannot be forgotten, and so that
+  // closing it later fails loudly here rather than passing silently.
+  //
+  // A hard link inside the workspace shares the inode of its outside target, so
+  // it IS reachable at a contained path and no path-based check can tell it
+  // apart from an ordinary file. It is accepted, and the inode pin cannot help.
+  //
+  // Severity is genuinely low: creating one requires write access inside the
+  // workspace, and anyone with that could copy the same bytes in directly. The
+  // containment rule ties evidence to project artifacts; it is not a
+  // confidentiality boundary, and it never was.
+  const ws = workspace(t);
+  const goal = oneStepGoal();
+  const content = "bytes that live outside\n";
+  const outsideFile = join(ws.outside, "data.txt");
+  writeFileSync(outsideFile, content);
+  try {
+    linkSync(outsideFile, join(ws.root, "linked.txt"));
+  } catch {
+    return; // same-filesystem hard links unavailable here; nothing to characterise
+  }
+
+  const result = validateEvidenceRefs(goal, [ref(goal, "linked.txt", content)]);
+  assert.equal(
+    result.ok,
+    true,
+    "documented residual: a hard link is a real directory entry inside the workspace",
+  );
 });

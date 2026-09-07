@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { readFileSync, realpathSync, statSync } from "node:fs";
+import { closeSync, fstatSync, openSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { isAbsolute, relative, resolve } from "node:path";
 
 import { currentStage } from "./state.js";
@@ -59,7 +59,15 @@ export function fingerprintContent(bytes: Uint8Array): string {
   return createHash("sha256").update(bytes).digest("hex").slice(0, FINGERPRINT_HEX_CHARS);
 }
 
-/** The fingerprint of a file's current bytes, or null when it cannot be read. */
+/**
+ * The fingerprint of a file's current bytes, or null when it cannot be read.
+ *
+ * NOT for the validation path. It resolves the file BY NAME, which is exactly
+ * the window resolveArtifactContent exists to close: between a containment
+ * check and a name-based read, a local writer can swap the path for a link out
+ * of the workspace. Validation opens once and reads from the descriptor it
+ * checked. Use this only where the bytes are not evidence for credit.
+ */
 export function fingerprintFile(absolutePath: string): string | null {
   try {
     return fingerprintContent(readFileSync(absolutePath));
@@ -92,35 +100,57 @@ function containedBy(root: string, candidate: string): boolean {
   return step === "" || (!step.startsWith("..") && !isAbsolute(step));
 }
 
-export type ArtifactResolution =
-  | { ok: true; path: string }
+export type ArtifactContent =
+  | { ok: true; bytes: Uint8Array }
   /** Outside the workspace, by traversal, absolute path, or a link that leaves it. */
   | { ok: false; reason: "outside" }
-  /** Inside the workspace, but nothing is there to fingerprint. */
+  /** Inside the workspace, but there is no readable file there to fingerprint. */
   | { ok: false; reason: "missing" };
 
 /**
- * Resolve an evidence ref to a real path inside the workspace.
+ * Read an evidence artifact's bytes, proving as we go that they belong to the
+ * project workspace.
  *
- * The lexical `resolve` + `relative` pair only proves the STRING stays under
- * the working directory. It says nothing about where a symlink INSIDE the
- * workspace points, and statSync/readFileSync follow links — so a ref naming an
- * ordinary-looking project path could fingerprint any readable file on the
- * machine. Since D4 that is not merely a false claim: a credited ref returns a
- * capped grant to the working request budget, so it would be a way to buy
- * execution budget by pointing at /etc/hosts.
+ * A lexical `resolve` + `relative` pair only proves the STRING stays under the
+ * working directory; it says nothing about where a symlink inside the workspace
+ * points, and stat/read follow links. Resolving the real path first and reusing
+ * that string closes the gap between the two reads but NOT the gap between the
+ * resolution and the reads — a local writer can swap a checked directory or
+ * file for a link to an outside path in between, and the fingerprint then
+ * covers outside bytes. Since D4 that is not merely a false claim: a credited
+ * ref returns a capped grant to the working request budget, so fingerprinting
+ * outside bytes buys execution budget.
  *
- * Links are resolved rather than banned — a symlinked directory inside a
- * project is ordinary — and the REAL path is what is returned, so the caller
- * stats and reads exactly the path that was checked. There is no window
- * between the check and the read in which the target could be swapped for a
- * link out of the workspace.
+ * Node exposes no `openat`, and `O_NOFOLLOW` constrains only the final path
+ * component, so this is NARROWED, NOT ELIMINATED. The sequence is:
  *
- * The workspace root is realpath'd too: on a platform whose working directory
- * is reached through a symlink (macOS `/var` -> `/private/var`), comparing a
- * resolved target against an unresolved root would read as an escape.
+ *   1. open the path once, and hold the descriptor;
+ *   2. `fstat` the descriptor — the inode we will actually read;
+ *   3. resolve the real path and containment-check it by name;
+ *   4. `stat` that resolved name and require the SAME device and inode;
+ *   5. read from the DESCRIPTOR, never from the name again.
+ *
+ * A swap before the open makes step 3 resolve outside and fail. A swap after
+ * the open makes step 3 or step 4 disagree with the descriptor and fail. So the
+ * bytes fingerprinted always come from an inode that was reachable at a
+ * contained path at check time.
+ *
+ * Residual risks, stated rather than papered over:
+ *
+ *  - A HARD LINK inside the workspace to an outside file shares that file's
+ *    inode, so it genuinely is reachable at a contained path and no path-based
+ *    check can distinguish it. Accepted, and characterised in
+ *    test/evidence-workspace.test.ts.
+ *  - Steps 1, 3 and 4 are separate syscalls. The device/inode pin makes an
+ *    interleaved swap detectable rather than exploitable, but it is a
+ *    mitigation, not an atomic operation.
+ *
+ * Both require write access inside the workspace, which is a strictly weaker
+ * position than the agent's own: anyone holding it could copy the same bytes in
+ * directly. The containment rule ties evidence to project artifacts; it is not
+ * and never was a confidentiality boundary.
  */
-function resolveArtifactPath(artifact: string): ArtifactResolution {
+function resolveArtifactContent(artifact: string): ArtifactContent {
   if (artifact.length === 0 || isAbsolute(artifact)) {
     return { ok: false, reason: "outside" };
   }
@@ -135,17 +165,37 @@ function resolveArtifactPath(artifact: string): ArtifactResolution {
   if (!containedBy(root, resolved)) {
     return { ok: false, reason: "outside" };
   }
-  let real: string;
+
+  let fd: number | undefined;
   try {
-    real = realpathSync(resolved);
+    fd = openSync(resolved, "r");
+    const opened = fstatSync(fd);
+    if (!opened.isFile()) {
+      return { ok: false, reason: "missing" };
+    }
+    const real = realpathSync(resolved);
+    if (!containedBy(root, real)) {
+      return { ok: false, reason: "outside" };
+    }
+    const named = statSync(real);
+    if (named.dev !== opened.dev || named.ino !== opened.ino) {
+      // The name no longer refers to what we opened: something moved under us.
+      return { ok: false, reason: "outside" };
+    }
+    return { ok: true, bytes: readFileSync(fd) };
   } catch {
-    // No such path, or a dangling link: nothing to fingerprint either way.
+    // No such path, a dangling link, or an unreadable file: nothing to
+    // fingerprint either way.
     return { ok: false, reason: "missing" };
+  } finally {
+    if (fd !== undefined) {
+      try {
+        closeSync(fd);
+      } catch {
+        /* already gone */
+      }
+    }
   }
-  if (!containedBy(root, real)) {
-    return { ok: false, reason: "outside" };
-  }
-  return { ok: true, path: real };
 }
 
 function refFailure(index: number, message: string): { ok: false; message: string } {
@@ -183,26 +233,18 @@ export function validateEvidenceRefs(goal: MultiGoal, refs: unknown): EvidenceVa
     if (typeof ref.artifact !== "string") {
       return refFailure(index, "artifact must be a project-relative path without traversal");
     }
-    const resolution = resolveArtifactPath(ref.artifact);
-    if (!resolution.ok && resolution.reason === "outside") {
+    // One open, one read, one inode: the bytes are fetched and proved to belong
+    // to the workspace together, so the path is never resolved by name again
+    // between the check and the read.
+    const content = resolveArtifactContent(ref.artifact);
+    if (!content.ok && content.reason === "outside") {
       return refFailure(
         index,
         `artifact "${ref.artifact}" resolves outside the project workspace; evidence must be a ` +
           "project-relative path whose real target stays inside it (a link out of the workspace is not project evidence)",
       );
     }
-    if (!resolution.ok) {
-      return refFailure(index, `artifact "${ref.artifact}" does not exist`);
-    }
-    // The real, contained path — the same string that is stat'd and read below.
-    const artifactPath = resolution.path;
-    let exists = false;
-    try {
-      exists = statSync(artifactPath).isFile();
-    } catch {
-      exists = false;
-    }
-    if (!exists) {
+    if (!content.ok) {
       return refFailure(index, `artifact "${ref.artifact}" does not exist`);
     }
     if (
@@ -215,7 +257,7 @@ export function validateEvidenceRefs(goal: MultiGoal, refs: unknown): EvidenceVa
         `fingerprint must be ${FINGERPRINT_HEX_CHARS} lowercase hex characters (sha256 prefix of the artifact bytes)`,
       );
     }
-    const actual = fingerprintFile(artifactPath);
+    const actual = fingerprintContent(content.bytes);
     if (actual !== ref.fingerprint) {
       return refFailure(
         index,

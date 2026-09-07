@@ -36,6 +36,11 @@ maintains a small evidence record, and reports completion or a blocker.
 - Compaction, reload, and retries preserve the current step's accounting. Only
   verified progress, an explicit user resume, or a legitimate new step starts a
   fresh no-progress allowance.
+- Every writer must satisfy the invariant the reader enforces. A transition
+  that produces a state the snapshot validator rejects leaves a goal running
+  until it reloads and is then skipped as malformed, so state is derived from
+  what is true rather than replayed from what was recorded, and limits are
+  clamped where they are minted rather than only checked where they are read.
 - A persisted grant must respect the limits it declares: every counter is at or
   below the limit it is spent from, and the limits themselves are ordered
   (turn bound <= working total <= lifetime ceiling), since the fuses are checked
@@ -138,9 +143,16 @@ without repeatedly asking it to reconsider the goal.
   memory. Recovery restores that record with the human-defined criteria, without
   replaying a history of memory updates into model context.
 - Evidence artifacts must resolve to a real path inside the project workspace.
-  Links are followed, not banned, and the resolved real path is what is stat'd
-  and read, so a link inside the workspace cannot fingerprint a file outside it
-  and there is no window between the check and the read.
+  Links are followed, not banned. Validation opens the file once, pins the
+  device and inode it opened, containment-checks the resolved name, requires
+  that name to still be the same inode, and reads from the descriptor — so the
+  bytes fingerprinted always come from an inode reachable at a contained path at
+  check time. Node exposes no `openat` and `O_NOFOLLOW` covers only the last
+  path component, so this is narrowed, not eliminated: a hard link inside the
+  workspace shares its target's inode and is indistinguishable, and the checks
+  are separate syscalls. Both require write access inside the workspace, where
+  the same bytes could simply be copied in; the containment rule ties evidence
+  to project artifacts and is not a confidentiality boundary.
 - Completion must account for every success criterion with applicable evidence.
   Human-defined criteria do not imply approval at every transition; require a
   human completion decision only when the agreed criteria explicitly require it.

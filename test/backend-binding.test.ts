@@ -10,6 +10,8 @@ import {
   goalOwnsMemory,
   goalScope,
   goalScopeId,
+  isGoalBackend,
+  markPeerAvailable,
   markPeerUnavailable,
   reconcileSelection,
   resolveReplay,
@@ -20,6 +22,7 @@ import { callPeer, canonicalDigest, verifyReceipt, type PeerSelection } from "..
 import {
   acceptCompletion,
   currentStage,
+  isMultiGoal,
   reconstructGoal,
   replaceGoalFromSteps,
   setEntry,
@@ -1074,4 +1077,137 @@ test("B18: the export read cannot be made to name a caller's own operation", asy
     `${detachId}:export`,
     "the derived read id is not a concatenation a caller can predict and occupy",
   );
+});
+
+// --- B21: every writer must satisfy the invariant the reader enforces -----
+
+/**
+ * Review finding (P1, src/backend.ts): markPeerAvailable accepted any string as
+ * the selected revision, including "". That state admits execution, but
+ * checkOperationLegality treats an empty selected revision as missing, so the
+ * goal becomes runnable yet unable to plan a single backend operation — and it
+ * is a snapshot isGoalBackend rejects, so the goal runs until it reloads and
+ * then loses its state.
+ *
+ * The rule the last rounds have been converging on: a writer that produces a
+ * state the reader refuses turns a live goal into an unloadable one after the
+ * fact. Every transition below is checked against the validator that will read
+ * it back.
+ */
+test("B21: availability requires a real selected revision", async () => {
+  const peer = createFakePeer();
+  const goal = twoStepGoal();
+  const bound = await bind(goal, peer);
+  const lost = markPeerUnavailable(bound, "the peer was unloaded");
+  assert.equal(lost.backend.state, "bound-unavailable", "sanity: it is waiting to come back");
+
+  for (const revision of ["", "   "]) {
+    const restored = markPeerAvailable(lost, revision);
+    assert.equal(
+      restored.backend.state,
+      "bound-unavailable",
+      `an empty selected revision (${JSON.stringify(revision)}) cannot make a backend available`,
+    );
+    assert.equal(
+      restored.backend.binding?.selectedRevision,
+      lost.backend.binding?.selectedRevision,
+      "and the previous pointer is not overwritten with it",
+    );
+    assert.equal(isGoalBackend(restored.backend), true, "whatever it produced is loadable");
+  }
+
+  const real = markPeerAvailable(lost, "rev-9");
+  assert.equal(real.backend.state, "bound-available", "sanity: a real revision still restores it");
+  assert.equal(real.backend.binding?.selectedRevision, "rev-9");
+  assert.equal(isGoalBackend(real.backend), true);
+});
+
+test("B21: an operation cannot be planned without an operation id", () => {
+  const goal = twoStepGoal();
+  const nameless = beginOperation(goal, { ...bindParams(goal, "") });
+  assert.equal(nameless.ok, false, "the validator requires a non-empty operation id, so the writer must too");
+  assert.equal(nameless.goal.backend.pending, null, "and nothing was persisted");
+});
+
+test("B21: abandoning an operation never leaves a state the validator refuses", () => {
+  // `binding-pending` means a bind is in flight. Restoring a recorded
+  // previousState blindly can put the backend back into it with no intent left
+  // — a state isGoalBackend rejects, so the goal would be lost on reload.
+  const goal = twoStepGoal();
+  const backend: any = {
+    state: "binding-pending",
+    binding: null,
+    pending: {
+      operationId: "op-bind",
+      kind: "bind",
+      expectedState: "bound-available",
+      previousState: "binding-pending",
+      scope: goalScope(goal, SELECTION_A),
+      expectedRevision: null,
+      payloadDigest: "a".repeat(64),
+      payload: { contract: {}, memory: null },
+      createdAt: 1,
+    },
+    operations: [],
+    reason: null,
+  };
+  assert.equal(isGoalBackend(backend), true, "sanity: the starting snapshot is valid");
+
+  const abandoned = abandonOperation({ ...goal, backend }, "the user changed their mind");
+
+  assert.equal(abandoned.backend.pending, null, "sanity: the intent is gone");
+  assert.equal(
+    isGoalBackend(abandoned.backend),
+    true,
+    "the state it settled into must be one the validator accepts",
+  );
+});
+
+test("B21: every state a normal lifecycle passes through is loadable", async () => {
+  // The durable guard for the rule: walk the lifecycle and validate after each
+  // transition, so a future writer cannot quietly produce an unloadable state.
+  const peer = createFakePeer();
+  const goal = twoStepGoal();
+  const seen: string[] = [];
+  const check = (label: string, current: MultiGoal): MultiGoal => {
+    seen.push(label);
+    assert.equal(isGoalBackend(current.backend), true, `unloadable after: ${label}`);
+    assert.equal(isMultiGoal(current), true, `whole snapshot unloadable after: ${label}`);
+    return current;
+  };
+
+  let current = check("fresh", goal);
+  const begun = beginOperation(current, bindParams(current));
+  assert.ok(begun.ok);
+  current = check("bind intent persisted", begun.goal);
+  current = check("bind accepted", await bind(goal, peer));
+  const wrote = await runPeerOperation(
+    current,
+    peer,
+    writeParams(current, { revision: 1, proved: ["x"], unresolved: [], next: "" }),
+  );
+  assert.equal(wrote.ok, true, wrote.ok ? "" : wrote.message);
+  current = check("write committed", wrote.goal);
+  current = check("peer unavailable", markPeerUnavailable(current, "unloaded"));
+  current = check("peer available again", markPeerAvailable(current, "rev-77"));
+  current = check("selection moved", reconcileSelection(current, SELECTION_B));
+
+  const advanced = acceptCompletion(current, Date.now(), {});
+  assert.ok(advanced.ok && advanced.goal, advanced.message);
+  current = check("stage advanced", advanced.goal);
+
+  assert.ok(seen.length >= 8, `sanity: the walk covered the lifecycle (${seen.length} states)`);
+});
+
+test("B21: a small configured budget produces a goal that can load itself", () => {
+  // freshExecution fills the D4 fuses from constants, so a small working total
+  // under a default turn bound of 40 would mint a goal whose limits violate
+  // their own ordering — rejected by its own validator on the next load.
+  const result = replaceGoalFromSteps([{ objective: "small", criteria: ["done"] }], {
+    noProgressLimit: 2,
+    totalLimit: 5,
+  });
+  assert.ok(result.ok && result.goal, result.message);
+  assert.equal(result.goal.execution.totalLimit, 5, "sanity: the configured total is honoured");
+  assert.equal(isMultiGoal(result.goal), true, "a goal must be able to load itself");
 });

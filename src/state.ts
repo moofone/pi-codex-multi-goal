@@ -55,7 +55,15 @@ export interface ExecutionLimits {
   lifetimeCeiling?: number;
 }
 
-/** A bounded grant: finite limits only, no unlimited mode. */
+/**
+ * A bounded grant: finite limits only, no unlimited mode.
+ *
+ * The fuses the caller does not specify are filled from the defaults, but
+ * CLAMPED into the ordering the validator enforces (turn bound <= working total
+ * <= lifetime ceiling). A caller asking for a working total of 5 would
+ * otherwise get the default turn bound of 40 and mint a goal that its own
+ * validator refuses on the next load.
+ */
 export function freshExecution(
   limits: ExecutionLimits = {
     noProgressLimit: DEFAULT_NO_PROGRESS_LIMIT,
@@ -69,10 +77,10 @@ export function freshExecution(
     turnRequests: 0,
     noProgressLimit: limits.noProgressLimit,
     totalLimit: limits.totalLimit,
-    turnLimit: limits.turnLimit ?? DEFAULT_TURN_LIMIT,
+    turnLimit: Math.min(limits.turnLimit ?? DEFAULT_TURN_LIMIT, limits.totalLimit),
     evidenceGrant: limits.evidenceGrant ?? DEFAULT_EVIDENCE_GRANT,
     lifetimeRequests: 0,
-    lifetimeCeiling: limits.lifetimeCeiling ?? DEFAULT_LIFETIME_CEILING,
+    lifetimeCeiling: Math.max(limits.lifetimeCeiling ?? DEFAULT_LIFETIME_CEILING, limits.totalLimit),
     tokenUsage: null,
     creditedEvidence: [],
   };
