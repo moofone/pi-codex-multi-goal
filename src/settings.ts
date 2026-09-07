@@ -60,13 +60,25 @@ export function parseSettings(raw: unknown, path: string): MultiGoalSettings {
     maxCompactionsWithoutMutation?: unknown;
   };
   const legacy = parsePositiveInteger(record.maxCompactionsWithoutMutation);
+  const totalLimit = parsePositiveInteger(record.totalLimit) ?? DEFAULT_TOTAL_LIMIT;
+  // The four fuses are checked hardest-first (lifetime, total, turn,
+  // no-progress) and that ordering is only meaningful if the limits are ordered
+  // too: a turn bound above the working total can never fire, and a working
+  // total above the lifetime ceiling is unreachable. A snapshot carrying such a
+  // combination is rejected as malformed on load, so clamp a misconfiguration
+  // here rather than letting it mint a goal that cannot be reloaded.
+  const turnLimit = Math.min(parsePositiveInteger(record.turnLimit) ?? DEFAULT_TURN_LIMIT, totalLimit);
+  const lifetimeCeiling = Math.max(
+    parsePositiveInteger(record.lifetimeCeiling) ?? DEFAULT_LIFETIME_CEILING,
+    totalLimit,
+  );
   return {
     noProgressLimit:
       parsePositiveInteger(record.noProgressLimit) ?? legacy ?? DEFAULT_NO_PROGRESS_LIMIT,
-    totalLimit: parsePositiveInteger(record.totalLimit) ?? DEFAULT_TOTAL_LIMIT,
-    turnLimit: parsePositiveInteger(record.turnLimit) ?? DEFAULT_TURN_LIMIT,
+    totalLimit,
+    turnLimit,
     evidenceGrant: parsePositiveInteger(record.evidenceGrant) ?? DEFAULT_EVIDENCE_GRANT,
-    lifetimeCeiling: parsePositiveInteger(record.lifetimeCeiling) ?? DEFAULT_LIFETIME_CEILING,
+    lifetimeCeiling,
     settingsPath: path,
   };
 }

@@ -79,6 +79,33 @@ export function freshExecution(
 }
 
 /**
+ * The limits a grant is actually held to, filling in the fuses the D4 budget
+ * split added when an older snapshot omits them.
+ *
+ * The defaults are chosen to be CONSISTENT with what the snapshot already
+ * declares, not flat constants. A pre-D4 goal configured with a working total
+ * of 5000 would, under a flat ceiling of 1000, migrate into a grant whose
+ * limits contradict each other and be skipped as malformed on the next load —
+ * the upgrade would eat the goal. So a materialised ceiling is at least the
+ * working total, and a materialised turn bound is at most the working total.
+ *
+ * This is the single source of truth for both normalizeExecution and
+ * isGoalExecution, so a snapshot is never validated against limits different
+ * from the ones it will be loaded with.
+ */
+function effectiveLimits(execution: GoalExecution): {
+  turnLimit: number;
+  evidenceGrant: number;
+  lifetimeCeiling: number;
+} {
+  return {
+    turnLimit: execution.turnLimit ?? Math.min(DEFAULT_TURN_LIMIT, execution.totalLimit),
+    evidenceGrant: execution.evidenceGrant ?? DEFAULT_EVIDENCE_GRANT,
+    lifetimeCeiling: execution.lifetimeCeiling ?? Math.max(DEFAULT_LIFETIME_CEILING, execution.totalLimit),
+  };
+}
+
+/**
  * Materialise the fuses added with the D4 budget split on a snapshot written
  * by an older build. Spent budgets are preserved exactly; only the missing
  * limits are filled in. Without this an in-flight goal would fail validation
@@ -88,9 +115,7 @@ function normalizeExecution(execution: GoalExecution): GoalExecution {
   return {
     ...execution,
     turnRequests: execution.turnRequests ?? 0,
-    turnLimit: execution.turnLimit ?? DEFAULT_TURN_LIMIT,
-    evidenceGrant: execution.evidenceGrant ?? DEFAULT_EVIDENCE_GRANT,
-    lifetimeCeiling: execution.lifetimeCeiling ?? DEFAULT_LIFETIME_CEILING,
+    ...effectiveLimits(execution),
     creditedEvidence: [...(execution.creditedEvidence ?? [])],
   };
 }
@@ -483,7 +508,7 @@ function isGoalExecution(value: unknown): value is GoalExecution {
   ) {
     return false;
   }
-  return (
+  const wellFormed =
     Number.isInteger(execution.generation) &&
     execution.generation >= 0 &&
     Number.isInteger(execution.noProgressRemaining) &&
@@ -498,8 +523,39 @@ function isGoalExecution(value: unknown): value is GoalExecution {
     execution.lifetimeRequests >= 0 &&
     (execution.tokenUsage === null ||
       (typeof execution.tokenUsage === "number" && Number.isFinite(execution.tokenUsage))) &&
-    creditedValid
-  );
+    creditedValid;
+  if (!wellFormed) {
+    return false;
+  }
+
+  // Shape is not enough: a counter that exceeds the limit bounding it is a
+  // grant asserting more work than the bounded execution contract allows, and
+  // a persisted or forged snapshot could simply declare one. Each counter is
+  // checked against the limit it is spent from — against the EFFECTIVE limit,
+  // so an older snapshot is held to the same limits it will be loaded with.
+  //
+  // The threat model is "a snapshot must respect the limits it declares", not
+  // "limits must match current settings": a snapshot carries the limits that
+  // were in force when its grant was issued, and changing settings must not
+  // retroactively rewrite a running goal's budget.
+  const limits = effectiveLimits(execution);
+  if (
+    execution.noProgressRemaining > execution.noProgressLimit ||
+    execution.totalRemaining > execution.totalLimit ||
+    (execution.turnRequests ?? 0) > limits.turnLimit ||
+    execution.lifetimeRequests > limits.lifetimeCeiling
+  ) {
+    return false;
+  }
+  // The fuses are ordered hardest-first in allowanceExhaustion (lifetime,
+  // total, turn, no-progress) and that ordering only means anything if the
+  // limits are ordered too. chargeRequest spends the working total on every
+  // turn request, so a turn bound above the working total can never fire and
+  // the runaway-loop backstop would be dead; nothing renews lifetimeRequests,
+  // so a working total above the ceiling is unreachable. `evidenceGrant` is
+  // deliberately unbounded here: creditVerifiedEvidence clamps the renewal at
+  // totalLimit, so an oversized grant is a full refill, never an unbounded one.
+  return limits.turnLimit <= execution.totalLimit && execution.totalLimit <= limits.lifetimeCeiling;
 }
 
 export function isMultiGoal(value: unknown): value is MultiGoal {

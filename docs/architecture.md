@@ -36,6 +36,14 @@ maintains a small evidence record, and reports completion or a blocker.
 - Compaction, reload, and retries preserve the current step's accounting. Only
   verified progress, an explicit user resume, or a legitimate new step starts a
   fresh no-progress allowance.
+- A persisted grant must respect the limits it declares: every counter is at or
+  below the limit it is spent from, and the limits themselves are ordered
+  (turn bound <= working total <= lifetime ceiling), since the fuses are checked
+  hardest-first and that ordering is otherwise meaningless. A snapshot that
+  contradicts its own limits is malformed and is skipped in favour of the last
+  valid one, so a forged or corrupt grant cannot buy work. Limits materialised
+  for an older snapshot are chosen consistently with what it already declares,
+  so an upgrade never turns a running goal into a malformed one.
 - Pausing cancels pending goal continuations and stops further goal-owned model
   execution. It preserves the objective, completed work, and a visible reason.
   Resuming requires an explicit user action; exhaustion never means completion.
@@ -129,6 +137,10 @@ without repeatedly asking it to reconsider the goal.
 - Pause, blocking, yielding, compaction, and reload preserve the current step's
   memory. Recovery restores that record with the human-defined criteria, without
   replaying a history of memory updates into model context.
+- Evidence artifacts must resolve to a real path inside the project workspace.
+  Links are followed, not banned, and the resolved real path is what is stat'd
+  and read, so a link inside the workspace cannot fingerprint a file outside it
+  and there is no window between the check and the read.
 - Completion must account for every success criterion with applicable evidence.
   Human-defined criteria do not imply approval at every transition; require a
   human completion decision only when the agreed criteria explicitly require it.

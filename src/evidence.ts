@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { readFileSync, statSync } from "node:fs";
+import { readFileSync, realpathSync, statSync } from "node:fs";
 import { isAbsolute, relative, resolve } from "node:path";
 
 import { currentStage } from "./state.js";
@@ -86,16 +86,66 @@ export function evidenceKey(ref: EvidenceRefInput): string {
   return `${ref.operation}#${ref.artifact}#${ref.fingerprint}`;
 }
 
-/** Evidence refs are project-relative paths under the pi working directory. */
-function resolveArtifactPath(artifact: string): string | null {
+/** Is `candidate` the workspace root itself, or somewhere beneath it? */
+function containedBy(root: string, candidate: string): boolean {
+  const step = relative(root, candidate);
+  return step === "" || (!step.startsWith("..") && !isAbsolute(step));
+}
+
+export type ArtifactResolution =
+  | { ok: true; path: string }
+  /** Outside the workspace, by traversal, absolute path, or a link that leaves it. */
+  | { ok: false; reason: "outside" }
+  /** Inside the workspace, but nothing is there to fingerprint. */
+  | { ok: false; reason: "missing" };
+
+/**
+ * Resolve an evidence ref to a real path inside the workspace.
+ *
+ * The lexical `resolve` + `relative` pair only proves the STRING stays under
+ * the working directory. It says nothing about where a symlink INSIDE the
+ * workspace points, and statSync/readFileSync follow links — so a ref naming an
+ * ordinary-looking project path could fingerprint any readable file on the
+ * machine. Since D4 that is not merely a false claim: a credited ref returns a
+ * capped grant to the working request budget, so it would be a way to buy
+ * execution budget by pointing at /etc/hosts.
+ *
+ * Links are resolved rather than banned — a symlinked directory inside a
+ * project is ordinary — and the REAL path is what is returned, so the caller
+ * stats and reads exactly the path that was checked. There is no window
+ * between the check and the read in which the target could be swapped for a
+ * link out of the workspace.
+ *
+ * The workspace root is realpath'd too: on a platform whose working directory
+ * is reached through a symlink (macOS `/var` -> `/private/var`), comparing a
+ * resolved target against an unresolved root would read as an escape.
+ */
+function resolveArtifactPath(artifact: string): ArtifactResolution {
   if (artifact.length === 0 || isAbsolute(artifact)) {
-    return null;
+    return { ok: false, reason: "outside" };
   }
-  const resolved = resolve(process.cwd(), artifact);
-  if (relative(process.cwd(), resolved).startsWith("..")) {
-    return null;
+  let root: string;
+  try {
+    root = realpathSync(process.cwd());
+  } catch {
+    return { ok: false, reason: "outside" };
   }
-  return resolved;
+  // Cheap lexical cut first, so an obvious traversal never reaches the disk.
+  const resolved = resolve(root, artifact);
+  if (!containedBy(root, resolved)) {
+    return { ok: false, reason: "outside" };
+  }
+  let real: string;
+  try {
+    real = realpathSync(resolved);
+  } catch {
+    // No such path, or a dangling link: nothing to fingerprint either way.
+    return { ok: false, reason: "missing" };
+  }
+  if (!containedBy(root, real)) {
+    return { ok: false, reason: "outside" };
+  }
+  return { ok: true, path: real };
 }
 
 function refFailure(index: number, message: string): { ok: false; message: string } {
@@ -130,10 +180,22 @@ export function validateEvidenceRefs(goal: MultiGoal, refs: unknown): EvidenceVa
           "(bash, read, edit, write, apply_patch, grep, glob, find, ls). Bookkeeping tool names are never evidence.",
       );
     }
-    if (typeof ref.artifact !== "string" || resolveArtifactPath(ref.artifact) === null) {
+    if (typeof ref.artifact !== "string") {
       return refFailure(index, "artifact must be a project-relative path without traversal");
     }
-    const artifactPath = resolveArtifactPath(ref.artifact)!;
+    const resolution = resolveArtifactPath(ref.artifact);
+    if (!resolution.ok && resolution.reason === "outside") {
+      return refFailure(
+        index,
+        `artifact "${ref.artifact}" resolves outside the project workspace; evidence must be a ` +
+          "project-relative path whose real target stays inside it (a link out of the workspace is not project evidence)",
+      );
+    }
+    if (!resolution.ok) {
+      return refFailure(index, `artifact "${ref.artifact}" does not exist`);
+    }
+    // The real, contained path — the same string that is stat'd and read below.
+    const artifactPath = resolution.path;
     let exists = false;
     try {
       exists = statSync(artifactPath).isFile();
