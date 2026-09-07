@@ -6,6 +6,7 @@ import {
   callPeer,
   canonicalDigest,
   discoverPeer,
+  isWellFormedReceipt,
   scopeKey,
   verifyReceipt,
   type PeerRequest,
@@ -450,4 +451,165 @@ test("B18: a legitimate scope is not blocked by a colliding neighbour", async ()
     { objective: "mine" },
     "the first consumer's record is untouched",
   );
+});
+
+// --- B31: discovery keeps its bounded-failure promise for nonsense too ----
+
+/**
+ * Review finding (P1, src/peer.ts): the capability parser validated
+ * `protocolVersion` and `peerId` but not `operations` or `profiles`, so a peer
+ * answering `operations: {}` made `new Set(...)` throw instead of returning the
+ * bounded typed result discovery promises.
+ *
+ * Nothing generated covered discoverPeer at all — every guard in this suite
+ * pointed at the answer path. Discovery makes the same promise the answer path
+ * makes (a typed failure, never an exception), so it gets the same treatment: a
+ * generated space over capability responses, asserting the call never throws
+ * and always returns a typed result.
+ *
+ * The round-9 sweep examined `capabilities.operations` and cleared it, reasoning
+ * that absent means "supports nothing" and fails the required check. That is
+ * true of ABSENT and says nothing about MALFORMED — in the very round whose
+ * subject was that those are two different cases.
+ */
+
+/** The closed set, from docs/peer-protocol.md §4.4 — the contract, not the code. */
+const PROTOCOL_ERROR_CODES = new Set([
+  "unavailable",
+  "timeout",
+  "incompatible",
+  "stale-selection",
+  "stale-epoch",
+  "scope-conflict",
+  "replay-conflict",
+  "refused",
+]);
+
+function capabilitySpace(): Array<{ label: string; value: unknown; usable: boolean }> {
+  const valid = {
+    protocolVersion: PEER_PROTOCOL_VERSION,
+    peerId: "fake-dag-peer",
+    operations: ["bind", "read", "write", "transition", "detach"],
+    profiles: ["current-scope@1"],
+  };
+  const mutate = (label: string, overrides: Record<string, unknown>) => ({
+    label,
+    value: { ...valid, ...overrides },
+    usable: false,
+  });
+  return [
+    { label: "a valid announcement", value: valid, usable: true },
+    { label: "nothing at all", value: undefined, usable: false },
+    { label: "null", value: null, usable: false },
+    { label: "a string", value: "hello", usable: false },
+    { label: "a number", value: 7, usable: false },
+    { label: "an array", value: [], usable: false },
+    { label: "an empty object", value: {}, usable: false },
+    mutate("no protocol version", { protocolVersion: undefined }),
+    mutate("a non-numeric protocol version", { protocolVersion: "one" }),
+    mutate("another protocol version", { protocolVersion: PEER_PROTOCOL_VERSION + 1 }),
+    mutate("no peer id", { peerId: undefined }),
+    mutate("an empty peer id", { peerId: "" }),
+    mutate("a non-string peer id", { peerId: 42 }),
+    // The nested cases the sweep missed: present, but not what it claims to be.
+    mutate("operations as an object", { operations: {} }),
+    mutate("operations as a string", { operations: "read" }),
+    mutate("operations as null", { operations: null }),
+    mutate("operations of numbers", { operations: [1, 2, 3] }),
+    mutate("operations containing an object", { operations: ["bind", {}] }),
+    mutate("no operations at all", { operations: undefined }),
+    mutate("profiles as an object", { profiles: {} }),
+    mutate("profiles as a string", { profiles: "current-scope@1" }),
+    mutate("profiles as null", { profiles: null }),
+    mutate("profiles of numbers", { profiles: [1] }),
+    mutate("no profiles at all", { profiles: undefined }),
+  ];
+}
+
+test("B31: discovery never throws and always returns a typed result", async () => {
+  const space = capabilitySpace();
+  assert.ok(space.length > 20, `sanity: the space is generated (${space.length} announcements)`);
+  let usable = 0;
+
+  for (const announcement of space) {
+    const peer = createFakePeer({ capabilitiesOverride: announcement.value });
+    let result: Awaited<ReturnType<typeof discoverPeer>>;
+    try {
+      result = await discoverPeer(peer, {
+        operations: ["bind", "read", "write"],
+        profile: "current-scope@1",
+      });
+    } catch (error) {
+      assert.fail(`discovery must not throw on ${announcement.label} (${String(error)})`);
+    }
+
+    if (announcement.usable) {
+      usable += 1;
+      assert.equal(result.ok, true, `a valid announcement must discover: ${announcement.label}`);
+      continue;
+    }
+    assert.equal(result.ok, false, `${announcement.label} must not discover`);
+    const code = result.ok === false ? result.code : null;
+    assert.ok(
+      code !== null && PROTOCOL_ERROR_CODES.has(code),
+      `${announcement.label} must fail with a code the protocol defines, got ${String(code)}`,
+    );
+    assert.equal(
+      code,
+      "incompatible",
+      `an announcement this protocol version cannot use is incompatible: ${announcement.label}`,
+    );
+  }
+
+  assert.equal(usable, 1, "sanity: exactly one announcement in the space is usable");
+});
+
+test("B31: the transports that cannot answer are still bounded", async () => {
+  const missing = await discoverPeer(null, { operations: ["bind"] });
+  assert.equal(missing.ok === false ? missing.code : null, "unavailable");
+
+  const throwing = await discoverPeer(createFakePeer({ throws: "socket closed" }), { operations: ["bind"] });
+  assert.equal(throwing.ok === false ? throwing.code : null, "unavailable");
+
+  const started = Date.now();
+  const wedged = await discoverPeer(createFakePeer({ hang: true }), { operations: ["bind"] }, { timeoutMs: 40 });
+  assert.equal(wedged.ok === false ? wedged.code : null, "timeout");
+  assert.ok(Date.now() - started < 2_000, "and it returned at its deadline");
+});
+
+test("B32: a well-formedness predicate validates to the depth its callers assume", () => {
+  // A shallow check that callers treat as deep is worse than no check: it turns
+  // a malformed input into a confident misclassification. isWellFormedReceipt
+  // only tested that `scope` was an object, so a receipt with `scope: {}`
+  // reached the identity comparisons and came back `scope-conflict` or
+  // `stale-epoch` — terminal codes, which discard the caller's pending work.
+  const base = {
+    protocolVersion: PEER_PROTOCOL_VERSION,
+    operationId: "op-1",
+    scope: scope("pi-research", "study:1"),
+    selectedRevision: "rev-1",
+    payloadDigest: "a".repeat(64),
+    committedAt: 1,
+  };
+  assert.equal(isWellFormedReceipt(base), true, "sanity: a complete receipt is well formed");
+
+  const shallow: Array<[string, unknown]> = [
+    ["an empty scope", {}],
+    ["a scope with no consumer", { ...base.scope, consumer: undefined }],
+    ["a scope with no work id", { ...base.scope, scopeId: undefined }],
+    ["a scope with a numeric work id", { ...base.scope, scopeId: 7 }],
+    ["a scope with no contract revision", { ...base.scope, contractRevision: undefined }],
+    ["a scope with a non-integer epoch", { ...base.scope, epoch: 1.5 }],
+    ["a scope with no selection", { ...base.scope, selection: undefined }],
+    ["a scope whose selection is a string", { ...base.scope, selection: "anchor" }],
+    ["a scope whose selection has no session", { ...base.scope, selection: { branchAnchorId: "a" } }],
+    ["a scope that is an array", []],
+  ];
+  for (const [label, badScope] of shallow) {
+    assert.equal(
+      isWellFormedReceipt({ ...base, scope: badScope }),
+      false,
+      `a receipt carrying ${label} is not well formed`,
+    );
+  }
 });

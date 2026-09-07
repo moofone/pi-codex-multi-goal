@@ -121,6 +121,15 @@ criteria stay in the Goal adapter and never enter the protocol.
 
 ### 4.1 Capability discovery
 
+Discovery makes the same promise the answer path makes: a bounded, typed
+result, never an exception. That promise covers a peer whose announcement is
+*nonsense* as well as one whose announcement is merely unsuitable — every field
+is validated to the depth the negotiation relies on before it is used, so a
+malformed `operations` or `profiles` is an `incompatible` result rather than a
+thrown error. Absent and malformed differ here too: an absent list means
+"supports nothing" and fails the required-capability check; a malformed one
+means the announcement cannot be read at all.
+
 ```ts
 interface PeerCapabilities {
   protocolVersion: number;
@@ -206,6 +215,17 @@ separate branches: **an answer may reduce a pending intent to `quarantined`
 only if it correlates to that intent AND its outcome is a terminal code.**
 `test/backend-binding.test.ts` asserts this over a generated answer space
 rather than over the branches known at the time of writing.
+
+**A predicate that reports "well-formed" validates to the depth its callers
+assume.** A shallow check that callers treat as deep is worse than no check,
+because it converts a malformed input into a *confident misclassification*: a
+receipt carrying `scope: {}` that passes a shallow check goes on to the identity
+comparisons and comes back `scope-conflict` or `stale-epoch` — terminal codes,
+which discard the caller's pending work on the strength of a scope that was
+never a scope. Structural validity is therefore decided before identity is
+compared, and a structurally invalid answer is always `incompatible`
+(retryable), never a terminal classification. This applies to nested values:
+validating that `scope` is an object is not validating the scope.
 
 **Absent, present-and-valid, and present-but-malformed are three cases.** A
 field the protocol marks mandatory is not exempt from checking because it

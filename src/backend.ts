@@ -3,6 +3,7 @@ import {
   PEER_PROTOCOL_VERSION,
   callPeer,
   canonicalDigest,
+  isPeerScope,
   isWellFormedReceipt,
   scopesEqual,
   selectionsEqual,
@@ -100,27 +101,10 @@ function cloneScope(scope: PeerScope): PeerScope {
   return { ...scope, selection: { ...scope.selection } };
 }
 
-function isSelection(value: unknown): boolean {
-  if (!value || typeof value !== "object") {
-    return false;
-  }
-  const selection = value as PeerSelection;
-  return typeof selection.sessionId === "string" && typeof selection.branchAnchorId === "string";
-}
-
-function isScope(value: unknown): boolean {
-  if (!value || typeof value !== "object") {
-    return false;
-  }
-  const scope = value as PeerScope;
-  return (
-    typeof scope.consumer === "string" &&
-    typeof scope.scopeId === "string" &&
-    typeof scope.contractRevision === "string" &&
-    Number.isInteger(scope.epoch) &&
-    isSelection(scope.selection)
-  );
-}
+// Scope validation is peer.ts's, not a second copy: it owns PeerScope, and a
+// second copy of a rule is the defect regardless of which one is currently
+// right (round 10).
+const isScope = isPeerScope;
 
 const DIGEST_PATTERN = /^[0-9a-f]{64}$/;
 

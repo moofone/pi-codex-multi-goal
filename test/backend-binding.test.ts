@@ -1320,6 +1320,14 @@ interface Answer {
   response: any;
   /** Does this answer say anything at all about the caller's operation? */
   correlates: boolean;
+  /**
+   * Is this answer structurally not a valid answer at all — as opposed to a
+   * well-formed answer that disagrees with the request? The distinction is the
+   * point: a malformed answer must be reported as `incompatible` (retryable),
+   * because classifying garbage as a terminal refusal converts it into a
+   * confident misclassification that permanently discards valid work.
+   */
+  malformed: boolean;
 }
 
 /** Every shape a peer can answer with, correlated and misdirected. */
@@ -1361,29 +1369,81 @@ function answerSpace(request: PeerRequest): Answer[] {
     ["no scope at all", { scope: undefined }],
   ];
 
+  // Nested: the scope is present but is not a scope. Previously outside this
+  // space entirely, because it only ever replaced scope with another VALID one.
+  const malformedScopes: Array<[string, unknown]> = [
+    ["an empty scope object", {}],
+    ["a scope missing its consumer", { ...request.scope, consumer: undefined }],
+    ["a scope whose work id is not a string", { ...request.scope, scopeId: 7 }],
+    ["a scope whose contract revision is missing", { ...request.scope, contractRevision: undefined }],
+    ["a scope whose epoch is not an integer", { ...request.scope, epoch: "soon" }],
+    ["a scope with no selection", { ...request.scope, selection: undefined }],
+    ["a scope whose selection is a string", { ...request.scope, selection: "anchor-1" }],
+    ["a scope whose selection has no branch", { ...request.scope, selection: { sessionId: "session-a" } }],
+    ["a scope that is an array", []],
+  ];
+  for (const [label, scope] of malformedScopes) {
+    mutations.push([label, { scope }]);
+  }
+
+  // Which mutations leave a WELL-FORMED answer that merely disagrees with the
+  // request — those may legitimately be terminal. Listed explicitly rather than
+  // inferred from the label, because inferring it is how a case gets silently
+  // mis-tagged and the assertion below stops meaning anything. Everything else
+  // in the space is structurally malformed.
+  const wellFormed = new Set([
+    "a valid receipt",
+    "another consumer's scope",
+    "another work scope",
+    "a spent execution epoch",
+    "another branch selection",
+    "another contract revision",
+    "a different payload",
+  ]);
+  for (const [label] of mutations) {
+    assert.ok(
+      wellFormed.has(label) || label.length > 0,
+      "sanity: every mutation is classified",
+    );
+  }
+
   const answers: Answer[] = [];
   for (const [label, overrides] of mutations) {
     // A receipt whose own operation id is missing or malformed does not
     // correlate with anything — it cannot be matched to a request at all.
     const correlates = !("operationId" in overrides);
-    answers.push({ label: `committed, correlated, ${label}`, response: { status: "committed", receipt: receipt(overrides) }, correlates });
+    const malformed = !wellFormed.has(label);
+    answers.push({
+      label: `committed, correlated, ${label}`,
+      response: { status: "committed", receipt: receipt(overrides) },
+      correlates,
+      malformed,
+    });
     answers.push({
       label: `committed, MISDIRECTED, ${label}`,
       response: { status: "committed", receipt: receipt({ ...overrides, operationId: FOREIGN_OPERATION }) },
       correlates: false,
+      malformed,
     });
   }
-  answers.push({ label: "committed with no receipt at all", response: { status: "committed" }, correlates: false });
+  answers.push({
+    label: "committed with no receipt at all",
+    response: { status: "committed" },
+    correlates: false,
+    malformed: true,
+  });
 
   answers.push({
     label: "pending, correlated",
     response: { status: "pending", operationId: request.operationId, reason: "reference append not acknowledged" },
     correlates: true,
+    malformed: false,
   });
   answers.push({
     label: "pending, MISDIRECTED",
     response: { status: "pending", operationId: FOREIGN_OPERATION, reason: "reference append not acknowledged" },
     correlates: false,
+    malformed: false,
   });
 
   const codes = [
@@ -1402,17 +1462,20 @@ function answerSpace(request: PeerRequest): Answer[] {
       label: `error ${code}, correlated`,
       response: { status: "error", code, message: "no", operationId: request.operationId },
       correlates: true,
+      malformed: code === "a-code-from-a-future-version",
     });
     answers.push({
       label: `error ${code}, MISDIRECTED`,
       response: { status: "error", code, message: "no", operationId: FOREIGN_OPERATION },
       correlates: false,
+      malformed: code === "a-code-from-a-future-version",
     });
     // The id is optional on an error, so its absence is not a mismatch.
     answers.push({
       label: `error ${code}, no correlation id`,
       response: { status: "error", code, message: "no" },
       correlates: true,
+      malformed: code === "a-code-from-a-future-version",
     });
   }
   return answers;
@@ -1436,6 +1499,7 @@ test("B23: no peer answer discards a pending intent unless it correlates and is 
 
   let quarantines = 0;
   let misdirected = 0;
+  let malformedSeen = 0;
   for (const answer of space) {
     const before = plan().goal;
     assert.ok(before.backend.pending, `sanity: there is an intent to protect (${answer.label})`);
@@ -1476,6 +1540,25 @@ test("B23: no peer answer discards a pending intent unless it correlates and is 
       `the whole snapshot must stay loadable after: ${answer.label}`,
     );
 
+    // The rule the shallow-predicate finding turns on: a predicate that reports
+    // "well-formed" must validate to the depth its callers assume, because a
+    // shallow check callers treat as deep converts garbage into a CONFIDENT
+    // misclassification — and a confident misclassification here is a terminal
+    // code, which discards valid work. So a malformed answer is never terminal.
+    if (answer.malformed) {
+      malformedSeen += 1;
+      assert.equal(after.ok, false, `a malformed answer must not be accepted: ${answer.label}`);
+      assert.equal(
+        after.ok === false ? after.code : null,
+        "incompatible",
+        `a malformed answer must be reported as incompatible, not classified: ${answer.label}`,
+      );
+      assert.ok(
+        after.goal.backend.pending !== null,
+        `a malformed answer must leave the intent recoverable: ${answer.label}`,
+      );
+    }
+
     if (!answer.correlates) {
       misdirected += 1;
       assert.ok(
@@ -1488,6 +1571,7 @@ test("B23: no peer answer discards a pending intent unless it correlates and is 
 
   assert.ok(quarantines >= 5, `sanity: the space exercises the quarantine path (${quarantines} times)`);
   assert.ok(misdirected >= 10, `sanity: the space exercises misdirection (${misdirected} answers)`);
+  assert.ok(malformedSeen >= 20, `sanity: the space exercises malformation (${malformedSeen} answers)`);
 
   // The hole this guard had: it drove every answer at a goal with a PENDING
   // intent, so the no-pending idempotency branch — which is the one that

@@ -78,6 +78,12 @@ export interface FakePeerOptions {
   misdirectedPending?: boolean;
   /** Refuse every `read`, so a detach's precondition fails terminally. */
   readError?: PeerErrorCode;
+  /**
+   * Announce arbitrary capabilities, including structurally invalid ones.
+   * Discovery promises a bounded typed failure; it must keep that promise for
+   * a peer that answers with nonsense as well as for one that answers wrongly.
+   */
+  capabilitiesOverride?: unknown;
 }
 
 interface CommittedOperation {
@@ -188,6 +194,9 @@ export function createFakePeer(options: FakePeerOptions = {}): FakePeer {
       }
       if (options.throws) {
         throw new Error(options.throws);
+      }
+      if ("capabilitiesOverride" in options) {
+        return options.capabilitiesOverride as PeerCapabilities;
       }
       return { protocolVersion, peerId, operations, profiles };
     },

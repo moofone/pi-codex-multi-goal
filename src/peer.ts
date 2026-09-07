@@ -145,6 +145,65 @@ export interface PeerRequirements {
   profile?: string;
 }
 
+export function isPeerSelection(value: unknown): value is PeerSelection {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return false;
+  }
+  const selection = value as PeerSelection;
+  return typeof selection.sessionId === "string" && typeof selection.branchAnchorId === "string";
+}
+
+/**
+ * Is this a structurally complete scope?
+ *
+ * Owned here because peer.ts owns PeerScope, and validated to full depth
+ * because every caller treats "well formed" as a promise about all of it. A
+ * shallow check that callers assume is deep is worse than no check: it turns a
+ * malformed input into a CONFIDENT misclassification. Concretely, a receipt
+ * with `scope: {}` used to pass and then reach the identity comparisons, which
+ * reported `scope-conflict` or `stale-epoch` — terminal codes that discard the
+ * caller's pending work, on the strength of a scope that was never a scope.
+ */
+export function isPeerScope(value: unknown): value is PeerScope {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return false;
+  }
+  const scope = value as PeerScope;
+  return (
+    typeof scope.consumer === "string" &&
+    typeof scope.scopeId === "string" &&
+    typeof scope.contractRevision === "string" &&
+    Number.isInteger(scope.epoch) &&
+    isPeerSelection(scope.selection)
+  );
+}
+
+/**
+ * Are these usable capabilities?
+ *
+ * Every field is validated to the depth discovery relies on. `operations` and
+ * `profiles` were previously read without checking they were arrays, so a peer
+ * answering `operations: {}` made `new Set(...)` throw — breaking discovery's
+ * documented promise of a BOUNDED TYPED failure. An absent list is not the same
+ * as a malformed one: absent means "supports nothing" and fails the required
+ * check, while malformed means the announcement cannot be read at all.
+ */
+export function isPeerCapabilities(value: unknown): value is PeerCapabilities {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return false;
+  }
+  const capabilities = value as PeerCapabilities;
+  const stringList = (list: unknown): boolean =>
+    list === undefined || (Array.isArray(list) && list.every((item) => typeof item === "string"));
+  return (
+    typeof capabilities.protocolVersion === "number" &&
+    typeof capabilities.peerId === "string" &&
+    capabilities.peerId.length > 0 &&
+    stringList(capabilities.operations) &&
+    stringList(capabilities.profiles)
+  );
+}
+
 /**
  * Is this a structurally complete receipt?
  *
@@ -165,8 +224,8 @@ export function isWellFormedReceipt(value: unknown): value is PeerReceipt {
     receipt.protocolVersion === PEER_PROTOCOL_VERSION &&
     typeof receipt.operationId === "string" &&
     receipt.operationId.length > 0 &&
-    !!receipt.scope &&
-    typeof receipt.scope === "object" &&
+    // Deep, not shallow: see isPeerScope for why the difference is the defect.
+    isPeerScope(receipt.scope) &&
     typeof receipt.selectedRevision === "string" &&
     // Blank counts as absent: a revision identifier of nothing but whitespace
     // is not a usable identifier, and the state that carries it admits work.
@@ -290,8 +349,10 @@ function isPeerResponse(value: unknown): value is PeerResponse {
   }
   const response = value as PeerResponse;
   if (response.status === "committed") {
-    const receipt = (response as { receipt?: unknown }).receipt;
-    return !!receipt && typeof receipt === "object";
+    // This is a `value is PeerResponse` guard, so callers are entitled to
+    // assume everything the type promises. A shallow receipt check here would
+    // be the same trap as a shallow scope check one level down.
+    return isWellFormedReceipt((response as { receipt?: unknown }).receipt);
   }
   if (response.status === "pending") {
     return typeof (response as { operationId?: unknown }).operationId === "string";
@@ -357,15 +418,12 @@ export async function discoverPeer(
     return { ok: false, code: outcome.code, message: outcome.message };
   }
   const capabilities = outcome.value;
-  if (
-    !capabilities ||
-    typeof capabilities !== "object" ||
-    typeof capabilities.protocolVersion !== "number" ||
-    typeof capabilities.peerId !== "string" ||
-    capabilities.peerId.length === 0
-  ) {
-    // `peerId` is mandatory too, and it is recorded on the binding: an
-    // unnameable peer cannot be one Goal binds to.
+  if (!isPeerCapabilities(capabilities)) {
+    // Every field, to the depth the checks below rely on. `peerId` is mandatory
+    // because it is recorded on the binding — an unnameable peer cannot be one
+    // Goal binds to — and `operations`/`profiles` must be readable as lists
+    // before they are read as lists, or discovery throws instead of returning
+    // the bounded typed failure it promises.
     return { ok: false, code: "incompatible", message: "the peer announced no readable capabilities" };
   }
   if (capabilities.protocolVersion !== PEER_PROTOCOL_VERSION) {
