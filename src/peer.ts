@@ -1,0 +1,391 @@
+import { createHash } from "node:crypto";
+
+/**
+ * The consumer-agnostic peer seam (GOAL_WITH_DAG_SUPPORT §4; the contract is
+ * docs/peer-protocol.md).
+ *
+ * It carries three things and nothing else: capability discovery, reading a
+ * scoped revision-tagged projection, and submitting scoped idempotent
+ * mutations/transitions. There is deliberately nothing about goals, ordered
+ * steps, criteria, or budgets in this file — Goal is the FIRST consumer of the
+ * continuity protocol, not its shape (§1). A research consumer maps its own
+ * study/experiment identities onto the same fields and needs no Goal record;
+ * P0 proves that with a fixture (test/peer-seam.test.ts, gate B07).
+ *
+ * Nothing here imports a peer engine, opens its database, or reads a module
+ * singleton: a `PeerClient` is two async methods, which is what lets the real
+ * transport be the host's shared extension event mechanism in task 5.1 without
+ * changing a caller.
+ */
+
+/**
+ * Exact match, never "best effort". A caller that cannot verify a receipt
+ * against a known shape cannot know whether a mutation committed, so a
+ * different version is incompatible rather than degraded.
+ */
+export const PEER_PROTOCOL_VERSION = 1;
+
+/**
+ * The deadline that makes "missing/incompatible peer fails boundedly" true.
+ * A tool call's worst case is one of these, never an unbounded await.
+ */
+export const DEFAULT_PEER_TIMEOUT_MS = 5_000;
+
+export interface PeerSelection {
+  /** The session the operation was planned in. */
+  sessionId: string;
+  /** The selected branch entry it was planned against. */
+  branchAnchorId: string;
+}
+
+/**
+ * The comparable identity tuple every request carries. The Goal adapter maps
+ * `goalId`/`Stage.id`/`generation`/`contractRevision` onto these generic names
+ * (PI_DAG_COMPACT D7); a research adapter maps its study and question scope.
+ *
+ * A caller CANNOT acquire ownership by supplying these fields: the registered
+ * peer decides who owns a scope, and a request from a consumer that does not
+ * own the addressed scope is refused with `scope-conflict`.
+ */
+export interface PeerScope {
+  /** Namespaced consumer/owner identity, e.g. "pi-codex-multi-goal". */
+  consumer: string;
+  /** Stable work-scope identity within that consumer. */
+  scopeId: string;
+  /** Deterministic identity of the accepted contract for that scope. */
+  contractRevision: string;
+  /** Execution epoch; a changed epoch invalidates stale callbacks. */
+  epoch: number;
+  /** The session/branch selection the operation was planned against. */
+  selection: PeerSelection;
+}
+
+export type PeerOperationKind = "bind" | "read" | "write" | "transition" | "detach";
+
+export interface PeerCapabilities {
+  protocolVersion: number;
+  peerId: string;
+  operations: PeerOperationKind[];
+  /** Projection profiles it can render; each declares its own version. */
+  profiles: string[];
+}
+
+export interface PeerRequest {
+  protocolVersion: number;
+  /** Correlation and idempotency key. */
+  operationId: string;
+  kind: PeerOperationKind;
+  scope: PeerScope;
+  /** The selected revision this was planned against; null only for `bind`. */
+  expectedRevision: string | null;
+  payload: unknown;
+}
+
+export interface PeerReceipt {
+  protocolVersion: number;
+  operationId: string;
+  /** Echoed verbatim, so the caller can verify what the peer thought it did. */
+  scope: PeerScope;
+  /** The DURABLY SELECTED revision after the commit. */
+  selectedRevision: string;
+  payloadDigest: string;
+  committedAt: number;
+}
+
+export type PeerErrorCode =
+  | "unavailable"
+  | "timeout"
+  | "incompatible"
+  | "stale-selection"
+  | "stale-epoch"
+  | "scope-conflict"
+  | "replay-conflict"
+  | "refused";
+
+/**
+ * `pending` is never success (§4 step 2: "a SQLite-only pending_ref result is
+ * not success"). It leaves the caller's intent in place and publishes nothing.
+ */
+export type PeerResponse =
+  | { status: "committed"; receipt: PeerReceipt; projection?: unknown }
+  | { status: "pending"; operationId: string; reason: string }
+  | { status: "error"; code: PeerErrorCode; message: string; operationId?: string };
+
+export interface PeerClient {
+  capabilities(): Promise<PeerCapabilities>;
+  request(request: PeerRequest): Promise<PeerResponse>;
+}
+
+export interface PeerRequirements {
+  /** Every one must be supported, or discovery fails as incompatible. */
+  operations: PeerOperationKind[];
+  /** An unsupported required profile is rejected explicitly, never degraded. */
+  profile?: string;
+}
+
+export type ReceiptRejection = PeerErrorCode | "pending";
+
+export type ReceiptCheck =
+  | { ok: true; receipt: PeerReceipt }
+  | { ok: false; code: ReceiptRejection; message: string };
+
+export type DiscoveryResult =
+  | { ok: true; capabilities: PeerCapabilities }
+  | { ok: false; code: PeerErrorCode; message: string };
+
+/**
+ * Recursively key-sorted JSON. Payload identity must not depend on how a
+ * caller happened to order its object fields, or a faithful retry of the same
+ * operation would look like a conflicting one and the four-step recovery in §4
+ * would refuse its own replay.
+ */
+function canonicalize(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return value.map(canonicalize);
+  }
+  if (value && typeof value === "object") {
+    const source = value as Record<string, unknown>;
+    const out: Record<string, unknown> = {};
+    for (const key of Object.keys(source).sort()) {
+      out[key] = canonicalize(source[key]);
+    }
+    return out;
+  }
+  return value;
+}
+
+export function canonicalDigest(payload: unknown): string {
+  return createHash("sha256")
+    .update(JSON.stringify(canonicalize(payload) ?? null), "utf8")
+    .digest("hex");
+}
+
+export function selectionsEqual(left: PeerSelection, right: PeerSelection): boolean {
+  return left.sessionId === right.sessionId && left.branchAnchorId === right.branchAnchorId;
+}
+
+/** Scope identity within one peer: consumer namespace plus work scope. */
+export function scopeKey(scope: PeerScope): string {
+  return `${scope.consumer} ${scope.scopeId}`;
+}
+
+/**
+ * Race a peer call against a deadline. The timer is cleared on the winning
+ * path and unref'd so a pending deadline can never hold the process open, and
+ * a synchronous throw from the client is caught along with a rejection: an
+ * extension that blew up while unloading must look like an absent peer, not
+ * like an exception escaping a tool call.
+ */
+async function withDeadline<T>(
+  work: () => Promise<T>,
+  timeoutMs: number,
+): Promise<{ ok: true; value: T } | { ok: false; code: "unavailable" | "timeout"; message: string }> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const deadline = new Promise<"timeout">((resolve) => {
+      timer = setTimeout(() => resolve("timeout"), timeoutMs);
+      timer.unref?.();
+    });
+    const raced = await Promise.race([work(), deadline]);
+    if (raced === "timeout") {
+      return { ok: false, code: "timeout", message: `the peer did not answer within ${timeoutMs}ms` };
+    }
+    return { ok: true, value: raced as T };
+  } catch (error) {
+    return {
+      ok: false,
+      code: "unavailable",
+      message: error instanceof Error ? error.message : String(error),
+    };
+  } finally {
+    if (timer) {
+      clearTimeout(timer);
+    }
+  }
+}
+
+function isPeerResponse(value: unknown): value is PeerResponse {
+  if (!value || typeof value !== "object") {
+    return false;
+  }
+  const response = value as PeerResponse;
+  if (response.status === "committed") {
+    const receipt = (response as { receipt?: unknown }).receipt;
+    return !!receipt && typeof receipt === "object";
+  }
+  if (response.status === "pending") {
+    return typeof (response as { operationId?: unknown }).operationId === "string";
+  }
+  return response.status === "error" && typeof (response as { code?: unknown }).code === "string";
+}
+
+/**
+ * One peer call that never hangs and never throws. No registered peer answers
+ * `unavailable` without waiting on a deadline it could never satisfy, which is
+ * what keeps an unbound Goal-only session (invariant 1) free of any peer cost.
+ */
+export async function callPeer(
+  client: PeerClient | null | undefined,
+  request: PeerRequest,
+  options: { timeoutMs?: number } = {},
+): Promise<PeerResponse> {
+  if (!client) {
+    return {
+      status: "error",
+      code: "unavailable",
+      message: "no peer is registered for this session",
+      operationId: request.operationId,
+    };
+  }
+  const outcome = await withDeadline(() => client.request(request), options.timeoutMs ?? DEFAULT_PEER_TIMEOUT_MS);
+  if (!outcome.ok) {
+    return { status: "error", code: outcome.code, message: outcome.message, operationId: request.operationId };
+  }
+  if (!isPeerResponse(outcome.value)) {
+    return {
+      status: "error",
+      code: "incompatible",
+      message: "the peer returned a response this protocol version cannot read",
+      operationId: request.operationId,
+    };
+  }
+  return outcome.value;
+}
+
+/**
+ * Capability negotiation. Requirements are declared by the caller and checked,
+ * never assumed: an unsupported required operation or projection profile is an
+ * explicit `incompatible` rejection (§4), because silently degrading would
+ * leave the caller believing content it never received was rendered.
+ */
+export async function discoverPeer(
+  client: PeerClient | null | undefined,
+  requirements: PeerRequirements,
+  options: { timeoutMs?: number } = {},
+): Promise<DiscoveryResult> {
+  if (!client) {
+    return { ok: false, code: "unavailable", message: "no peer is registered for this session" };
+  }
+  const outcome = await withDeadline(() => client.capabilities(), options.timeoutMs ?? DEFAULT_PEER_TIMEOUT_MS);
+  if (!outcome.ok) {
+    return { ok: false, code: outcome.code, message: outcome.message };
+  }
+  const capabilities = outcome.value;
+  if (!capabilities || typeof capabilities !== "object" || typeof capabilities.protocolVersion !== "number") {
+    return { ok: false, code: "incompatible", message: "the peer announced no readable capabilities" };
+  }
+  if (capabilities.protocolVersion !== PEER_PROTOCOL_VERSION) {
+    return {
+      ok: false,
+      code: "incompatible",
+      message:
+        `the peer speaks protocol version ${capabilities.protocolVersion}; this consumer speaks ` +
+        `${PEER_PROTOCOL_VERSION}. A receipt from an unknown version cannot be verified.`,
+    };
+  }
+  const supported = new Set(capabilities.operations ?? []);
+  const missing = requirements.operations.filter((operation) => !supported.has(operation));
+  if (missing.length > 0) {
+    return {
+      ok: false,
+      code: "incompatible",
+      message: `the peer does not support required operation(s): ${missing.join(", ")}`,
+    };
+  }
+  if (requirements.profile && !(capabilities.profiles ?? []).includes(requirements.profile)) {
+    return {
+      ok: false,
+      code: "incompatible",
+      message: `the peer does not support the required projection profile ${requirements.profile}`,
+    };
+  }
+  return { ok: true, capabilities };
+}
+
+/**
+ * Step 3 of the recoverable ordering, caller side: verify the answer against
+ * the request that produced it before anything is persisted or published.
+ *
+ * The checks are deliberately granular, because the code decides recovery: a
+ * stale epoch or selection quarantines the intent, while an unavailable peer
+ * keeps it for retry. Verifying here — rather than trusting the transport — is
+ * also what makes a late response harmless after cancellation, pause,
+ * generation change, or branch change (§4).
+ */
+export function verifyReceipt(request: PeerRequest, response: PeerResponse): ReceiptCheck {
+  if (response.status === "error") {
+    return { ok: false, code: response.code, message: response.message };
+  }
+  if (response.status === "pending") {
+    return {
+      ok: false,
+      code: "pending",
+      message: `the peer has not durably selected operation ${response.operationId}: ${response.reason}`,
+    };
+  }
+  const receipt = response.receipt;
+  if (!receipt || typeof receipt !== "object") {
+    return { ok: false, code: "incompatible", message: "the peer returned a committed status with no receipt" };
+  }
+  if (receipt.protocolVersion !== PEER_PROTOCOL_VERSION) {
+    return {
+      ok: false,
+      code: "incompatible",
+      message: `the receipt is protocol version ${receipt.protocolVersion}, not ${PEER_PROTOCOL_VERSION}`,
+    };
+  }
+  if (receipt.operationId !== request.operationId) {
+    return {
+      ok: false,
+      code: "refused",
+      message: `the receipt answers operation ${receipt.operationId}, not ${request.operationId}`,
+    };
+  }
+  const scope = receipt.scope;
+  if (!scope || typeof scope !== "object") {
+    return { ok: false, code: "incompatible", message: "the receipt carries no scope identity" };
+  }
+  if (scope.consumer !== request.scope.consumer || scope.scopeId !== request.scope.scopeId) {
+    return {
+      ok: false,
+      code: "scope-conflict",
+      message: `the receipt is for scope ${scope.consumer}/${scope.scopeId}, not ${request.scope.consumer}/${request.scope.scopeId}`,
+    };
+  }
+  if (scope.epoch !== request.scope.epoch) {
+    return {
+      ok: false,
+      code: "stale-epoch",
+      message: `the receipt was issued for execution epoch ${scope.epoch}; ${request.scope.epoch} is in force`,
+    };
+  }
+  if (!scope.selection || !selectionsEqual(scope.selection, request.scope.selection)) {
+    return {
+      ok: false,
+      code: "stale-selection",
+      message: "the receipt was issued against a different session/branch selection",
+    };
+  }
+  if (scope.contractRevision !== request.scope.contractRevision) {
+    return {
+      ok: false,
+      code: "refused",
+      message: "the receipt mirrors a different contract revision than the one in force",
+    };
+  }
+  if (receipt.payloadDigest !== canonicalDigest(request.payload)) {
+    return {
+      ok: false,
+      code: "replay-conflict",
+      message: `operation ${request.operationId} was committed with a different payload`,
+    };
+  }
+  if (typeof receipt.selectedRevision !== "string" || receipt.selectedRevision.length === 0) {
+    return {
+      ok: false,
+      code: "refused",
+      message: "the receipt names no durably selected revision, so it is not a commit",
+    };
+  }
+  return { ok: true, receipt };
+}

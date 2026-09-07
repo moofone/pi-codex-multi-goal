@@ -1,3 +1,5 @@
+import type { PeerOperationKind, PeerReceipt, PeerScope } from "./peer.js";
+
 export const CUSTOM_ENTRY_TYPE = "pi-codex-multi-goal";
 export const MAX_STAGES = 24;
 export const MIN_WIZARD_STAGES = 2;
@@ -27,6 +29,13 @@ export const DEFAULT_LIFETIME_CEILING = 1000;
 export const BUDGET_WARNING_FRACTION = 0.8;
 /** Maximum credited-evidence dedupe keys kept on one execution grant. */
 export const MAX_CREDITED_EVIDENCE = 64;
+/**
+ * Durable operation receipts kept per stage. Retention only has to cover the
+ * lifetime in which an operation can be retried (GOAL_WITH_DAG_SUPPORT §4), and
+ * a stage transition changes the scope identity, so the list is cleared there
+ * rather than growing for the life of the goal.
+ */
+export const MAX_RETAINED_OPERATIONS = 16;
 
 export type GoalStatus = "active" | "paused" | "blocked" | "complete";
 export type StageStatus = "pending" | "active" | "complete";
@@ -99,6 +108,97 @@ export interface GoalExecution {
   creditedEvidence: string[];
 }
 
+/**
+ * The five backend states of GOAL_WITH_DAG_SUPPORT §3.
+ *
+ * `unbound` is not a degraded mode: it is today's Goal-only behaviour, and P0
+ * must not start rejecting working Goal-only memory writes just because it
+ * discovers a checkpoint (§10, P0 row; invariant 1). Optional means a peer is
+ * not required to START an unbound goal — it does not mean an authoritative
+ * backend may disappear without recovery, which is why an explicit disable or
+ * unload after binding takes the unavailable or detached path, never a silent
+ * return to `unbound`.
+ */
+export type GoalBackendState =
+  | "unbound"
+  | "binding-pending"
+  | "bound-available"
+  | "bound-unavailable"
+  | "detached";
+
+/**
+ * The minimum binding state needed for recovery (§3). `stageId` is `Stage.id`
+ * (PI_DAG_COMPACT D7): the displayed step number is not identity. The recorded
+ * generation, contract revision and session/branch selection are what let a
+ * stale callback be detected — a receipt is compared against the identity the
+ * operation was PLANNED with, not against whatever is current when it lands.
+ */
+export interface GoalBinding {
+  peerId: string;
+  /** The peer's own work identity for this binding. */
+  taskId: string;
+  goalId: string;
+  stageId: string;
+  generation: number;
+  contractRevision: string;
+  sessionId: string;
+  branchAnchorId: string;
+  /**
+   * The selected durable revision: the current working set. Checkpoints are
+   * recovery anchors; this identifies what is in force. Null until the bind
+   * receipt lands.
+   */
+  selectedRevision: string | null;
+}
+
+/**
+ * One persisted intent (§4 step 1): enough to retry the SAME operation after a
+ * crash at any of the four partial-write boundaries. At most one may be
+ * pending for a stage.
+ */
+export interface PendingOperation {
+  operationId: string;
+  kind: PeerOperationKind;
+  /** The backend state this operation intends to reach. */
+  expectedState: GoalBackendState;
+  /** The state to return to if it never gets there. */
+  previousState: GoalBackendState;
+  /** The identity it was planned with, including the branch selection. */
+  scope: PeerScope;
+  expectedRevision: string | null;
+  payloadDigest: string;
+  payload: unknown;
+  /** Peer identity to record on the binding when this operation is accepted. */
+  peerId?: string;
+  taskId?: string;
+  createdAt: number;
+}
+
+export type OperationOutcome = "committed" | "quarantined";
+
+/**
+ * A retained operation record. A committed one answers an identical replay
+ * without touching the peer; a quarantined one refuses a late receipt and
+ * tells the caller to re-plan under a new ID.
+ */
+export interface RetainedOperation {
+  operationId: string;
+  kind: PeerOperationKind;
+  payloadDigest: string;
+  outcome: OperationOutcome;
+  receipt: PeerReceipt | null;
+  reason: string | null;
+}
+
+export interface GoalBackend {
+  state: GoalBackendState;
+  binding: GoalBinding | null;
+  pending: PendingOperation | null;
+  operations: RetainedOperation[];
+  /** Why execution is withheld or why the last switch did not complete. */
+  reason: string | null;
+}
+
 export interface MultiGoal {
   goalId: string;
   status: GoalStatus;
@@ -116,6 +216,12 @@ export interface MultiGoal {
   updatedAt: number;
   memory: GoalMemory;
   execution: GoalExecution;
+  /**
+   * Which working-memory authority is in force, and any operation still in
+   * flight to it. A goal that never meets a peer carries `unbound` here for
+   * its whole life and behaves exactly as it did before P0.
+   */
+  backend: GoalBackend;
   pauseReason: string | null;
   /**
    * Provider-visible isolation boundary (epoch ms) recorded when a step

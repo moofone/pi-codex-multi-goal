@@ -1,5 +1,11 @@
 import { randomUUID } from "node:crypto";
 
+import {
+  advanceBackendToNextStage,
+  emptyBackend,
+  isGoalBackend,
+  normalizeBackend,
+} from "./backend.js";
 import { computeContractRevision } from "./contract.js";
 import { parseStageTitles, validateSteps, validateTitles } from "./parse.js";
 import {
@@ -122,6 +128,9 @@ export function cloneGoal(goal: MultiGoal): MultiGoal {
       next: goal.memory.next,
     },
     execution: normalizeExecution(goal.execution),
+    // A snapshot written before P0 has no backend record; a goal that never met
+    // a peer is `unbound`, which is today's behaviour (invariant 1).
+    backend: normalizeBackend(goal.backend),
     pauseReason: goal.pauseReason,
     stages: goal.stages.map((stage) => ({
       ...stage,
@@ -153,6 +162,7 @@ export function createGoal(titles: string[], now = unixSeconds()): MultiGoal {
     isolationCutoff: null,
     memory: emptyMemory(),
     execution: freshExecution(),
+    backend: emptyBackend(),
     pauseReason: null,
     stages: titles.map((title, index) => ({
       id: randomUUID(),
@@ -177,6 +187,7 @@ function createGoalFromSteps(
     isolationCutoff: null,
     memory: emptyMemory(),
     execution: freshExecution(limits),
+    backend: emptyBackend(),
     pauseReason: null,
     stages: steps.map((step, index) => ({
       id: randomUUID(),
@@ -301,6 +312,12 @@ export function acceptCompletion(
     creditedEvidence: [],
   };
   next.isolationCutoff = isolationCutoffMs;
+  // The new stage has a different Stage.id and contractRevision, so no
+  // operation planned for the old one can address it: the pending intent and
+  // the retained receipts are cleared with the stage they belonged to (§4
+  // "operation retention"). A bound goal waits for the next stage's protected
+  // contract before it is authoritative again.
+  next.backend = advanceBackendToNextStage(next.backend);
   next.pauseReason = null;
   return {
     ok: true,
@@ -501,6 +518,10 @@ export function isMultiGoal(value: unknown): value is MultiGoal {
     !goal.stages.every(isStage) ||
     !isGoalMemory(goal.memory) ||
     !isGoalExecution(goal.execution) ||
+    // Absent is fine (an older snapshot is unbound); present but unreadable is
+    // not, because invariant 8 forbids downgrading an authoritative backend to
+    // "there was never a binding". reconstructGoal keeps the last valid one.
+    !(goal.backend === undefined || isGoalBackend(goal.backend)) ||
     !(goal.pauseReason === null || typeof goal.pauseReason === "string")
   ) {
     return false;
@@ -649,6 +670,7 @@ export function migrateV1Goal(v1: V1GoalShape): MultiGoal {
     isolationCutoff: null,
     memory: emptyMemory(),
     execution: freshExecution(),
+    backend: emptyBackend(),
     pauseReason: complete ? null : V1_MIGRATION_PAUSE_REASON,
     stages: v1.stages.map((stage, position) => ({
       id: `${v1.goalId}:stage:${position}`,

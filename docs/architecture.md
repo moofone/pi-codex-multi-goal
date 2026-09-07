@@ -141,6 +141,36 @@ without repeatedly asking it to reconsider the goal.
   working memory means removing active state and model context, not deleting
   workspace evidence or rewriting the host's historical session log.
 
+## 7. Working-memory backend binding (P0, Goal side)
+
+The working-memory authority is explicit and persisted. `MultiGoal.backend`
+carries one of five states — `unbound`, `binding-pending`, `bound-available`,
+`bound-unavailable`, `detached` — plus the binding identity, at most one pending
+durable operation, and a bounded list of retained operation receipts.
+
+- `unbound` is the default and is unchanged behaviour: no peer is consulted, no
+  new settings are required, and a checkpoint on the branch that describes
+  unrelated work has no effect on a Goal-only memory write.
+- Binding, detachment, reload and branch selection refill no execution budget.
+  Withholding execution while a switch is in progress is not exhaustion and
+  charges nothing.
+- A bound backend that stops answering becomes `bound-unavailable`: the binding,
+  its revision pointer and the allowances are preserved, Goal-owned execution is
+  paused with a visible reason, and Goal does not fall back to its previous
+  memory record.
+- Every mutation and transition carries `goalId`, `Stage.id`, `generation`,
+  `contractRevision`, and the session/branch selection. A receipt is verified
+  against the intent it answers, so a late response after a pause, a generation
+  change, or a branch move quarantines itself instead of publishing state.
+- Recovery is a persisted intent plus idempotent replay, not a shared
+  transaction. The four partial-write boundaries — after the intent, after the
+  peer commit, after the receipt, before Goal's acknowledgement — all recover to
+  exactly one commit.
+
+The wire contract, payload shapes, error codes, retention rules, and recovery
+transitions are specified in [peer-protocol.md](peer-protocol.md). There is no
+peer transport yet: P0 proves the seam against an in-process fake.
+
 ## Acceptance evidence
 
 The implementation should demonstrate these properties with deterministic
