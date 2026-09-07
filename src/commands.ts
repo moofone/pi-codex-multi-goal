@@ -17,6 +17,29 @@ export interface CommandHost {
 }
 
 const COMMANDS = ["pause", "resume", "clear"] as const;
+type LifecycleCommand = (typeof COMMANDS)[number];
+
+/**
+ * Lifecycle words are never a new objective. `/goal resume` must resume, not
+ * open the criteria wizard with objective "resume".
+ */
+function parseLifecycleCommand(
+  args: string,
+): { ok: true; command: LifecycleCommand } | { ok: false; message: string } | null {
+  const trimmed = args.trim();
+  if (trimmed.length === 0) {
+    return null;
+  }
+  const [first = "", ...rest] = trimmed.split(/\s+/);
+  const command = first.toLowerCase();
+  if (!COMMANDS.includes(command as LifecycleCommand)) {
+    return null;
+  }
+  if (rest.length > 0) {
+    return { ok: false, message: `Usage: /goal ${command}` };
+  }
+  return { ok: true, command: command as LifecycleCommand };
+}
 
 async function confirmReplaceIfNeeded(
   host: CommandHost,
@@ -103,7 +126,12 @@ export async function handleGoalCommand(
     return;
   }
 
-  if (trimmed === "clear") {
+  const lifecycle = parseLifecycleCommand(trimmed);
+  if (lifecycle && !lifecycle.ok) {
+    ctx.ui.notify(lifecycle.message, "warning");
+    return;
+  }
+  if (lifecycle?.ok && lifecycle.command === "clear") {
     if (!host.getGoal()) {
       ctx.ui.notify("No goal is set.", "warning");
       return;
@@ -112,9 +140,8 @@ export async function handleGoalCommand(
     ctx.ui.notify("Goal cleared.");
     return;
   }
-
-  if (trimmed === "pause" || trimmed === "resume") {
-    const status = trimmed === "pause" ? "paused" : "active";
+  if (lifecycle?.ok && (lifecycle.command === "pause" || lifecycle.command === "resume")) {
+    const status = lifecycle.command === "pause" ? "paused" : "active";
     const result = setGoalStatus(host.getGoal(), status);
     if (!result.ok || !result.goal) {
       ctx.ui.notify(result.message, "warning");
@@ -122,10 +149,10 @@ export async function handleGoalCommand(
     }
     // An explicit user resume grants a fresh bounded no-progress allowance;
     // the total budget and lifetime totals are never replenished.
-    const goal = trimmed === "resume" ? applyResumeGrant(result.goal) : result.goal;
+    const goal = lifecycle.command === "resume" ? applyResumeGrant(result.goal) : result.goal;
     host.setGoal(goal, "command", ctx);
     ctx.ui.notify(result.message);
-    if (trimmed === "resume" && goal.status === "active") {
+    if (lifecycle.command === "resume" && goal.status === "active") {
       host.requestContinuation(ctx, "command_resume");
     }
     return;
@@ -193,8 +220,8 @@ export function registerGoalCommand(pi: ExtensionAPI, host: CommandHost): void {
     description:
       "Usage: /goal [<objective>|pause|resume|clear] — Codex-style goal; headless accepts a JSON contract. Use /goal-multi for staged goals.",
     getArgumentCompletions(argumentPrefix) {
-      const prefix = argumentPrefix.trim();
-      if (prefix.length === 0 || /\s/.test(argumentPrefix)) {
+      const prefix = argumentPrefix.trim().toLowerCase();
+      if (/\s/.test(argumentPrefix)) {
         return null;
       }
       const items = COMMANDS.filter((command) => command.startsWith(prefix)).map((command) => ({

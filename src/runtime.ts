@@ -3,9 +3,11 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import {
   allowanceExhaustion,
   allowancePauseReason,
+  chargeContext,
   chargeRequest,
   creditVerifiedEvidence,
   type AllowanceExhaustion,
+  type ChargeOutcome,
 } from "./allowance.js";
 import { registerGoalCommand, registerGoalMultiCommand } from "./commands.js";
 import { createContinuation } from "./continuation.js";
@@ -166,12 +168,12 @@ export function registerMultiGoal(pi: ExtensionAPI): void {
     refresh(ctx);
   };
 
-  // Exhaustion pauses goal execution with a visible, persisted reason. The
-  // user resume path may grant a fresh bounded no-progress allowance, but the
-  // total budget never refills. This is an accounting pause: future scheduling
-  // is invalidated, and the loop already in flight keeps its goal ownership
-  // (a later user withdraw must still recognize it) — no abort is issued here,
-  // so the request that was just charged is not thrown away.
+  // Exhaustion pauses goal execution with a visible, persisted reason and
+  // stops proven goal-owned work. The user resume path may grant a fresh
+  // bounded no-progress allowance, but the total budget never refills.
+  // Persist first so agent_end sees an already-paused goal, then withdraw:
+  // abort only when outstanding() proves the queued follow-up or in-flight
+  // loop is ours (probe 2: ctx.abort() is process-global).
   const pauseForExhaustion = (
     ctx: ExtensionContext,
     goal: MultiGoal,
@@ -185,11 +187,11 @@ export function registerMultiGoal(pi: ExtensionAPI): void {
       return;
     }
     paused.goal.pauseReason = allowancePauseReason(paused.goal.execution, exhaustion);
-    continuation.clearSchedule();
     persist(paused.goal, "runtime", ctx);
     if (!persistenceBroken) {
       ctx.ui.notify(paused.goal.pauseReason, "warning");
     }
+    withdrawGoalWork(ctx);
   };
 
   // Persistence failure admits no goal work: no completions, no blocks, and no
@@ -217,19 +219,11 @@ export function registerMultiGoal(pi: ExtensionAPI): void {
     return continuation.request(ctx, kind, options);
   };
 
-  // Persisted request accounting at provider entry (probe 1: the hook observes
-  // every goal-owned agent-loop request before the provider's retry loop).
-  // Charge durably exactly once per request; reloads and retries never refund.
-  // Revalidation at provider admission: ownership (yielding), goal status, and
-  // a non-exhausted allowance — a host-issued request this extension cannot
-  // deny is left uncharged rather than negative — the A04 gap is documented,
-  // not claimed solved.
-  const chargeAtProviderEntry = (ctx: ExtensionContext): void => {
-    const goal = persistence.getGoal();
-    if (!goal || goal.status !== "active" || yielding(ctx) || persistenceBroken) {
-      return;
-    }
-    const outcome = chargeRequest(goal.execution);
+  // Apply a charge against the persisted grant. Unchanged (already exhausted)
+  // and charged-exhausted both pause and stop goal-owned work. A host-issued
+  // request this extension cannot deny is left uncharged rather than negative
+  // — the A04 gap is documented, not claimed solved.
+  const applyCharge = (ctx: ExtensionContext, goal: MultiGoal, outcome: ChargeOutcome): void => {
     if (outcome.type === "unchanged") {
       pauseForExhaustion(ctx, goal, outcome.exhaustion);
       return;
@@ -237,15 +231,33 @@ export function registerMultiGoal(pi: ExtensionAPI): void {
     const next = cloneGoal(goal);
     next.execution = outcome.execution;
     next.updatedAt = unixSeconds();
-    if (outcome.type === "charged-exhausted") {
-      next.status = "paused";
-      next.pauseReason = allowancePauseReason(next.execution, outcome.exhaustion);
-      continuation.clearSchedule();
-    }
     persist(next, "runtime", ctx);
-    if (next.status === "paused" && next.pauseReason && !persistenceBroken) {
-      ctx.ui.notify(next.pauseReason, "warning");
+    if (outcome.type === "charged-exhausted") {
+      pauseForExhaustion(ctx, next, outcome.exhaustion);
     }
+  };
+
+  // Total-budget accounting at provider entry (probe 1: the hook observes
+  // every goal-owned agent-loop request before the provider's retry loop).
+  // Charge durably exactly once per request against total/lifetime; reloads
+  // and retries never refund. No-progress is not spent here.
+  const chargeAtProviderEntry = (ctx: ExtensionContext): void => {
+    const goal = persistence.getGoal();
+    if (!goal || goal.status !== "active" || yielding(ctx) || persistenceBroken) {
+      return;
+    }
+    applyCharge(ctx, goal, chargeRequest(goal.execution));
+  };
+
+  // No-progress accounting at a full context: one session_compact is one
+  // context window. Tool-loop provider requests do not count. Peer-owned
+  // sessions are not charged.
+  const chargeAtContextBoundary = (ctx: ExtensionContext): void => {
+    const goal = persistence.getGoal();
+    if (!goal || goal.status !== "active" || yielding(ctx) || persistenceBroken) {
+      return;
+    }
+    applyCharge(ctx, goal, chargeContext(goal.execution));
   };
 
   // Accepted completions, newest kept per tool-call id: a replayed terminal
@@ -764,10 +776,11 @@ export function registerMultiGoal(pi: ExtensionAPI): void {
     persistence.flush("runtime");
     trackPersistence(ctx);
     refresh(ctx);
-    // The one context-boundary snapshot: eligible only after the previous
-    // continuation was delivered, and still gated by ownership, status, and
-    // allowance. Recovery after context loss is a goal continuation like any
-    // other; the provider-entry charge applies to it.
+    // One full context spent (or a no-progress pause + stop if that was the
+    // last one). Then the one context-boundary snapshot: eligible only after
+    // the previous continuation was delivered, and still gated by ownership,
+    // status, and allowance.
+    chargeAtContextBoundary(ctx);
     requestContinuation(ctx, undefined, { atContextBoundary: true });
   });
 

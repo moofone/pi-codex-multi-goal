@@ -17,12 +17,14 @@ maintains a small evidence record, and reports completion or a blocker.
 
 ## 1. Unproductive execution is bounded
 
-- Every active step has a finite maximum number of consecutive model turns
-  without useful progress. Reaching the limit pauses that step before another
-  goal-owned model request can begin.
-- A turn means one model request, including requests inside a continuing tool
-  loop. Kickoff, continuation, retries, and recovery cannot bypass accounting by
-  using a different entry path.
+- Every active step has a finite maximum number of consecutive full contexts
+  without useful progress. Reaching the limit pauses that step and stops proven
+  goal-owned work before another goal-owned context can begin.
+- A full context means one context-window fill (a `session_compact`). Provider
+  requests inside a continuing tool loop do not spend the no-progress allowance.
+  A separate total request budget still bounds those loops. Kickoff,
+  continuation, retries, and recovery cannot bypass accounting by using a
+  different entry path.
 - Useful progress is new, verifiable movement toward the current objective:
   a relevant implementation change, a meaningful validation result, or evidence
   that resolves an open question. A successful tool call, arbitrary edit, repeated
@@ -58,7 +60,7 @@ maintains a small evidence record, and reports completion or a blocker.
   While pi-orchestrate owns execution, this controller yields and injects no
   competing goal follow-ups or step transitions.
 - Yielding preserves the current step and allowance. Orchestrate-owned work is
-  neither charged as goal turns nor treated as proof of goal progress.
+  neither charged as goal contexts or requests nor treated as proof of goal progress.
 - Handoff must not cancel the peer's work, lose user input, duplicate a queued
   continuation, or revive a paused goal. With no goal active, the extension is inert.
 
@@ -75,8 +77,8 @@ without repeatedly asking it to reconsider the goal.
   representation of that objective without accumulating reminder history.
 - Completion, blockers, user pause, and safety exhaustion may be handled as soon
   as they occur; they do not need to wait for a full context window.
-- Silent per-turn accounting is separate from model-facing goal review. Sparse
-  reminders must never create an unbounded tool loop or bypass the turn limit.
+- Silent accounting is separate from model-facing goal review. Sparse
+  reminders must never create an unbounded tool loop or bypass the execution limits.
 
 ## 5. Optional steps are deterministic and isolated
 
@@ -143,8 +145,10 @@ without repeatedly asking it to reconsider the goal.
 The implementation should demonstrate these properties with deterministic
 runtime tests, including controlled model responses:
 
-- An endless bookkeeping/tool loop pauses at the configured turn limit, without
-  waiting for idle or compaction, and admits no further goal-owned model request.
+- An endless bookkeeping/tool loop is bounded by the total request budget, stops
+  when that budget is spent, and admits no further goal-owned model request.
+  Unproductive full context windows pause at the configured no-progress limit
+  and stop proven goal-owned work.
 - Relevant research and validation can count as progress; repeated no-op activity
   cannot. Reload and compaction do not erase a partially consumed allowance.
 - Ordinary turns do not inject goal-review prompts; the context boundary does.
@@ -160,8 +164,9 @@ runtime tests, including controlled model responses:
 
 ## Implementation status and decisions
 
-Implemented in the goal-memory-and-limits feature, replacing the earlier
-compaction/mutation counting described at design time:
+Implemented in the goal-memory-and-limits feature. No-progress counting is
+full-context (compaction) again; mutation-name resets stay retired in favor of
+verified evidence:
 
 - **State (invariants 2, 5, 6):** validated v2 custom entries with per-stage
   stable IDs, human-authored criteria, one current-step memory record
@@ -175,9 +180,11 @@ compaction/mutation counting described at design time:
   `/goal-multi` collects per-step criteria behind one sequence confirm; headless
   starts only from the documented JSON contract. The undocumented ` || `
   splitting is retired.
-- **Accounting (invariant 1):** request-based, durable, charged once at provider
-  entry; no unlimited settings; verified evidence — validated on the same path
-  as completion — resets only the no-progress streak, once per novel ref.
+- **Accounting (invariant 1):** dual-unit and durable. No-progress is charged
+  once per full context (`session_compact`); the total budget is charged once
+  per goal-owned provider request. No unlimited settings. Exhaustion pauses and
+  withdraws proven goal-owned work. Verified evidence — validated on the same
+  path as completion — resets only the no-progress streak, once per novel ref.
   Explicit resume grants a fresh bounded no-progress streak; totals never
   refill.
 - **Continuation (invariants 3, 4):** queued / delivered /
@@ -192,7 +199,7 @@ compaction/mutation counting described at design time:
   withholds the kickoff paused instead of running the next step in the old
   transcript.
 
-Explicit provisional choices: 20 no-progress / 200 total requests per grant,
+Explicit provisional choices: 20 no-progress full contexts / 200 total requests per grant,
 8 KiB memory record, validated in fixtures before being treated as product
 numbers; bytes are not tokens. Recovery reads the selected session branch and
 never silently resumes or refills.

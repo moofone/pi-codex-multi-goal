@@ -67,15 +67,17 @@ contract confirm.
 
 ## Limits (provisional)
 
-Each step gets a finite execution grant. Defaults: **20** provider requests
-without verified progress and **200** total. There is no unlimited mode: `0`,
-`null`, and malformed values clamp to the finite defaults. Verified evidence
-(the same validation path completion uses) resets only the no-progress streak,
-once per novel evidence ref; memory rewrites, tool success, and
-`edit`/`write`/`apply_patch` calls alone earn nothing. Reloads, retries, and
-compaction never refund; lifetime totals never reset. Exhaustion pauses the goal
-with a persisted reason, and `/goal resume` grants a fresh bounded no-progress
-streak only.
+Each step gets a finite execution grant. Defaults: **20** full contexts
+(compaction / context-window fills) without verified progress and **200**
+total provider requests. Turns inside a tool loop do not spend the no-progress
+allowance. There is no unlimited mode: `0`, `null`, and malformed values clamp
+to the finite defaults. Verified evidence (the same validation path completion
+uses) resets only the no-progress streak, once per novel evidence ref; memory
+rewrites, tool success, and `edit`/`write`/`apply_patch` calls alone earn
+nothing. Reloads, retries, and compaction never refund; lifetime totals never
+reset. Exhaustion pauses the goal with a persisted reason **and stops proven
+goal-owned work** (queued follow-up or in-flight goal loop). `/goal resume`
+grants a fresh bounded no-progress streak only.
 
 Settings live in `~/.pi/agent/pi-codex-multi-goal.json`:
 
@@ -83,10 +85,10 @@ Settings live in `~/.pi/agent/pi-codex-multi-goal.json`:
 { "noProgressLimit": 20, "totalLimit": 200 }
 ```
 
-Migration: `maxCompactionsWithoutMutation` is retired — full-context-window
-counting no longer gates execution. A positive legacy value migrates onto
-`noProgressLimit`; the old `0`/`null` "disable" meaning clamps to the finite
-defaults instead of disabling admission.
+Migration: `maxCompactionsWithoutMutation` is the legacy name for the
+no-progress full-context limit. A positive legacy value migrates onto
+`noProgressLimit` (same unit: context windows). The old `0`/`null` "disable"
+meaning clamps to the finite defaults instead of disabling admission.
 
 The 8 KiB memory limit and the 20/200 defaults are provisional pending long-run
 fixture validation; bytes are not a token count.
@@ -98,9 +100,10 @@ Recorded against the installed Pi peer by `qa/host-capabilities.test.ts` in
 
 - `before_provider_request` observes and may replace the payload but **cannot
   deny** a request, including provider-level retries. The allowance is therefore
-  enforced by refusing to schedule goal continuations once remaining is 0 and
-  charging every goal-owned request once at provider entry; the host itself is
-  not walled off.
+  enforced by refusing to schedule goal continuations once remaining is 0,
+  charging the total budget once per goal-owned request at provider entry,
+  charging no-progress once per full context at `session_compact`, and aborting
+  proven goal-owned work on exhaustion; the host itself is not walled off.
 - No offline-drivable live agent loop exists, so end-to-end admission, retry,
   and delivery behavior is not behaviorally verified.
 - `ctx.abort()` is process-global; the extension aborts only after proving the

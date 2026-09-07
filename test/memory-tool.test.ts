@@ -20,7 +20,7 @@ import { CUSTOM_ENTRY_TYPE } from "../src/types.ts";
 //     next action (A06 snapshot content);
 //   - criteria are unchanged (A01: memory is not a contract mutation), no step
 //     transition happens, and execution remaining is unchanged — a memory-only
-//     loop still consumes no-progress at provider entry (A02 progress-buy).
+//     loop still consumes no-progress at a full context (A02 progress-buy).
 //   - human /goal status shows the memory record and the counters.
 
 interface HarnessOptions {
@@ -105,6 +105,7 @@ function harness(t: any, options: HarnessOptions = {}) {
       emit("before_provider_request", {
         payload: { model: "fake-model", messages: [{ role: "user", content: "<goal>turn</goal>" }], tools: [] },
       }),
+    compact: () => emit("session_compact", { reason: "threshold" }),
     goalStatus: () => {
       commands.get("goal").handler("", ctx);
       return lastNotified ?? "";
@@ -212,15 +213,25 @@ test("update_goal_memory replace reject stale and oversized", async t => {
   assert.equal(current.index, indexBefore, "memory updates cannot transition steps");
   assert.deepEqual(current.execution, executionBefore, "memory updates never replenish the allowance");
 
-  // --- a memory-only loop still consumes no-progress at provider entry.
+  // --- a memory-only loop still consumes no-progress at a full context, not
+  // at a provider-entry turn.
   await h.providerRequest();
   current = h.current();
   assert.equal(
     current.execution.noProgressRemaining,
-    executionBefore.noProgressRemaining - 1,
-    "memory-only work consumes no-progress like other unproductive work",
+    executionBefore.noProgressRemaining,
+    "a memory-only provider request does not spend no-progress",
   );
   assert.equal(current.execution.lifetimeRequests, executionBefore.lifetimeRequests + 1);
+  assert.equal(current.execution.totalRemaining, executionBefore.totalRemaining - 1);
+
+  await h.compact();
+  current = h.current();
+  assert.equal(
+    current.execution.noProgressRemaining,
+    executionBefore.noProgressRemaining - 1,
+    "memory-only work consumes no-progress at a full context",
+  );
 
   // --- human /goal status shows the memory record and the counters.
   const status = h.goalStatus();

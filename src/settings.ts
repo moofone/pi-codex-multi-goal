@@ -24,10 +24,11 @@ function parsePositiveInteger(value: unknown): number | undefined {
 }
 
 /**
- * Finite limits only. `maxCompactionsWithoutMutation` is retired: when no
- * explicit `noProgressLimit` is set, a positive legacy value migrates onto the
- * no-progress limit; its old 0/null "disable" meaning clamps to the finite
- * default instead of disabling admission.
+ * Finite limits only. `maxCompactionsWithoutMutation` is the legacy name for
+ * the no-progress full-context limit: when no explicit `noProgressLimit` is
+ * set, a positive legacy value migrates onto it (same unit: context windows).
+ * Its old 0/null "disable" meaning clamps to the finite default instead of
+ * disabling admission.
  */
 export function parseSettings(raw: unknown, path: string): MultiGoalSettings {
   const fallback: MultiGoalSettings = {

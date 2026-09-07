@@ -3,7 +3,7 @@ import test from "node:test";
 import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 
 import { handleGoalCommand, type CommandHost } from "../src/commands.ts";
-import { createGoal, goalsEquivalent } from "../src/state.ts";
+import { createGoal, goalsEquivalent, setGoalStatus } from "../src/state.ts";
 import type { GoalContinuationKind, GoalEntrySource, MultiGoal } from "../src/types.ts";
 
 interface TestHost extends CommandHost {
@@ -42,13 +42,16 @@ function makeCtx(options: { hasUI: boolean; inputs?: Array<string | undefined>; 
   ctx: ExtensionCommandContext;
   notifications: Array<{ message: string; level?: string }>;
   confirmCalls: Array<{ title: string; message: string }>;
+  inputPrompts: string[];
 } {
   const notifications: Array<{ message: string; level?: string }> = [];
   const confirmCalls: Array<{ title: string; message: string }> = [];
+  const inputPrompts: string[] = [];
   const ctx = {
     hasUI: options.hasUI,
     ui: {
-      async input(_prompt: string, _preset?: string) {
+      async input(prompt: string, _preset?: string) {
+        inputPrompts.push(prompt);
         return options.inputs?.shift();
       },
       async confirm(title: string, message: string) {
@@ -60,7 +63,7 @@ function makeCtx(options: { hasUI: boolean; inputs?: Array<string | undefined>; 
       },
     },
   };
-  return { ctx: ctx as unknown as ExtensionCommandContext, notifications, confirmCalls };
+  return { ctx: ctx as unknown as ExtensionCommandContext, notifications, confirmCalls, inputPrompts };
 }
 
 test("headless start requires JSON contract", async () => {
@@ -214,4 +217,38 @@ test("headless start requires JSON contract", async () => {
     replaced.setCalls[0]!.goal.stages[0]!.criteria[0]!.text,
     "clean criterion",
   );
+});
+
+test("/goal resume never asks for criteria", async () => {
+  const paused = setGoalStatus(createGoal(["ship the fix"], 1), "paused").goal!;
+  const host = makeHost(paused);
+  const ui = makeCtx({
+    hasUI: true,
+    inputs: ["should never be read", ""],
+    confirms: [true, true],
+  });
+
+  await handleGoalCommand(host, "resume", ui.ctx);
+
+  assert.deepEqual(ui.inputPrompts, [], "resume must not open the criteria wizard");
+  assert.equal(ui.confirmCalls.length, 0, "resume must not confirm a new contract");
+  assert.equal(host.setCalls.length, 1);
+  assert.equal(host.setCalls[0]!.goal.status, "active");
+  assert.equal(host.setCalls[0]!.goal.stages[0]!.title, "ship the fix");
+  assert.deepEqual(host.continuations, ["command_resume"]);
+  assert.match(ui.notifications.at(-1)?.message ?? "", /resumed/i);
+
+  // Case and surrounding whitespace still resume; extra tokens are usage, not a new objective.
+  const again = makeHost(setGoalStatus(createGoal(["keep going"], 1), "paused").goal!);
+  const caps = makeCtx({ hasUI: true, inputs: ["hijack"], confirms: [true] });
+  await handleGoalCommand(again, "  Resume  ", caps.ctx);
+  assert.deepEqual(caps.inputPrompts, []);
+  assert.equal(again.setCalls[0]!.goal.status, "active");
+
+  const extra = makeHost(paused);
+  const extraUi = makeCtx({ hasUI: true, inputs: ["hijack"], confirms: [true] });
+  await handleGoalCommand(extra, "resume now", extraUi.ctx);
+  assert.deepEqual(extraUi.inputPrompts, []);
+  assert.equal(extra.setCalls.length, 0);
+  assert.match(extraUi.notifications.at(-1)?.message ?? "", /Usage: \/goal resume/);
 });
