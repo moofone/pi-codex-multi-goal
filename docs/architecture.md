@@ -36,6 +36,24 @@ maintains a small evidence record, and reports completion or a blocker.
 - Compaction, reload, and retries preserve the current step's accounting. Only
   verified progress, an explicit user resume, or a legitimate new step starts a
   fresh no-progress allowance.
+- A component must be consistent with its container, not only with itself. A
+  binding, a pending operation, or a retained receipt that names another goal or
+  another stage is rejected on load rather than reloading as authoritative —
+  while the fields that record when or where it was made are allowed to lag,
+  because noticing that is what the recovery path is for.
+- Every writer must satisfy the invariant the reader enforces. A transition
+  that produces a state the snapshot validator rejects leaves a goal running
+  until it reloads and is then skipped as malformed, so state is derived from
+  what is true rather than replayed from what was recorded, and limits are
+  clamped where they are minted rather than only checked where they are read.
+- A persisted grant must respect the limits it declares: every counter is at or
+  below the limit it is spent from, and the limits themselves are ordered
+  (turn bound <= working total <= lifetime ceiling), since the fuses are checked
+  hardest-first and that ordering is otherwise meaningless. A snapshot that
+  contradicts its own limits is malformed and is skipped in favour of the last
+  valid one, so a forged or corrupt grant cannot buy work. Limits materialised
+  for an older snapshot are chosen consistently with what it already declares,
+  so an upgrade never turns a running goal into a malformed one.
 - Pausing cancels pending goal continuations and stops further goal-owned model
   execution. It preserves the objective, completed work, and a visible reason.
   Resuming requires an explicit user action; exhaustion never means completion.
@@ -129,6 +147,17 @@ without repeatedly asking it to reconsider the goal.
 - Pause, blocking, yielding, compaction, and reload preserve the current step's
   memory. Recovery restores that record with the human-defined criteria, without
   replaying a history of memory updates into model context.
+- Evidence artifacts must resolve to a real path inside the project workspace.
+  Links are followed, not banned. Validation opens the file once, pins the
+  device and inode it opened, containment-checks the resolved name, requires
+  that name to still be the same inode, and reads from the descriptor — so the
+  bytes fingerprinted always come from an inode reachable at a contained path at
+  check time. Node exposes no `openat` and `O_NOFOLLOW` covers only the last
+  path component, so this is narrowed, not eliminated: a hard link inside the
+  workspace shares its target's inode and is indistinguishable, and the checks
+  are separate syscalls. Both require write access inside the workspace, where
+  the same bytes could simply be copied in; the containment rule ties evidence
+  to project artifacts and is not a confidentiality boundary.
 - Completion must account for every success criterion with applicable evidence.
   Human-defined criteria do not imply approval at every transition; require a
   human completion decision only when the agreed criteria explicitly require it.
@@ -140,6 +169,52 @@ without repeatedly asking it to reconsider the goal.
   completed or replaced step cannot populate the current step's memory. Clearing
   working memory means removing active state and model context, not deleting
   workspace evidence or rewriting the host's historical session log.
+
+## 7. Working-memory backend binding (P0, Goal side)
+
+The working-memory authority is explicit and persisted. `MultiGoal.backend`
+carries one of five states — `unbound`, `binding-pending`, `bound-available`,
+`bound-unavailable`, `detached` — plus the binding identity, at most one pending
+durable operation, and a bounded list of retained operation receipts.
+
+- `unbound` is the default and is unchanged behaviour: no peer is consulted, no
+  new settings are required, and a checkpoint on the branch that describes
+  unrelated work has no effect on a Goal-only memory write.
+- Binding, detachment, reload and branch selection refill no execution budget.
+  Withholding execution while a switch is in progress is not exhaustion and
+  charges nothing.
+- A bound backend that stops answering becomes `bound-unavailable`: the binding,
+  its revision pointer and the allowances are preserved, Goal-owned execution is
+  paused with a visible reason, and Goal does not fall back to its previous
+  memory record.
+- Every mutation and transition carries `goalId`, `Stage.id`, `generation`,
+  `contractRevision`, and the session/branch selection. A receipt is verified
+  against the intent it answers, so a late response after a pause, a generation
+  change, or a branch move quarantines itself instead of publishing state.
+- A binding is scoped to one stage, so it ends with the stage it belonged to,
+  along with that stage's pending intent and retained receipts. The next stage
+  starts unbound and runnable, with the empty memory record a transition
+  mandates, and the recorded reason names the peer it was previously bound to.
+  No state reachable today is permanently unrecoverable.
+- A persisted snapshot must satisfy its own backend state: a binding exists
+  exactly when the backend is bound, a pending bind intent exists exactly when a
+  switch is in progress, and a retained record marked committed must carry a
+  complete receipt. A snapshot that contradicts itself is malformed and is
+  skipped in favour of the last valid one, so a corrupt record cannot be
+  laundered into authority.
+- Which operations are legal for which backend state is enforced before an
+  intent is persisted, not delegated to the peer: `bind` is the only operation
+  legal from unbound, a second bind over a live binding is refused, and every
+  other mutation requires a bound and available backend planned against its
+  selected revision. No receipt can install a binding that no bind created.
+- Recovery is a persisted intent plus idempotent replay, not a shared
+  transaction. The four partial-write boundaries — after the intent, after the
+  peer commit, after the receipt, before Goal's acknowledgement — all recover to
+  exactly one commit.
+
+The wire contract, payload shapes, error codes, retention rules, and recovery
+transitions are specified in [peer-protocol.md](peer-protocol.md). There is no
+peer transport yet: P0 proves the seam against an in-process fake.
 
 ## Acceptance evidence
 

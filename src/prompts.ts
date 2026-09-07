@@ -1,4 +1,5 @@
 import { budgetPressure } from "./allowance.js";
+import { backendAdmitsExecution } from "./backend.js";
 import { currentStage } from "./state.js";
 import type { GoalMemory, MultiGoal } from "./types.js";
 
@@ -128,6 +129,20 @@ export function formatHumanStatus(goal: MultiGoal | null): string {
   lines.push(
     `Allowance: no-progress ${goal.execution.noProgressRemaining}/${goal.execution.noProgressLimit}, total ${goal.execution.totalRemaining}/${goal.execution.totalLimit}`,
   );
+  // Which working-memory authority is in force. An unbound goal shows nothing
+  // here: that is today's view, and P0 does not add noise to a Goal-only
+  // session (invariant 1).
+  // A reason without a state change still matters: a binding that ended with
+  // the stage it belonged to must not disappear silently.
+  if (goal.backend.state !== "unbound" || goal.backend.reason !== null) {
+    lines.push(`Backend: ${goal.backend.state}`);
+    if (goal.backend.reason) {
+      lines.push(`  Reason: ${goal.backend.reason}`);
+    }
+    if (goal.backend.binding?.selectedRevision) {
+      lines.push(`  Selected revision: ${goal.backend.binding.selectedRevision}`);
+    }
+  }
   if (goal.pauseReason) {
     lines.push(`Paused: ${goal.pauseReason}`);
   }
@@ -155,6 +170,13 @@ export function formatFooterStatus(
     return "Goal waiting on /orchestrate";
   }
   const stageLabel = `${goal.index + 1}/${goal.stages.length}`;
+  if (goal.status === "active" && !backendAdmitsExecution(goal.backend)) {
+    // Execution is withheld, not exhausted: say which authority is missing
+    // rather than showing a budget the user cannot spend anyway.
+    return goal.backend.state === "binding-pending"
+      ? `Goal ${stageLabel} · backend switch pending`
+      : `Goal ${stageLabel} · backend unavailable`;
+  }
   if (goal.status === "active") {
     // Budget pressure is shown only once a fuse passes its warning threshold,
     // so an ordinary goal reads as "Pursuing 2/4" and a goal that is about to

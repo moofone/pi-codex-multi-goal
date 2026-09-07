@@ -10,6 +10,11 @@ import {
   type AllowanceExhaustion,
   type ChargeOutcome,
 } from "./allowance.js";
+import {
+  backendAdmitsExecution,
+  backendMemoryRefusal,
+  backendWithholdReason,
+} from "./backend.js";
 import { registerGoalCommand, registerGoalMultiCommand } from "./commands.js";
 import { createContinuation } from "./continuation.js";
 import { checkEvidenceCoverage, validateEvidenceRefs } from "./evidence.js";
@@ -206,6 +211,14 @@ export function registerMultiGoal(pi: ExtensionAPI): void {
       return false;
     }
     const goal = persistence.getGoal();
+    // The backend gate runs before the allowance gate and spends nothing: while
+    // a working-memory backend switch is in progress, or while a bound backend
+    // is unavailable, Goal-owned execution is withheld with a visible reason
+    // (GOAL_WITH_DAG_SUPPORT §3). Withholding is not exhaustion, so no budget
+    // is charged, refunded, or refilled by it (invariant 6).
+    if (goal && !backendAdmitsExecution(goal.backend)) {
+      return false;
+    }
     if (goal?.status === "active" && !yielding(ctx)) {
       // Admission gate: once the allowance reaches 0, no goal continuation is
       // requested (the Phase 0 probe recorded that before_provider_request
@@ -356,6 +369,15 @@ export function registerMultiGoal(pi: ExtensionAPI): void {
     if (goal.status !== "active") {
       return { ok: false, message: `Goal is ${goal.status}.`, goal };
     }
+    // A step transition is a durable operation against whichever backend owns
+    // the working memory. While the switch is in progress or the bound backend
+    // is unavailable, the transition is withheld rather than completed against
+    // an authority that cannot record it (§3; invariant 8 forbids weakening
+    // completion requirements to get past an unavailable backend).
+    const withheld = backendWithholdReason(goal.backend);
+    if (withheld) {
+      return { ok: false, message: withheld, goal };
+    }
     const unbound = rejectUnboundTerminal(goal, input, "Completion");
     if (unbound) {
       return unbound;
@@ -484,6 +506,14 @@ export function registerMultiGoal(pi: ExtensionAPI): void {
     }
     if (persistenceBroken) {
       return { ok: false, message: PERSIST_FAILURE_NOTICE, goal };
+    }
+    // Goal-only whole-record replacement is preserved exactly while unbound
+    // (§5 "Memory tool behavior"). In any bound or switching state Goal is not
+    // the authority: accepting the write would expose a second writable
+    // authority, or resurrect the stale blob behind an unavailable backend.
+    const backendRefusal = backendMemoryRefusal(goal.backend);
+    if (backendRefusal) {
+      return { ok: false, message: backendRefusal, goal };
     }
     if (input.goalId !== goal.goalId) {
       return {

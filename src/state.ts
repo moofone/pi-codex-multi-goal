@@ -1,5 +1,12 @@
 import { randomUUID } from "node:crypto";
 
+import {
+  emptyBackend,
+  endStageBinding,
+  isBackendConsistentWithGoal,
+  isGoalBackend,
+  normalizeBackend,
+} from "./backend.js";
 import { computeContractRevision } from "./contract.js";
 import { parseStageTitles, validateSteps, validateTitles } from "./parse.js";
 import {
@@ -49,7 +56,65 @@ export interface ExecutionLimits {
   lifetimeCeiling?: number;
 }
 
-/** A bounded grant: finite limits only, no unlimited mode. */
+/**
+ * THE ordering rule, stated once — as two functions, because filling in an
+ * ABSENT limit and repairing a PRESENT one are different jobs and must stay
+ * different.
+ *
+ * The four fuses are checked hardest-first (lifetime, total, turn, no-progress)
+ * and that order only means something if the limits are ordered too: a turn
+ * bound above the working total can never fire, and a working total above the
+ * lifetime ceiling is unreachable.
+ *
+ * `orderedLimits` supplies the DEFAULT an absent field takes, consistent with
+ * the working total the snapshot already declares. It never touches a value
+ * that is present, because the reader must not silently repair a forged grant —
+ * a snapshot that contradicts its own limits is malformed, and clamping it on
+ * load would launder it into a valid one.
+ *
+ * `clampedLimits` is for the paths that MINT a grant — configuring a goal and
+ * creating one — where a value out of order is a misconfiguration to correct
+ * before it becomes a snapshot the validator would refuse.
+ *
+ * `evidenceGrant` is deliberately unclamped in both: creditVerifiedEvidence
+ * caps the renewal at totalLimit, so an oversized grant is a full refill rather
+ * than an unbounded one.
+ */
+export interface FillableLimits {
+  totalLimit: number;
+  turnLimit?: number;
+  evidenceGrant?: number;
+  lifetimeCeiling?: number;
+}
+
+export interface FilledLimits {
+  turnLimit: number;
+  evidenceGrant: number;
+  lifetimeCeiling: number;
+}
+
+export function orderedLimits(limits: FillableLimits): FilledLimits {
+  return {
+    turnLimit: limits.turnLimit ?? Math.min(DEFAULT_TURN_LIMIT, limits.totalLimit),
+    evidenceGrant: limits.evidenceGrant ?? DEFAULT_EVIDENCE_GRANT,
+    lifetimeCeiling: limits.lifetimeCeiling ?? Math.max(DEFAULT_LIFETIME_CEILING, limits.totalLimit),
+  };
+}
+
+export function clampedLimits(limits: FillableLimits): FilledLimits {
+  const filled = orderedLimits(limits);
+  return {
+    turnLimit: Math.min(filled.turnLimit, limits.totalLimit),
+    evidenceGrant: filled.evidenceGrant,
+    lifetimeCeiling: Math.max(filled.lifetimeCeiling, limits.totalLimit),
+  };
+}
+
+/**
+ * A bounded grant: finite limits only, no unlimited mode. The fuses the caller
+ * does not specify are filled in by orderedLimits, so a goal is never minted
+ * with limits its own validator refuses on the next load.
+ */
 export function freshExecution(
   limits: ExecutionLimits = {
     noProgressLimit: DEFAULT_NO_PROGRESS_LIMIT,
@@ -63,13 +128,32 @@ export function freshExecution(
     turnRequests: 0,
     noProgressLimit: limits.noProgressLimit,
     totalLimit: limits.totalLimit,
-    turnLimit: limits.turnLimit ?? DEFAULT_TURN_LIMIT,
-    evidenceGrant: limits.evidenceGrant ?? DEFAULT_EVIDENCE_GRANT,
+    ...clampedLimits(limits),
     lifetimeRequests: 0,
-    lifetimeCeiling: limits.lifetimeCeiling ?? DEFAULT_LIFETIME_CEILING,
     tokenUsage: null,
     creditedEvidence: [],
   };
+}
+
+/**
+ * The limits a grant is actually held to, filling in the fuses the D4 budget
+ * split added when an older snapshot omits them.
+ *
+ * The defaults are chosen to be CONSISTENT with what the snapshot already
+ * declares, not flat constants. A pre-D4 goal configured with a working total
+ * of 5000 would, under a flat ceiling of 1000, migrate into a grant whose
+ * limits contradict each other and be skipped as malformed on the next load —
+ * the upgrade would eat the goal. So a materialised ceiling is at least the
+ * working total, and a materialised turn bound is at most the working total.
+ *
+ * This is the single source of truth for both normalizeExecution and
+ * isGoalExecution, so a snapshot is never validated against limits different
+ * from the ones it will be loaded with.
+ */
+function effectiveLimits(execution: GoalExecution): FilledLimits {
+  // Defaults only. A present-but-out-of-order limit must reach the validator
+  // unrepaired, or a forged grant would be laundered into a valid one on load.
+  return orderedLimits(execution);
 }
 
 /**
@@ -82,9 +166,7 @@ function normalizeExecution(execution: GoalExecution): GoalExecution {
   return {
     ...execution,
     turnRequests: execution.turnRequests ?? 0,
-    turnLimit: execution.turnLimit ?? DEFAULT_TURN_LIMIT,
-    evidenceGrant: execution.evidenceGrant ?? DEFAULT_EVIDENCE_GRANT,
-    lifetimeCeiling: execution.lifetimeCeiling ?? DEFAULT_LIFETIME_CEILING,
+    ...effectiveLimits(execution),
     creditedEvidence: [...(execution.creditedEvidence ?? [])],
   };
 }
@@ -122,6 +204,9 @@ export function cloneGoal(goal: MultiGoal): MultiGoal {
       next: goal.memory.next,
     },
     execution: normalizeExecution(goal.execution),
+    // A snapshot written before P0 has no backend record; a goal that never met
+    // a peer is `unbound`, which is today's behaviour (invariant 1).
+    backend: normalizeBackend(goal.backend),
     pauseReason: goal.pauseReason,
     stages: goal.stages.map((stage) => ({
       ...stage,
@@ -153,6 +238,7 @@ export function createGoal(titles: string[], now = unixSeconds()): MultiGoal {
     isolationCutoff: null,
     memory: emptyMemory(),
     execution: freshExecution(),
+    backend: emptyBackend(),
     pauseReason: null,
     stages: titles.map((title, index) => ({
       id: randomUUID(),
@@ -177,6 +263,7 @@ function createGoalFromSteps(
     isolationCutoff: null,
     memory: emptyMemory(),
     execution: freshExecution(limits),
+    backend: emptyBackend(),
     pauseReason: null,
     stages: steps.map((step, index) => ({
       id: randomUUID(),
@@ -275,7 +362,10 @@ export function acceptCompletion(
   const next = completed.goal;
   if (next.status === "complete") {
     // Last step: keep the completion receipt in the stages, drop active memory.
+    // The stage scope is over here too, so no completed goal is left holding a
+    // live binding to a scope nothing will ever write to again.
     next.memory = emptyMemory();
+    next.backend = endStageBinding(next.backend);
     next.pauseReason = null;
     return { ok: true, message: "Goal complete.", goal: next };
   }
@@ -301,6 +391,14 @@ export function acceptCompletion(
     creditedEvidence: [],
   };
   next.isolationCutoff = isolationCutoffMs;
+  // A binding is scoped to one stage, so it ends with the stage it belonged
+  // to, along with its pending intent and retained receipts — none of them can
+  // address the new Stage.id and contractRevision (§4 "operation retention";
+  // PI_DAG_COMPACT §1 "a stage transition invalidates old reviews and active
+  // selections before admitting the next stage"). The next stage starts
+  // unbound and runnable; task 5.3 replaces this with the durable transition
+  // operation that carries the binding across.
+  next.backend = endStageBinding(next.backend);
   next.pauseReason = null;
   return {
     ok: true,
@@ -461,7 +559,7 @@ function isGoalExecution(value: unknown): value is GoalExecution {
   ) {
     return false;
   }
-  return (
+  const wellFormed =
     Number.isInteger(execution.generation) &&
     execution.generation >= 0 &&
     Number.isInteger(execution.noProgressRemaining) &&
@@ -476,8 +574,39 @@ function isGoalExecution(value: unknown): value is GoalExecution {
     execution.lifetimeRequests >= 0 &&
     (execution.tokenUsage === null ||
       (typeof execution.tokenUsage === "number" && Number.isFinite(execution.tokenUsage))) &&
-    creditedValid
-  );
+    creditedValid;
+  if (!wellFormed) {
+    return false;
+  }
+
+  // Shape is not enough: a counter that exceeds the limit bounding it is a
+  // grant asserting more work than the bounded execution contract allows, and
+  // a persisted or forged snapshot could simply declare one. Each counter is
+  // checked against the limit it is spent from — against the EFFECTIVE limit,
+  // so an older snapshot is held to the same limits it will be loaded with.
+  //
+  // The threat model is "a snapshot must respect the limits it declares", not
+  // "limits must match current settings": a snapshot carries the limits that
+  // were in force when its grant was issued, and changing settings must not
+  // retroactively rewrite a running goal's budget.
+  const limits = effectiveLimits(execution);
+  if (
+    execution.noProgressRemaining > execution.noProgressLimit ||
+    execution.totalRemaining > execution.totalLimit ||
+    (execution.turnRequests ?? 0) > limits.turnLimit ||
+    execution.lifetimeRequests > limits.lifetimeCeiling
+  ) {
+    return false;
+  }
+  // The fuses are ordered hardest-first in allowanceExhaustion (lifetime,
+  // total, turn, no-progress) and that ordering only means anything if the
+  // limits are ordered too. chargeRequest spends the working total on every
+  // turn request, so a turn bound above the working total can never fire and
+  // the runaway-loop backstop would be dead; nothing renews lifetimeRequests,
+  // so a working total above the ceiling is unreachable. `evidenceGrant` is
+  // deliberately unbounded here: creditVerifiedEvidence clamps the renewal at
+  // totalLimit, so an oversized grant is a full refill, never an unbounded one.
+  return limits.turnLimit <= execution.totalLimit && execution.totalLimit <= limits.lifetimeCeiling;
 }
 
 export function isMultiGoal(value: unknown): value is MultiGoal {
@@ -501,6 +630,10 @@ export function isMultiGoal(value: unknown): value is MultiGoal {
     !goal.stages.every(isStage) ||
     !isGoalMemory(goal.memory) ||
     !isGoalExecution(goal.execution) ||
+    // Absent is fine (an older snapshot is unbound); present but unreadable is
+    // not, because invariant 8 forbids downgrading an authoritative backend to
+    // "there was never a binding". reconstructGoal keeps the last valid one.
+    !(goal.backend === undefined || isGoalBackend(goal.backend)) ||
     !(goal.pauseReason === null || typeof goal.pauseReason === "string")
   ) {
     return false;
@@ -552,6 +685,26 @@ export function isMultiGoal(value: unknown): value is MultiGoal {
         (stage.status !== "pending" && stage.status !== "active") || stage.criteria.length > 0,
     );
     if (!runnableStagesHaveCriteria) {
+      return false;
+    }
+  }
+
+  // Containment: the backend is validated in isolation above, which cannot see
+  // the goal it belongs to. A binding for another goal — or an intent or
+  // retained record naming another stage's work — is a valid backend on its own
+  // and would reload as authoritative here. The contract revision is recomputed
+  // rather than read from the snapshot, because the stored value is derived
+  // state that a forged or stale snapshot may disagree with.
+  if (goal.backend !== undefined) {
+    const stage = goal.stages[goal.index]!;
+    if (
+      !isBackendConsistentWithGoal(goal.backend, {
+        goalId: goal.goalId,
+        stageId: stage.id,
+        contractRevision: computeContractRevision(stage),
+        generation: goal.execution.generation,
+      })
+    ) {
       return false;
     }
   }
@@ -649,6 +802,7 @@ export function migrateV1Goal(v1: V1GoalShape): MultiGoal {
     isolationCutoff: null,
     memory: emptyMemory(),
     execution: freshExecution(),
+    backend: emptyBackend(),
     pauseReason: complete ? null : V1_MIGRATION_PAUSE_REASON,
     stages: v1.stages.map((stage, position) => ({
       id: `${v1.goalId}:stage:${position}`,

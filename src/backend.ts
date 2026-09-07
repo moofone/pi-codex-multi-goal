@@ -1,0 +1,1329 @@
+import { validateMemoryContent } from "./memory.js";
+import {
+  PEER_PROTOCOL_VERSION,
+  callPeer,
+  canonicalDigest,
+  isPeerScope,
+  isWellFormedReceipt,
+  scopesEqual,
+  selectionsEqual,
+  verifyReceipt,
+  type PeerClient,
+  type PeerOperationKind,
+  type PeerReceipt,
+  type PeerRequest,
+  type PeerResponse,
+  type PeerScope,
+  type PeerSelection,
+  type ReceiptRejection,
+} from "./peer.js";
+import { cloneGoal, currentStage } from "./state.js";
+import {
+  MAX_RETAINED_OPERATIONS,
+  type GoalBackend,
+  type GoalBackendState,
+  type GoalMemory,
+  type MultiGoal,
+  type PendingOperation,
+  type RetainedOperation,
+} from "./types.js";
+
+/**
+ * The Goal side of the binding and recovery protocol
+ * (GOAL_WITH_DAG_SUPPORT §3 and §4; contract in docs/peer-protocol.md).
+ *
+ * This module is the Goal ADAPTER over the generic seam in src/peer.ts: it maps
+ * `goalId`, `Stage.id`, `generation` and `contractRevision` onto the protocol's
+ * consumer/scope/epoch fields (PI_DAG_COMPACT D7), and it owns the small
+ * persisted operation state machine that makes a mutation recoverable across
+ * the four partial-write boundaries. It is NOT a transaction coordinator: there
+ * is no shared transaction between Goal session state and a peer's storage, and
+ * this file never pretends otherwise.
+ *
+ * Two rules run through everything here:
+ *
+ *  1. `unbound` is untouched. No peer is consulted, no state is rewritten, and
+ *     a checkpoint that describes unrelated work has no effect (§10 P0 row).
+ *  2. Nothing in this file grants execution budget. Binding, detachment,
+ *     reload and branch selection all leave `goal.execution` byte-identical
+ *     (§3; invariant 6).
+ */
+
+export const GOAL_CONSUMER = "pi-codex-multi-goal";
+
+/** The projection profile Goal needs a peer to be able to render. */
+export const GOAL_PROJECTION_PROFILE = "current-scope@1";
+
+/**
+ * The identity of the export read a detach performs before it releases
+ * authority. It has to be derived (so a retry re-reads under the same id) and
+ * injective (so it cannot be made to name a caller's own operation): the same
+ * reasoning as scopeKey and goalScopeId. JSON escaping keeps the two parts
+ * from reaching across each other.
+ */
+export function exportReadId(operationId: string): string {
+  return JSON.stringify(["export", operationId]);
+}
+
+export function emptyBackend(): GoalBackend {
+  return { state: "unbound", binding: null, pending: null, operations: [], reason: null };
+}
+
+const BACKEND_STATES: GoalBackendState[] = [
+  "unbound",
+  "binding-pending",
+  "bound-available",
+  "bound-unavailable",
+  "detached",
+];
+
+const OPERATION_KINDS: PeerOperationKind[] = ["bind", "read", "write", "transition", "detach"];
+
+/**
+ * Materialise the backend record on a snapshot written before P0 existed. A
+ * missing field means "this goal never met a peer", which is exactly `unbound`
+ * — the one default that cannot change behaviour.
+ */
+export function normalizeBackend(backend: GoalBackend | undefined | null): GoalBackend {
+  if (!backend) {
+    return emptyBackend();
+  }
+  return {
+    state: backend.state,
+    binding: backend.binding ? { ...backend.binding } : null,
+    pending: backend.pending ? { ...backend.pending, scope: cloneScope(backend.pending.scope) } : null,
+    operations: (backend.operations ?? []).map((record) => ({ ...record })),
+    reason: backend.reason ?? null,
+  };
+}
+
+function cloneScope(scope: PeerScope): PeerScope {
+  return { ...scope, selection: { ...scope.selection } };
+}
+
+// Scope validation is peer.ts's, not a second copy: it owns PeerScope, and a
+// second copy of a rule is the defect regardless of which one is currently
+// right (round 10).
+const isScope = isPeerScope;
+
+const DIGEST_PATTERN = /^[0-9a-f]{64}$/;
+
+function isBinding(value: unknown): boolean {
+  if (!value || typeof value !== "object") {
+    return false;
+  }
+  const binding = value as GoalBackend["binding"] & object;
+  return (
+    typeof binding.peerId === "string" &&
+    typeof binding.taskId === "string" &&
+    typeof binding.goalId === "string" &&
+    typeof binding.stageId === "string" &&
+    Number.isInteger(binding.generation) &&
+    typeof binding.contractRevision === "string" &&
+    typeof binding.sessionId === "string" &&
+    typeof binding.branchAnchorId === "string" &&
+    (binding.selectedRevision === null || typeof binding.selectedRevision === "string")
+  );
+}
+
+function isPendingOperation(value: unknown): value is PendingOperation {
+  if (!value || typeof value !== "object") {
+    return false;
+  }
+  const pending = value as PendingOperation;
+  return (
+    typeof pending.operationId === "string" &&
+    pending.operationId.length > 0 &&
+    OPERATION_KINDS.includes(pending.kind) &&
+    pending.kind !== "read" &&
+    BACKEND_STATES.includes(pending.expectedState) &&
+    BACKEND_STATES.includes(pending.previousState) &&
+    isScope(pending.scope) &&
+    (pending.expectedRevision === null || typeof pending.expectedRevision === "string") &&
+    DIGEST_PATTERN.test(pending.payloadDigest) &&
+    typeof pending.createdAt === "number" &&
+    // The field acceptReceipt promotes on must be one this kind can reach, or a
+    // persisted intent could take a branch its operation never earned.
+    pending.expectedState === REACHABLE_STATE[pending.kind]
+  );
+}
+
+/**
+ * A receipt is only proof of a commit if it is complete AND it belongs to the
+ * operation it is retained under.
+ *
+ * A retained `committed` record is what answers an identical replay WITHOUT
+ * contacting the peer, so a record carrying someone else's receipt would hand
+ * that foreign receipt back as success — the third route to answering a replay
+ * out of nothing, after a missing receipt and a too-narrow replay identity.
+ *
+ * The shape check is not re-implemented here: it CALLS isWellFormedReceipt, the
+ * same predicate verifyReceipt applies when it decides whether a receipt may be
+ * persisted at all. A second copy of a rule is the defect and the field it
+ * forgets is only the symptom — a weaker copy here is exactly the drift that
+ * predicate was introduced to prevent.
+ */
+function isCompleteReceipt(value: unknown, record: RetainedOperation): boolean {
+  if (!isWellFormedReceipt(value)) {
+    return false;
+  }
+  const receipt = value as PeerReceipt;
+  return (
+    receipt.operationId === record.operationId &&
+    receipt.payloadDigest === record.payloadDigest &&
+    isScope(receipt.scope) &&
+    scopesEqual(receipt.scope, record.scope)
+  );
+}
+
+function isRetainedOperation(value: unknown): value is RetainedOperation {
+  if (!value || typeof value !== "object") {
+    return false;
+  }
+  const record = value as RetainedOperation;
+  if (
+    typeof record.operationId !== "string" ||
+    record.operationId.length === 0 ||
+    !OPERATION_KINDS.includes(record.kind) ||
+    !isScope(record.scope) ||
+    !(record.expectedRevision === null || typeof record.expectedRevision === "string") ||
+    !DIGEST_PATTERN.test(record.payloadDigest)
+  ) {
+    return false;
+  }
+  if (record.outcome === "committed") {
+    return isCompleteReceipt(record.receipt, record);
+  }
+  if (record.outcome === "quarantined") {
+    // No receipt, and a reason — a quarantined operation that cannot say why is
+    // one the user can never be told about.
+    return (
+      (record.receipt === null || record.receipt === undefined) && typeof record.reason === "string"
+    );
+  }
+  return false;
+}
+
+/**
+ * Snapshot validation, state by state.
+ *
+ * A malformed backend record makes the whole snapshot malformed rather than
+ * being repaired: invariant 8 says previously authoritative but unreadable
+ * backend state cannot silently downgrade to stale Goal memory, and
+ * reconstructGoal keeps the last VALID branch snapshot when it skips one.
+ *
+ * Checking each field's SHAPE when present is not enough. The state machine's
+ * invariants are enforced by checkOperationLegality on the way in, but a
+ * snapshot asserts a state directly — so a backend that does not satisfy its
+ * own state would enter those invariants from disk without ever passing the
+ * guard. `bound-available` with no binding would admit execution with no
+ * authoritative memory source behind it; `binding-pending` with no intent would
+ * withhold execution forever; a `committed` record with no receipt would let
+ * resolveReplay answer a replay with success out of nothing. So each state
+ * declares what it REQUIRES and what it FORBIDS, and anything else is
+ * malformed.
+ */
+export function isGoalBackend(value: unknown): value is GoalBackend {
+  if (!value || typeof value !== "object") {
+    return false;
+  }
+  const backend = value as GoalBackend;
+  if (!BACKEND_STATES.includes(backend.state)) {
+    return false;
+  }
+  if (!(backend.reason === null || backend.reason === undefined || typeof backend.reason === "string")) {
+    return false;
+  }
+
+  const binding = backend.binding ?? null;
+  if (binding !== null && !isBinding(binding)) {
+    return false;
+  }
+  const pending = backend.pending ?? null;
+  if (pending !== null && !isPendingOperation(pending)) {
+    return false;
+  }
+  const operations = backend.operations;
+  if (!Array.isArray(operations) || operations.length > MAX_RETAINED_OPERATIONS) {
+    return false;
+  }
+  if (!operations.every(isRetainedOperation)) {
+    return false;
+  }
+
+  // One operation ID names one operation. A duplicate — or an ID that is both
+  // pending and retained — would make resolveReplay's answer depend on list
+  // order, which is not an identity.
+  const ids = new Set(operations.map((record) => record.operationId));
+  if (ids.size !== operations.length) {
+    return false;
+  }
+  if (pending && ids.has(pending.operationId)) {
+    return false;
+  }
+
+  // A binding exists exactly when the backend claims a peer holds the working
+  // memory. Anything else is a contradiction: authority with nothing granting
+  // it, or a grant in a state that disclaims authority.
+  const claimsAuthority = backend.state === "bound-available" || backend.state === "bound-unavailable";
+  if (claimsAuthority !== (binding !== null)) {
+    return false;
+  }
+  if (claimsAuthority && !(typeof binding!.selectedRevision === "string" && binding!.selectedRevision.trim().length > 0)) {
+    // Bound means a revision was durably selected; a bound state without one
+    // has no working set to read or write through.
+    return false;
+  }
+
+  // Only a bind switches authority, and beginOperation moves the state with it,
+  // so a bind intent and `binding-pending` imply each other exactly.
+  const isBindIntent = pending?.kind === "bind";
+  if ((backend.state === "binding-pending") !== isBindIntent) {
+    return false;
+  }
+  // A state with no authority and no switch in progress has nothing to submit.
+  if ((backend.state === "unbound" || backend.state === "detached") && pending !== null) {
+    return false;
+  }
+  // Nor can it hold a committed operation for a replay to answer with: there is
+  // no path that reaches these states while retaining one, and allowing it
+  // would let a replay report success for a scope nothing is bound to.
+  if (backend.state === "unbound" && operations.some((record) => record.outcome === "committed")) {
+    return false;
+  }
+
+  return true;
+}
+
+/**
+ * Identity of the goal a backend record must belong to. Supplied by the caller
+ * rather than read off the snapshot, because a stored `contractRevision` may be
+ * stale or tampered — the value that counts is the one recomputed from the
+ * criteria.
+ */
+export interface GoalIdentity {
+  goalId: string;
+  stageId: string;
+  contractRevision: string;
+  generation: number;
+}
+
+/**
+ * Containment: a component must be consistent with its CONTAINER, not only with
+ * itself.
+ *
+ * Every other rule in this file is internal — a backend state consistent with
+ * its own fields, a receipt consistent with its own record. isGoalBackend is a
+ * standalone predicate, so by construction it cannot see the goal it belongs
+ * to, and a binding for a different goal entirely is a perfectly valid backend
+ * in isolation. It would reload as authoritative, and subsequent operations
+ * would use its selected revision while building a scope for the goal actually
+ * in hand — authority and identity pointing at different things.
+ *
+ * Which fields must match is the substance here:
+ *
+ *  - WHICH WORK a component concerns must agree with the container. A binding's
+ *    goal and stage, and the `scopeId` of any intent or retained record, name
+ *    the work; naming someone else's is corruption, not history.
+ *  - WHEN a component was made may lag. §3 is explicit that a resume may
+ *    replace execution authority while retaining the memory scope, so a binding
+ *    from an earlier generation is legitimate. A pending intent from an earlier
+ *    generation is precisely what acceptReceipt quarantines as `stale-epoch` —
+ *    it has to survive the reload to be quarantined, or the snapshot would be
+ *    skipped and the intent §4 says to retain would be lost instead.
+ *  - WHERE a retained record was planned may differ. A record keeps the branch
+ *    it was planned on; that IS the record of a branch move, and refusing it
+ *    would discard the replay protection it exists to provide.
+ *
+ * The binding is held to the contract revision as well, because it is the LIVE
+ * authority: the peer mirrors the contract, and a mirror of a superseded one is
+ * not something to keep executing against. Intents and retained records are
+ * plans and history, so theirs may lag.
+ */
+export function isBackendConsistentWithGoal(backend: GoalBackend, goal: GoalIdentity): boolean {
+  const scopeId = goalScopeId(goal.goalId, goal.stageId);
+  const binding = backend.binding;
+  if (binding) {
+    if (
+      binding.goalId !== goal.goalId ||
+      binding.stageId !== goal.stageId ||
+      binding.contractRevision !== goal.contractRevision ||
+      !Number.isInteger(binding.generation) ||
+      binding.generation > goal.generation
+    ) {
+      return false;
+    }
+  }
+  const namesThisWork = (scope: PeerScope): boolean =>
+    scope.consumer === GOAL_CONSUMER && scope.scopeId === scopeId && scope.epoch <= goal.generation;
+  if (backend.pending && !namesThisWork(backend.pending.scope)) {
+    return false;
+  }
+  return backend.operations.every((record) => namesThisWork(record.scope));
+}
+
+/**
+ * The stage's scope identity. `Stage.id` and not the displayed step number,
+ * because the displayed number changes meaning at every transition while the id
+ * does not (D7).
+ *
+ * Percent-encoded per component, because plain interpolation is not injective
+ * and both components come off a persisted snapshot: `goalScopeId("a",
+ * "b:stage:c")` and `goalScopeId("a:stage:b", "c")` would name one scope. This
+ * is not theoretical — migrateV1Goal mints stage IDs of the form
+ * `<goalId>:stage:<position>`, so the delimiter really does occur inside a
+ * component. encodeURIComponent escapes `:`, so an encoded component can never
+ * contain the separator and the identity cannot be forged from the other half.
+ */
+export function goalScopeId(goalId: string, stageId: string): string {
+  return `goal:${encodeURIComponent(goalId)}:stage:${encodeURIComponent(stageId)}`;
+}
+
+/** The identity every mutation and transition carries (§3). */
+export function goalScope(goal: MultiGoal, selection: PeerSelection): PeerScope {
+  return {
+    consumer: GOAL_CONSUMER,
+    scopeId: goalScopeId(goal.goalId, currentStage(goal).id),
+    contractRevision: goal.contractRevision,
+    epoch: goal.execution.generation,
+    selection: { ...selection },
+  };
+}
+
+/**
+ * True only when Goal itself is the working-memory authority. While a switch is
+ * in progress, or while a bound peer is unavailable, the answer is false: §3
+ * forbids exposing two writable authorities during the switch, and invariant 8
+ * forbids downgrading to the stale blob when the authority is gone.
+ */
+export function goalOwnsMemory(backend: GoalBackend): boolean {
+  return backend.state === "unbound" || backend.state === "detached";
+}
+
+/** False while the switch is in progress or the bound authority is missing. */
+export function backendAdmitsExecution(backend: GoalBackend): boolean {
+  return backend.state !== "binding-pending" && backend.state !== "bound-unavailable";
+}
+
+export function backendWithholdReason(backend: GoalBackend): string | null {
+  if (backendAdmitsExecution(backend)) {
+    return null;
+  }
+  const detail = backend.reason ? ` (${backend.reason})` : "";
+  if (backend.state === "binding-pending") {
+    return (
+      "Goal execution is withheld while the working-memory backend switch is in progress" +
+      `${detail}. The migration is persisted and will be recovered; it is not lost.`
+    );
+  }
+  return (
+    "Goal execution is paused: the bound working-memory backend is unavailable" +
+    `${detail}. The binding, its memory pointers and the allowances are preserved; ` +
+    "Goal will not fall back to its previous memory record."
+  );
+}
+
+/**
+ * Why a Goal-only memory replace cannot be accepted right now. Whole-record
+ * replacement is preserved when unbound (§5 "Memory tool behavior"); in every
+ * other state Goal is not the authority, and accepting the write would either
+ * expose a second writable authority during the switch or silently downgrade an
+ * unavailable backend to the stale blob (invariants 2 and 8).
+ */
+export function backendMemoryRefusal(backend: GoalBackend): string | null {
+  if (goalOwnsMemory(backend)) {
+    return null;
+  }
+  if (backend.state === "bound-available") {
+    return (
+      "Memory update rejected: the bound working-memory backend is the authority for this stage, " +
+      "so the record is written through the peer adapter rather than replaced here."
+    );
+  }
+  return `Memory update rejected. ${backendWithholdReason(backend) ?? ""}`.trim();
+}
+
+// --- replay protection (§4 step 4) ---------------------------------------
+
+export type ReplayVerdict =
+  | { verdict: "novel" }
+  | { verdict: "pending"; pending: PendingOperation }
+  | { verdict: "identical"; record: RetainedOperation }
+  | { verdict: "quarantined"; record: RetainedOperation }
+  | { verdict: "conflict"; message: string };
+
+/**
+ * What distinguishes one durable operation from another. An operation id alone
+ * is a name, not an identity: the same id with the same payload bytes can still
+ * be a completely different request if its kind, scope, branch selection or
+ * expected revision differ.
+ */
+export interface ReplayIdentity {
+  operationId: string;
+  kind: PeerOperationKind;
+  scope: PeerScope;
+  expectedRevision: string | null;
+  payloadDigest: string;
+}
+
+function sameIntent(
+  identity: ReplayIdentity,
+  other: { kind: PeerOperationKind; scope: PeerScope; expectedRevision: string | null; payloadDigest: string },
+): string | null {
+  if (other.kind !== identity.kind) {
+    return `it was a ${other.kind} operation, not a ${identity.kind}`;
+  }
+  if (!scopesEqual(other.scope, identity.scope)) {
+    return "it was planned for a different scope, contract revision, execution epoch or branch selection";
+  }
+  if (other.expectedRevision !== identity.expectedRevision) {
+    return `it was planned against revision ${other.expectedRevision ?? "none"}, not ${identity.expectedRevision ?? "none"}`;
+  }
+  if (other.payloadDigest !== identity.payloadDigest) {
+    return "it carried a different payload";
+  }
+  return null;
+}
+
+/**
+ * Classify an operation id against everything this stage remembers. Retention
+ * is bounded but must cover the lifetime in which an operation can be retried,
+ * which is why a quarantined id keeps its record: a late receipt for an
+ * operation that was abandoned still has to be refusable.
+ *
+ * Matching is over the WHOLE intent, not the id and payload alone. §4 step 4
+ * refuses a conflicting payload, and a different kind or scope is a conflicting
+ * REQUEST even when the payload bytes match. This is load-bearing rather than
+ * pedantic: replay resolution deliberately runs BEFORE checkOperationLegality
+ * so that recovery still works after the state has legitimately moved on, which
+ * means a mis-matched replay would bypass the legality matrix entirely and be
+ * acknowledged with an unrelated operation's receipt.
+ */
+export function resolveReplay(backend: GoalBackend, identity: ReplayIdentity): ReplayVerdict {
+  const pending = backend.pending;
+  if (pending && pending.operationId === identity.operationId) {
+    const difference = sameIntent(identity, pending);
+    if (difference) {
+      return {
+        verdict: "conflict",
+        message: `operation ${identity.operationId} is already pending, and ${difference}`,
+      };
+    }
+    return { verdict: "pending", pending };
+  }
+  const record = backend.operations.find((entry) => entry.operationId === identity.operationId);
+  if (!record) {
+    return { verdict: "novel" };
+  }
+  const difference = sameIntent(identity, record);
+  if (difference) {
+    return {
+      verdict: "conflict",
+      message: `operation ${identity.operationId} already exists, and ${difference}`,
+    };
+  }
+  return record.outcome === "committed" ? { verdict: "identical", record } : { verdict: "quarantined", record };
+}
+
+function retain(backend: GoalBackend, record: RetainedOperation): RetainedOperation[] {
+  const kept = backend.operations.filter((entry) => entry.operationId !== record.operationId);
+  kept.push(record);
+  return kept.slice(-MAX_RETAINED_OPERATIONS);
+}
+
+// --- operation legality (docs/peer-protocol.md §6.1) ----------------------
+
+/** The one backend state each kind of operation can actually reach. */
+const REACHABLE_STATE: Record<Exclude<PeerOperationKind, "read">, GoalBackendState> = {
+  bind: "bound-available",
+  write: "bound-available",
+  transition: "bound-available",
+  detach: "detached",
+};
+
+/** Where a `bind` may start: nothing is bound, or a previous binding ended. */
+const BINDABLE_FROM: GoalBackendState[] = ["unbound", "detached", "binding-pending"];
+
+export type LegalityCheck = { ok: true } | { ok: false; message: string };
+
+/**
+ * Is this operation legal for the backend as it stands? Enforced BEFORE the
+ * intent is persisted and never delegated to the peer, because a peer that
+ * accepts an illegal operation must not be able to promote Goal into
+ * `bound-available` without a bind. The protocol's own guarantee cannot rest on
+ * the peer being well behaved.
+ *
+ * Checked on the novel path only: a replay is resolved from the pending intent
+ * or the retained receipt first, so idempotent recovery still works after the
+ * state has legitimately moved on (a `bind` replayed after its own
+ * acknowledgement would otherwise be rejected as "already bound").
+ */
+export function checkOperationLegality(
+  backend: GoalBackend,
+  params: { kind: PeerOperationKind; expectedState: GoalBackendState; expectedRevision: string | null },
+): LegalityCheck {
+  if (params.kind === "read") {
+    return { ok: false, message: "a read mutates nothing and persists no intent" };
+  }
+  const reachable = REACHABLE_STATE[params.kind];
+  if (params.expectedState !== reachable) {
+    return {
+      ok: false,
+      message: `a ${params.kind} operation reaches ${reachable}, not ${params.expectedState}`,
+    };
+  }
+
+  if (params.kind === "bind") {
+    if (!BINDABLE_FROM.includes(backend.state)) {
+      return {
+        ok: false,
+        message:
+          `this goal is already ${backend.state}; a second bind would replace the working-memory ` +
+          "authority without detaching from it. Detach first.",
+      };
+    }
+    if (params.expectedRevision !== null) {
+      return {
+        ok: false,
+        message: "a bind is what selects the first revision, so it cannot claim an expected revision",
+      };
+    }
+    return { ok: true };
+  }
+
+  // write, transition and detach all act on a live binding.
+  if (backend.state !== "bound-available") {
+    return {
+      ok: false,
+      message:
+        `a ${params.kind} operation needs a bound and available backend; this goal is ${backend.state}. ` +
+        (backend.state === "unbound" || backend.state === "detached"
+          ? "Bind first."
+          : "The bound backend is not answering; nothing new can be planned against it."),
+    };
+  }
+  const selected = backend.binding?.selectedRevision ?? null;
+  if (!selected) {
+    return {
+      ok: false,
+      message: `a ${params.kind} operation needs a binding with a selected revision; none is recorded`,
+    };
+  }
+  if (params.expectedRevision !== selected) {
+    return {
+      ok: false,
+      message:
+        `a ${params.kind} operation must be planned against the selected revision ${selected}; ` +
+        `the supplied expected revision is ${params.expectedRevision ?? "null"}`,
+    };
+  }
+  return { ok: true };
+}
+
+// --- step 1: persist the intent -------------------------------------------
+
+export interface OperationParams {
+  operationId: string;
+  kind: PeerOperationKind;
+  /** The backend state this operation intends to reach. */
+  expectedState: GoalBackendState;
+  payload: unknown;
+  selection: PeerSelection;
+  expectedRevision: string | null;
+  /** Recorded on the binding when a bind is accepted. */
+  peerId?: string;
+  taskId?: string;
+  now?: number;
+}
+
+export type BeginResult =
+  | { ok: true; goal: MultiGoal; request: PeerRequest; replayed: false }
+  | { ok: true; goal: MultiGoal; request: PeerRequest; replayed: true; receipt: PeerReceipt | null }
+  | { ok: false; goal: MultiGoal; code: ReceiptRejection; message: string };
+
+function requestOf(pending: PendingOperation): PeerRequest {
+  return {
+    protocolVersion: PEER_PROTOCOL_VERSION,
+    operationId: pending.operationId,
+    kind: pending.kind,
+    scope: cloneScope(pending.scope),
+    expectedRevision: pending.expectedRevision,
+    payload: pending.payload,
+  };
+}
+
+/**
+ * Step 1 of the recoverable ordering: check ownership and scope, then persist a
+ * pending intent carrying the operation ID, the expected state, and enough
+ * payload to retry.
+ *
+ * Only ONE binding, memory or transition operation may be pending for a stage.
+ * A second, different operation is refused here, before anything reaches the
+ * peer, which is what makes "a pending operation never causes a second credit,
+ * graph mutation, completion, or kickoff" true by construction rather than by
+ * the peer's good behaviour.
+ *
+ * Reads persist no intent: they mutate nothing, so there is nothing to recover.
+ *
+ * Order matters and is load-bearing: replay is resolved first (so idempotent
+ * recovery still works after the state has legitimately moved on), then
+ * `checkOperationLegality` enforces the state machine, then the one-pending
+ * check — and only after all three is anything written to the snapshot. The
+ * legality guard is inside this function, a few lines below, not at the call
+ * sites: no caller can persist an intent without passing it.
+ */
+export function beginOperation(goal: MultiGoal, params: OperationParams): BeginResult {
+  if (params.kind === "read") {
+    return {
+      ok: false,
+      goal,
+      code: "refused",
+      message: "a read mutates nothing and needs no persisted intent; call the peer directly",
+    };
+  }
+  if (typeof params.operationId !== "string" || params.operationId.length === 0) {
+    // The validator requires a non-empty operation id, so the writer must too:
+    // an intent it refuses would make the whole snapshot unloadable.
+    return { ok: false, goal, code: "refused", message: "an operation needs a non-empty operation id" };
+  }
+  const backend = goal.backend;
+  const digest = canonicalDigest(params.payload);
+  const identity: ReplayIdentity = {
+    operationId: params.operationId,
+    kind: params.kind,
+    scope: goalScope(goal, params.selection),
+    expectedRevision: params.expectedRevision,
+    payloadDigest: digest,
+  };
+  const replay = resolveReplay(backend, identity);
+  if (replay.verdict === "conflict") {
+    return { ok: false, goal, code: "replay-conflict", message: replay.message };
+  }
+  if (replay.verdict === "identical") {
+    // Already acknowledged: hand back the retained result without touching the
+    // peer and without re-running anything — but only if the retained receipt
+    // actually belongs to the record. A snapshot validated on load cannot carry
+    // an inconsistent one; this is the in-memory belt to that braces, so no
+    // path returns a foreign receipt as this operation's success.
+    if (!isCompleteReceipt(replay.record.receipt, replay.record)) {
+      return {
+        ok: false,
+        goal,
+        code: "refused",
+        message:
+          `operation ${params.operationId} is retained as committed but its receipt does not belong to it; ` +
+          "re-plan it under a new operation ID",
+      };
+    }
+    return { ok: true, goal, request: requestOf(pendingFrom(params, goal, digest)), replayed: true, receipt: replay.record.receipt };
+  }
+  if (replay.verdict === "quarantined") {
+    return {
+      ok: false,
+      goal,
+      code: "refused",
+      message:
+        `operation ${params.operationId} was quarantined (${replay.record.reason ?? "no reason recorded"}); ` +
+        "re-plan it under a new operation ID",
+    };
+  }
+  if (replay.verdict === "pending") {
+    // The same intent, replayed after a crash: reuse the persisted request so
+    // the peer sees byte-identical input and can answer idempotently.
+    return { ok: true, goal, request: requestOf(replay.pending), replayed: false };
+  }
+  // Novel work: the state machine is enforced here, before anything is
+  // persisted and before the peer is asked (docs/peer-protocol.md §6.1).
+  const legality = checkOperationLegality(backend, params);
+  if (!legality.ok) {
+    return { ok: false, goal, code: "refused", message: legality.message };
+  }
+  if (backend.pending) {
+    return {
+      ok: false,
+      goal,
+      code: "refused",
+      message:
+        `operation ${backend.pending.operationId} (${backend.pending.kind}) is already pending for this stage; ` +
+        "at most one binding, memory or transition operation may be in flight",
+    };
+  }
+
+  const pending = pendingFrom(params, goal, digest);
+  const next = cloneGoal(goal);
+  next.backend = {
+    ...next.backend,
+    // The intended migration is persisted BEFORE the peer is asked, and the
+    // state moves with it so execution is withheld during the switch (§3).
+    // Only a bind switches authority; an ordinary write against a live binding
+    // does not withhold execution.
+    state: pending.kind === "bind" ? "binding-pending" : backend.state,
+    pending,
+    reason: null,
+  };
+  return { ok: true, goal: next, request: requestOf(pending), replayed: false };
+}
+
+function pendingFrom(params: OperationParams, goal: MultiGoal, digest: string): PendingOperation {
+  return {
+    operationId: params.operationId,
+    kind: params.kind,
+    expectedState: params.expectedState,
+    previousState: goal.backend.state,
+    scope: goalScope(goal, params.selection),
+    expectedRevision: params.expectedRevision,
+    payloadDigest: digest,
+    payload: params.payload,
+    peerId: params.peerId,
+    taskId: params.taskId,
+    createdAt: params.now ?? Date.now(),
+  };
+}
+
+// --- step 3: verify the receipt against the still-current intent ----------
+
+export type AcceptResult =
+  | { ok: true; goal: MultiGoal; receipt: PeerReceipt; projection?: unknown }
+  | { ok: false; goal: MultiGoal; code: ReceiptRejection; message: string };
+
+/**
+ * The state to settle into once an intent is gone.
+ *
+ * A recorded `previousState` is a memory of how things were, not a fact about
+ * how they are: restoring `binding-pending` after clearing the intent would
+ * assert a bind is in flight when none is, which isGoalBackend rejects. The
+ * answer is derived from what is actually true — a binding means bound, no
+ * binding means unbound — so a writer cannot mint a state the reader refuses.
+ */
+function settledState(preferred: GoalBackendState, binding: GoalBackend["binding"]): GoalBackendState {
+  if (preferred !== "binding-pending") {
+    return preferred;
+  }
+  return binding ? "bound-available" : "unbound";
+}
+
+/** A retained record, stamped with the identity the operation was planned with. */
+function recordOf(
+  pending: PendingOperation,
+  outcome: RetainedOperation["outcome"],
+  receipt: PeerReceipt | null,
+  reason: string | null,
+): RetainedOperation {
+  return {
+    operationId: pending.operationId,
+    kind: pending.kind,
+    scope: cloneScope(pending.scope),
+    expectedRevision: pending.expectedRevision,
+    payloadDigest: pending.payloadDigest,
+    outcome,
+    receipt,
+    reason,
+  };
+}
+
+function quarantine(goal: MultiGoal, pending: PendingOperation, reason: string, state?: GoalBackendState): MultiGoal {
+  const next = cloneGoal(goal);
+  next.backend = {
+    ...next.backend,
+    state: settledState(state ?? pending.previousState, next.backend.binding),
+    pending: null,
+    operations: retain(next.backend, recordOf(pending, "quarantined", null, reason)),
+    reason,
+  };
+  return next;
+}
+
+/**
+ * Step 3: verify the receipt against the STILL-CURRENT intent and selection,
+ * then persist the corresponding backend state. Success is published only
+ * after this.
+ *
+ * The identity checks are the reason a late response is harmless: a receipt
+ * that arrives after a pause, a generation change, a branch move, or a
+ * cancellation matches no current intent and quarantines itself instead of
+ * publishing state. A changed generation quarantines the OPERATION only — §3
+ * is explicit that a resume may retain the same memory scope while replacing
+ * execution authority, so the binding and its revision pointer survive.
+ */
+export function acceptReceipt(
+  goal: MultiGoal,
+  response: PeerResponse,
+  selection: PeerSelection,
+  options: { export?: GoalMemory } = {},
+): AcceptResult {
+  const pending = goal.backend.pending;
+  if (!pending) {
+    // No current intent. An already-acknowledged operation replays
+    // idempotently; anything else is a late callback with nothing to attach to.
+    //
+    // This branch verifies exactly as hard as the pending one. It previously
+    // took an id, a digest and a scope as proof and skipped the receipt's shape
+    // entirely — and read `response.receipt.operationId` before establishing a
+    // receipt was there, so a malformed answer threw rather than being
+    // rejected. The shape check comes first, and the receipt is then held to
+    // the same isCompleteReceipt predicate the snapshot validator applies.
+    if (response.status === "committed" && isWellFormedReceipt(response.receipt)) {
+      const record = goal.backend.operations.find(
+        (entry) => entry.operationId === response.receipt.operationId && entry.outcome === "committed",
+      );
+      if (record && isCompleteReceipt(response.receipt, record) && isCompleteReceipt(record.receipt, record)) {
+        // Return what Goal ACKNOWLEDGED, not what the answer carried: the
+        // retained receipt is the one already verified and persisted, so a
+        // response cannot restate a committed operation with different content.
+        return { ok: true, goal, receipt: record.receipt! };
+      }
+    }
+    return {
+      ok: false,
+      goal,
+      code: "refused",
+      message: "the answer matches no current intent for this stage",
+    };
+  }
+  if (!selectionsEqual(pending.scope.selection, selection)) {
+    return {
+      ok: false,
+      goal: quarantine(
+        goal,
+        pending,
+        `operation ${pending.operationId} was planned on branch ${pending.scope.selection.branchAnchorId}; ` +
+          `the session/branch selection has moved to ${selection.branchAnchorId}`,
+      ),
+      code: "stale-selection",
+      message: "the live session/branch selection no longer matches the intent this receipt answers",
+    };
+  }
+  if (pending.scope.epoch !== goal.execution.generation) {
+    return {
+      ok: false,
+      goal: quarantine(
+        goal,
+        pending,
+        `operation ${pending.operationId} was planned in execution generation ${pending.scope.epoch}; ` +
+          `${goal.execution.generation} is in force`,
+        goal.backend.state,
+      ),
+      code: "stale-epoch",
+      message: "the execution generation changed while the operation was in flight",
+    };
+  }
+
+  const verified = verifyReceipt(requestOf(pending), response);
+  if (!verified.ok) {
+    if (verified.code === "pending") {
+      // Not durably selected: publish nothing, keep the intent for the retry.
+      const held = cloneGoal(goal);
+      held.backend = { ...held.backend, reason: verified.message };
+      return { ok: false, goal: held, code: "pending", message: verified.message };
+    }
+    // Only a code that positively means "this can never succeed" discards the
+    // intent. Everything else — transport failures, and anything this build
+    // does not recognise — keeps it for the retry (see TERMINAL_CODES).
+    if (!TERMINAL_CODES.has(verified.code)) {
+      return {
+        ok: false,
+        goal: failOperation(goal, { code: verified.code, message: verified.message }),
+        code: verified.code,
+        message: verified.message,
+      };
+    }
+    return {
+      ok: false,
+      goal: quarantine(goal, pending, verified.message),
+      code: verified.code,
+      message: verified.message,
+    };
+  }
+
+  const receipt = verified.receipt;
+  const next = cloneGoal(goal);
+
+  if (pending.expectedState === "detached") {
+    // A detach may only complete against a VALIDATED export: §3 forbids
+    // silently truncating a projection that does not fit the 8 KiB record.
+    // Defence in depth: this is the function that actually replaces the Goal
+    // record, so it re-validates rather than trusting its caller. An absent
+    // export and an invalid one both hold the switch; neither truncates.
+    const exported = options.export;
+    const exportCheck = exported
+      ? validateMemoryContent(
+          { proved: exported.proved, unresolved: exported.unresolved, next: exported.next },
+          exported.revision,
+        )
+      : null;
+    if (!exported || !exportCheck?.ok) {
+      const message = exportCheck && !exportCheck.ok
+        ? `a detach needs a valid export before Goal-only mode resumes. ${exportCheck.message}`
+        : "a detach needs a validated export before Goal-only mode resumes";
+      const held = cloneGoal(goal);
+      held.backend = { ...held.backend, reason: message };
+      return { ok: false, goal: held, code: "refused", message };
+    }
+    next.memory = { ...exported };
+    const released = next.backend.binding;
+    next.backend = {
+      ...next.backend,
+      state: "detached",
+      // Detached means Goal-only mode has resumed, so the binding is released
+      // rather than kept as a decoration: a binding record in a state that
+      // disclaims authority is a contradiction the snapshot validator rejects,
+      // and keeping one would leave a stale association pointing at a scope
+      // Goal no longer writes through. The provenance goes into `reason`.
+      binding: null,
+      pending: null,
+      operations: retain(next.backend, recordOf(pending, "committed", receipt, null)),
+      reason: released
+        ? `detached from ${released.peerId} (task ${released.taskId}) at revision ${receipt.selectedRevision}; ` +
+          "the exported projection is now the Goal record"
+        : `detached at revision ${receipt.selectedRevision}`,
+    };
+    return { ok: true, goal: next, receipt, projection: response.status === "committed" ? response.projection : undefined };
+  }
+
+  if (pending.kind !== "bind" && !goal.backend.binding) {
+    // Defence in depth: no receipt may install a binding that no bind created.
+    return {
+      ok: false,
+      goal: quarantine(goal, pending, "a receipt cannot install a binding that no bind operation created"),
+      code: "refused",
+      message: "a receipt cannot install a binding that no bind operation created",
+    };
+  }
+  const stage = currentStage(goal);
+  next.backend = {
+    ...next.backend,
+    state: pending.expectedState,
+    binding: {
+      peerId: next.backend.binding?.peerId ?? pending.peerId ?? "",
+      taskId: next.backend.binding?.taskId ?? pending.taskId ?? "",
+      goalId: goal.goalId,
+      stageId: stage.id,
+      generation: goal.execution.generation,
+      contractRevision: goal.contractRevision,
+      sessionId: pending.scope.selection.sessionId,
+      branchAnchorId: pending.scope.selection.branchAnchorId,
+      selectedRevision: receipt.selectedRevision,
+    },
+    pending: null,
+    operations: retain(next.backend, recordOf(pending, "committed", receipt, null)),
+    reason: null,
+  };
+  return { ok: true, goal: next, receipt, projection: response.status === "committed" ? response.projection : undefined };
+}
+
+/**
+ * The codes that positively mean "this operation can never succeed". Anything
+ * else — including a code this build does not recognise — keeps its intent.
+ *
+ * The default matters: an unrecognised code most likely came from a malformed
+ * or incompatible peer, which this design classifies as retryable. Discarding
+ * the intent on it would turn a recoverable transport problem into permanent
+ * loss of the operation, so classification is by this closed TERMINAL set
+ * rather than by a closed retryable set with a terminal default.
+ */
+const TERMINAL_CODES: ReadonlySet<string> = new Set<ReceiptRejection>([
+  "stale-selection",
+  "stale-epoch",
+  "scope-conflict",
+  "replay-conflict",
+  "refused",
+]);
+
+/**
+ * Apply a failed attempt. The code decides recovery:
+ *
+ *  - retryable (`unavailable`, `timeout`, `incompatible`) keeps the persisted
+ *    intent so the SAME operation ID and payload can be replayed — that is what
+ *    makes the "peer committed but Goal never saw the receipt" boundary
+ *    recoverable rather than a lost mutation;
+ *  - terminal codes quarantine the intent, keeping its ID so a late receipt can
+ *    still be refused, and the caller re-plans under a new one.
+ *
+ * A terminal failure of a bind that was never bound returns the goal to
+ * `unbound`, so a peer that refuses outright cannot wedge a session that never
+ * had an authoritative backend to lose (§3 "optional"; §10's P0 warning). This
+ * only ever runs after an EXPLICIT bind: nothing here is triggered by merely
+ * discovering a checkpoint.
+ */
+export function failOperation(goal: MultiGoal, failure: { code: string; message: string }): MultiGoal {
+  const pending = goal.backend.pending;
+  if (!pending) {
+    return goal;
+  }
+  if (TERMINAL_CODES.has(failure.code)) {
+    return quarantine(goal, pending, failure.message);
+  }
+  const next = cloneGoal(goal);
+  next.backend = {
+    ...next.backend,
+    // A bound authority that stopped answering is `bound-unavailable`, never a
+    // silent return to Goal's own record (invariant 8). A bind attempt that
+    // never landed stays `binding-pending`: the switch is persisted, visible,
+    // and recoverable, and abandonOperation is the way out of it.
+    state: next.backend.state === "bound-available" ? "bound-unavailable" : next.backend.state,
+    reason: failure.message,
+  };
+  return next;
+}
+
+/**
+ * Give up on the pending switch. This is a Goal-owned decision — an export that
+ * cannot fit, a user who changed their mind — and it frees the stage's one
+ * pending slot without pretending the operation succeeded. The ID stays
+ * retained, so a late receipt for it is still refused.
+ */
+export function abandonOperation(goal: MultiGoal, reason: string): MultiGoal {
+  const pending = goal.backend.pending;
+  if (!pending) {
+    return goal;
+  }
+  return quarantine(goal, pending, reason);
+}
+
+/**
+ * Branch-selection check 2 (§4: "branch movement must not attach a pending
+ * operation to a different branch"). The intent is quarantined rather than
+ * rebased: replanning happens under a new ID on the branch that owns it, and
+ * the peer's own idempotency prevents a double commit if the original did
+ * commit. The BINDING itself is left alone — moving branch is not losing the
+ * backend, and it refills no budget.
+ */
+export function reconcileSelection(goal: MultiGoal, selection: PeerSelection): MultiGoal {
+  const pending = goal.backend.pending;
+  if (!pending || selectionsEqual(pending.scope.selection, selection)) {
+    return goal;
+  }
+  return quarantine(
+    goal,
+    pending,
+    `operation ${pending.operationId} was planned on branch ${pending.scope.selection.branchAnchorId}; ` +
+      `the selection moved to ${selection.branchAnchorId}, so it was not attached`,
+  );
+}
+
+/**
+ * The bound authority stopped answering. §3: preserve the binding, the memory
+ * pointers and the allowances; pause Goal-owned execution with a visible
+ * reason; do not resurrect the old blob.
+ */
+export function markPeerUnavailable(goal: MultiGoal, reason: string): MultiGoal {
+  if (goal.backend.state !== "bound-available" && goal.backend.state !== "bound-unavailable") {
+    return goal;
+  }
+  const next = cloneGoal(goal);
+  next.backend = { ...next.backend, state: "bound-unavailable", reason };
+  return next;
+}
+
+/**
+ * Restore availability from a VERIFIED peer answer.
+ *
+ * This is an exported state transition that hands execution authority back, so
+ * it cannot take a caller's word for the revision. It previously accepted any
+ * non-empty string: any caller could resume Goal execution and plan writes
+ * against an arbitrary revision while the authoritative backend was still
+ * unavailable, with no peer response, scope, generation or contract identity
+ * ever checked.
+ *
+ * It now takes the request and the answer, verifies the receipt exactly as step
+ * 3 of the recoverable ordering does, and additionally requires the receipt to
+ * be for the scope IN FORCE — the current stage, contract revision and
+ * execution generation, on the branch the binding was made against. A receipt
+ * for a superseded epoch or another branch cannot resurrect authority.
+ *
+ * There is deliberately no unverified variant. If a recovery path ever needs
+ * one it should be a differently-named operation whose contract states what it
+ * does not check, rather than this one being permissive again.
+ */
+export function markPeerAvailable(
+  goal: MultiGoal,
+  request: PeerRequest,
+  response: PeerResponse,
+): MultiGoal {
+  const binding = goal.backend.binding;
+  if (goal.backend.state !== "bound-unavailable" || !binding) {
+    return goal;
+  }
+  const verified = verifyReceipt(request, response);
+  if (!verified.ok) {
+    return goal;
+  }
+  // The receipt verified against its own request; that request must also be the
+  // one this goal would issue right now, or it proves nothing about this scope.
+  const expected = goalScope(goal, {
+    sessionId: binding.sessionId,
+    branchAnchorId: binding.branchAnchorId,
+  });
+  if (!scopesEqual(verified.receipt.scope, expected)) {
+    return goal;
+  }
+  const next = cloneGoal(goal);
+  next.backend = {
+    ...next.backend,
+    state: "bound-available",
+    binding: { ...binding, selectedRevision: verified.receipt.selectedRevision },
+    reason: null,
+  };
+  return next;
+}
+
+/**
+ * End the stage's binding.
+ *
+ * A binding is scoped to ONE stage: its `scopeId` is
+ * `goal:<goalId>:stage:<Stage.id>`, so a transition moves to a scope nothing
+ * has bound. The pending intent and the retained receipts go with it — neither
+ * can address the new `scopeId` and `contractRevision`, which is exactly "the
+ * lifetime in which an operation can be retried" (§4) and satisfies "a stage
+ * transition invalidates old reviews and active selections before admitting the
+ * next stage" (PI_DAG_COMPACT §1).
+ *
+ * The next stage therefore starts `unbound`, which is runnable, and pairs with
+ * the empty working-memory record §8 mandates — there is no stale blob here to
+ * downgrade to, so invariant 8 is not in play. The `reason` records which peer,
+ * task and revision the previous stage was bound to, so the change is visible
+ * rather than silent.
+ *
+ * This deliberately does NOT move to `binding-pending`. P0 has no transition
+ * operation and no runtime path that submits one, so a pending switch would be
+ * a switch nothing could complete: `requestContinuation` would refuse forever,
+ * `abandonOperation` would have no intent to act on, and a bound goal would be
+ * wedged after stage 1 with no user-reachable exit. No state reachable within
+ * P0 may be permanently unrecoverable. Task 5.3 replaces this rule with the
+ * durable transition operation that archives the old stage, installs the next
+ * stage's protected contract in one scoped mutation, and carries the binding
+ * across as part of it.
+ */
+export function endStageBinding(backend: GoalBackend): GoalBackend {
+  if (backend.state === "unbound" && !backend.binding) {
+    return { ...backend, pending: null, operations: [], reason: null };
+  }
+  const previous = backend.binding;
+  return {
+    state: "unbound",
+    binding: null,
+    pending: null,
+    operations: [],
+    reason: previous
+      ? `the previous stage's binding to ${previous.peerId} (task ${previous.taskId}, ` +
+        `selected revision ${previous.selectedRevision ?? "none"}) ended with that stage; ` +
+        "this stage starts unbound because the durable stage-transition operation is not implemented yet"
+      : null,
+  };
+}
+
+// --- the driver -----------------------------------------------------------
+
+export type OperationResult =
+  | { ok: true; goal: MultiGoal; receipt: PeerReceipt | null; projection?: unknown; replayed: boolean }
+  | { ok: false; goal: MultiGoal; code: ReceiptRejection; message: string };
+
+/**
+ * The four-step ordering, end to end. Every caller of a durable Goal-side
+ * operation goes through here so that no path can skip the intent, the
+ * verification, or the acknowledgement.
+ *
+ * `detach` is the one kind with an extra step: the export is READ and validated
+ * against Goal's 8 KiB record before the peer is asked to release authority.
+ * Validating after the release would leave Goal unable to un-release; §3
+ * requires the switch to stay pending and report why instead. The export must be
+ * PRESENT to be validated: a committed read that carries no projection is a
+ * failed export, not an empty one.
+ */
+export async function runPeerOperation(
+  goal: MultiGoal,
+  client: PeerClient | null | undefined,
+  params: OperationParams,
+  options: { timeoutMs?: number } = {},
+): Promise<OperationResult> {
+  const begun = beginOperation(goal, params);
+  if (!begun.ok) {
+    return begun;
+  }
+  if (begun.replayed) {
+    return { ok: true, goal: begun.goal, receipt: begun.receipt, replayed: true };
+  }
+
+  let exported: GoalMemory | undefined;
+  if (params.kind === "detach") {
+    const holdSwitch = (message: string): OperationResult => {
+      // The switch stays pending with a visible reason; nothing is truncated
+      // and authority is never released on an export Goal cannot hold.
+      const held = cloneGoal(begun.goal);
+      held.backend = { ...held.backend, reason: message };
+      return { ok: false, goal: held, code: "refused", message };
+    };
+    const read: PeerRequest = {
+      protocolVersion: PEER_PROTOCOL_VERSION,
+      // Injectively derived, not concatenated: `${id}:export` lets a caller
+      // whose own operation id happens to be `<detachId>:export` collide with
+      // this read at the peer, and be answered with that operation's receipt.
+      operationId: exportReadId(params.operationId),
+      kind: "read",
+      scope: cloneScope(begun.request.scope),
+      expectedRevision: params.expectedRevision,
+      payload: { profile: GOAL_PROJECTION_PROFILE },
+    };
+    const readResponse = await callPeer(client, read, options);
+    const readVerified = verifyReceipt(read, readResponse);
+    if (!readVerified.ok) {
+      // The export read is a PRECONDITION of the detach, not the operation
+      // itself, so its failure must never burn the detach's operation id. A
+      // retryable failure keeps the intent and marks the backend unavailable
+      // as usual; a terminal one holds the switch pending with the reason
+      // rather than quarantining an operation the peer never saw.
+      const message = `Detach refused: the export could not be read. ${readVerified.message}`;
+      if (TERMINAL_CODES.has(readVerified.code)) {
+        return holdSwitch(message);
+      }
+      return {
+        ok: false,
+        goal: failOperation(begun.goal, { code: readVerified.code, message }),
+        code: readVerified.code,
+        message,
+      };
+    }
+    // An ABSENT export is not an empty one. A committed read that carries no
+    // projection — or a projection with no memory record — means the peer said
+    // nothing, and defaulting that to an empty record would let a dropped
+    // payload replace the Goal record with nothing and release authority. That
+    // is the exact loss this read-then-detach ordering exists to prevent, so
+    // absent and empty stay distinguishable: a peer whose working set really is
+    // empty says so with a present, correctly typed { proved: [], unresolved:
+    // [], next: "" }. Missing fields are left missing here rather than filled
+    // in, so validateMemoryContent refuses them on the schema check.
+    const projection = readResponse.status === "committed" ? readResponse.projection : undefined;
+    const record =
+      projection && typeof projection === "object"
+        ? (projection as { memory?: unknown }).memory
+        : undefined;
+    if (!record || typeof record !== "object") {
+      return holdSwitch(
+        "Detach refused: the peer acknowledged the export read but returned no projection record, " +
+          "so there is nothing to validate. An absent export is not an empty one; the backend switch " +
+          "stays pending. Retry it, or abandon the switch.",
+      );
+    }
+    const memory = record as { proved?: unknown; unresolved?: unknown; next?: unknown };
+    const validated = validateMemoryContent(
+      { proved: memory.proved, unresolved: memory.unresolved, next: memory.next },
+      goal.memory.revision + 1,
+    );
+    if (!validated.ok) {
+      return holdSwitch(`Detach refused: the exported projection is not a valid Goal record. ${validated.message}`);
+    }
+    exported = {
+      revision: goal.memory.revision + 1,
+      proved: validated.proved,
+      unresolved: validated.unresolved,
+      next: validated.next,
+    };
+  }
+
+  const response = await callPeer(client, begun.request, options);
+  const accepted = acceptReceipt(begun.goal, response, params.selection, { export: exported });
+  if (!accepted.ok) {
+    return accepted;
+  }
+  return { ok: true, goal: accepted.goal, receipt: accepted.receipt, projection: accepted.projection, replayed: false };
+}
