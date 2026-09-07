@@ -1133,8 +1133,29 @@ test("B21: availability requires a real selected revision", async () => {
   const lost = markPeerUnavailable(bound, "the peer was unloaded");
   assert.equal(lost.backend.state, "bound-unavailable", "sanity: it is waiting to come back");
 
+  const probe: PeerRequest = {
+    protocolVersion: 1,
+    operationId: "op-probe",
+    kind: "read",
+    scope: goalScope(lost, SELECTION_A),
+    expectedRevision: lost.backend.binding?.selectedRevision ?? null,
+    payload: { profile: "current-scope@1" },
+  };
+
+  // A receipt that names no durably selected revision proves nothing, whatever
+  // else it carries.
   for (const revision of ["", "   "]) {
-    const restored = markPeerAvailable(lost, revision);
+    const restored = markPeerAvailable(lost, probe, {
+      status: "committed",
+      receipt: {
+        protocolVersion: 1,
+        operationId: probe.operationId,
+        scope: probe.scope,
+        selectedRevision: revision,
+        payloadDigest: canonicalDigest(probe.payload),
+        committedAt: 1,
+      },
+    });
     assert.equal(
       restored.backend.state,
       "bound-unavailable",
@@ -1148,9 +1169,14 @@ test("B21: availability requires a real selected revision", async () => {
     assert.equal(isGoalBackend(restored.backend), true, "whatever it produced is loadable");
   }
 
-  const real = markPeerAvailable(lost, "rev-9");
+  const answer = await callPeer(peer, probe);
+  const real = markPeerAvailable(lost, probe, answer);
   assert.equal(real.backend.state, "bound-available", "sanity: a real revision still restores it");
-  assert.equal(real.backend.binding?.selectedRevision, "rev-9");
+  assert.equal(
+    real.backend.binding?.selectedRevision,
+    answer.status === "committed" ? answer.receipt.selectedRevision : null,
+    "and the pointer is the revision the peer actually selected",
+  );
   assert.equal(isGoalBackend(real.backend), true);
 });
 
@@ -1198,6 +1224,11 @@ test("B21: abandoning an operation never leaves a state the validator refuses", 
 test("B21: every state a normal lifecycle passes through is loadable", async () => {
   // The durable guard for the rule: walk the lifecycle and validate after each
   // transition, so a future writer cannot quietly produce an unloadable state.
+  //
+  // It walks transitions driven by WELL-FORMED peer answers, because that is
+  // what the fake peer produces. A writer that accepts a MALFORMED answer and
+  // persists a record the validator rejects is invisible here; B23 covers that,
+  // by asserting loadability after every answer in the generated answer space.
   const peer = createFakePeer();
   const goal = twoStepGoal();
   const seen: string[] = [];
@@ -1221,7 +1252,15 @@ test("B21: every state a normal lifecycle passes through is loadable", async () 
   assert.equal(wrote.ok, true, wrote.ok ? "" : wrote.message);
   current = check("write committed", wrote.goal);
   current = check("peer unavailable", markPeerUnavailable(current, "unloaded"));
-  current = check("peer available again", markPeerAvailable(current, "rev-77"));
+  const revive: PeerRequest = {
+    protocolVersion: 1,
+    operationId: "op-revive",
+    kind: "read",
+    scope: goalScope(current, SELECTION_A),
+    expectedRevision: current.backend.binding?.selectedRevision ?? null,
+    payload: { profile: "current-scope@1" },
+  };
+  current = check("peer available again", markPeerAvailable(current, revive, await callPeer(peer, revive)));
   current = check("selection moved", reconcileSelection(current, SELECTION_B));
 
   const advanced = acceptCompletion(current, Date.now(), {});
@@ -1305,11 +1344,27 @@ function answerSpace(request: PeerRequest): Answer[] {
     ["a different payload", { payloadDigest: canonicalDigest({ something: "else" }) }],
     ["no durably selected revision", { selectedRevision: "" }],
     ["an unreadable protocol version", { protocolVersion: 99 }],
+    // Absent, present-and-valid, and PRESENT-BUT-MALFORMED are three cases, not
+    // two. Every field below is mandatory on a committed receipt, so neither
+    // absence nor a wrong type may be waved through the way an optional field's
+    // absence is (docs/peer-protocol.md §4.3).
+    ["no operation id at all", { operationId: undefined }],
+    ["an operation id that is not a string", { operationId: 42 }],
+    ["an empty operation id", { operationId: "" }],
+    ["no commit timestamp", { committedAt: undefined }],
+    ["a commit timestamp that is not a number", { committedAt: "soon" }],
+    ["no payload digest", { payloadDigest: undefined }],
+    ["no selected revision at all", { selectedRevision: undefined }],
+    ["a selected revision that is not a string", { selectedRevision: 7 }],
+    ["no scope at all", { scope: undefined }],
   ];
 
   const answers: Answer[] = [];
   for (const [label, overrides] of mutations) {
-    answers.push({ label: `committed, correlated, ${label}`, response: { status: "committed", receipt: receipt(overrides) }, correlates: true });
+    // A receipt whose own operation id is missing or malformed does not
+    // correlate with anything — it cannot be matched to a request at all.
+    const correlates = !("operationId" in overrides);
+    answers.push({ label: `committed, correlated, ${label}`, response: { status: "committed", receipt: receipt(overrides) }, correlates });
     answers.push({
       label: `committed, MISDIRECTED, ${label}`,
       response: { status: "committed", receipt: receipt({ ...overrides, operationId: FOREIGN_OPERATION }) },
@@ -1402,6 +1457,22 @@ test("B23: no peer answer discards a pending intent unless it correlates and is 
         `a non-terminal outcome (${code}) must not discard the intent: ${answer.label}`,
       );
     }
+
+    // The lifecycle walk (B21) proves every transition driven by a WELL-FORMED
+    // peer answer is loadable. It cannot see a writer that accepts a malformed
+    // answer and persists a record the validator later rejects, because the
+    // fake peer never produces one. That gap is closed here, where the
+    // malformed answers actually live.
+    assert.equal(
+      isGoalBackend(after.goal.backend),
+      true,
+      `the backend must stay loadable after: ${answer.label}`,
+    );
+    assert.equal(
+      isMultiGoal(after.goal),
+      true,
+      `the whole snapshot must stay loadable after: ${answer.label}`,
+    );
 
     if (!answer.correlates) {
       misdirected += 1;
@@ -1503,4 +1574,151 @@ test("B24: a true replay of the same intent still returns its receipt", async ()
   assert.deepEqual(replayed.receipt, first.ok ? first.receipt : null, "the same receipt comes back");
   assert.equal(peer.calls.length, callsBefore, "without a peer round trip");
   assert.equal(peer.commits, 2, "and without a second commit");
+});
+
+// --- B25/B26: absent, valid, and present-but-malformed are three cases ----
+
+/**
+ * Review finding (P1, src/peer.ts): correlationFailure treated a non-string
+ * operation id as if the field were ABSENT, and an absent id is deliberately
+ * not a mismatch — because on an ERROR the field is optional. On a committed
+ * receipt it is mandatory, so the leniency was applied to a branch where it
+ * does not belong, and to a value that is not absent but wrong.
+ *
+ * The consequence is the writer-vs-reader rule again: a receipt with no
+ * operation id could be accepted and persisted as a committed record that
+ * isGoalBackend later rejects, so the goal would run until it reloaded.
+ */
+test("B25: a committed receipt missing a mandatory field is never accepted", async () => {
+  const peer = createFakePeer();
+  const bound = await bind(twoStepGoal(), peer);
+  const plan = () => {
+    const begun = beginOperation(
+      bound,
+      writeParams(bound, { revision: 1, proved: ["real work"], unresolved: [], next: "" }, "op-mandatory"),
+    );
+    assert.ok(begun.ok);
+    return begun;
+  };
+  const request = plan().request;
+  const valid = {
+    protocolVersion: 1,
+    operationId: request.operationId,
+    scope: request.scope,
+    selectedRevision: "rev-9",
+    payloadDigest: canonicalDigest(request.payload),
+    committedAt: 1,
+  };
+
+  // Sanity: the well-formed receipt IS accepted, so the cases below fail for
+  // the field under test and not because the fixture was broken.
+  const accepted = acceptReceipt(plan().goal, { status: "committed", receipt: valid } as any, SELECTION_A);
+  assert.equal(accepted.ok, true, accepted.ok ? "" : accepted.message);
+
+  const mandatory: Array<[string, Record<string, unknown>]> = [
+    ["operationId", { operationId: undefined }],
+    ["operationId (wrong type)", { operationId: 42 }],
+    ["operationId (empty)", { operationId: "" }],
+    ["committedAt", { committedAt: undefined }],
+    ["committedAt (wrong type)", { committedAt: "soon" }],
+    ["payloadDigest", { payloadDigest: undefined }],
+    ["selectedRevision", { selectedRevision: undefined }],
+    ["selectedRevision (wrong type)", { selectedRevision: 7 }],
+    ["scope", { scope: undefined }],
+    ["protocolVersion", { protocolVersion: undefined }],
+  ];
+
+  for (const [field, override] of mandatory) {
+    const before = plan().goal;
+    const after = acceptReceipt(
+      before,
+      { status: "committed", receipt: { ...valid, ...override } } as any,
+      SELECTION_A,
+    );
+    assert.equal(after.ok, false, `a receipt with a bad ${field} must not be accepted`);
+    assert.equal(
+      after.goal.backend.operations.some(
+        (record) => record.operationId === "op-mandatory" && record.outcome === "committed",
+      ),
+      false,
+      `and must not be retained as a committed operation: ${field}`,
+    );
+    assert.equal(isMultiGoal(after.goal), true, `and must leave a loadable snapshot: ${field}`);
+  }
+});
+
+/**
+ * Review finding (P1, src/backend.ts): markPeerAvailable granted execution
+ * authority on a caller-supplied string. Last round it stopped accepting an
+ * EMPTY one; the deeper problem was that it accepted any non-empty one. No
+ * peer response, scope, generation or contract identity was verified, so an
+ * arbitrary revision could resume Goal execution while the authoritative
+ * backend was still unavailable.
+ */
+test("B26: availability is restored only by a verified peer answer", async () => {
+  const peer = createFakePeer();
+  const bound = await bind(twoStepGoal(), peer);
+  const lost = markPeerUnavailable(bound, "the peer was unloaded");
+  assert.equal(lost.backend.state, "bound-unavailable", "sanity: it is waiting to come back");
+  const pointerBefore = lost.backend.binding?.selectedRevision;
+
+  // A read the peer really answered, for the scope and epoch in force.
+  const probe: PeerRequest = {
+    protocolVersion: 1,
+    operationId: "op-probe",
+    kind: "read",
+    scope: goalScope(lost, SELECTION_A),
+    expectedRevision: pointerBefore ?? null,
+    payload: { profile: "current-scope@1" },
+  };
+  const answer = await callPeer(peer, probe);
+  assert.equal(answer.status, "committed", "sanity: the peer answered the probe");
+
+  const restored = markPeerAvailable(lost, probe, answer);
+  assert.equal(restored.backend.state, "bound-available", "a verified answer restores availability");
+  assert.equal(isMultiGoal(restored), true);
+
+  // Nothing else may.
+  const forgeries: Array<[string, PeerRequest, any]> = [
+    [
+      "an answer that is not a receipt at all",
+      probe,
+      { status: "error", code: "unavailable", message: "still gone", operationId: probe.operationId },
+    ],
+    [
+      "a receipt for another execution generation",
+      { ...probe, scope: { ...probe.scope, epoch: probe.scope.epoch + 1 } },
+      answer,
+    ],
+    [
+      "a receipt for another branch selection",
+      { ...probe, scope: { ...probe.scope, selection: SELECTION_B } },
+      answer,
+    ],
+    [
+      "a receipt for another work scope",
+      { ...probe, scope: { ...probe.scope, scopeId: "goal:someone-else:stage:theirs" } },
+      answer,
+    ],
+    [
+      "a receipt for another contract revision",
+      { ...probe, scope: { ...probe.scope, contractRevision: "f".repeat(64) } },
+      answer,
+    ],
+  ];
+
+  for (const [label, request, response] of forgeries) {
+    const attempt = markPeerAvailable(lost, request, response);
+    assert.equal(
+      attempt.backend.state,
+      "bound-unavailable",
+      `availability must not be granted by ${label}`,
+    );
+    assert.equal(
+      attempt.backend.binding?.selectedRevision,
+      pointerBefore,
+      `and the revision pointer must not move: ${label}`,
+    );
+    assert.equal(isMultiGoal(attempt), true, `and the snapshot stays loadable: ${label}`);
+  }
 });

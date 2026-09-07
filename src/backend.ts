@@ -278,7 +278,7 @@ export function isGoalBackend(value: unknown): value is GoalBackend {
   if (claimsAuthority !== (binding !== null)) {
     return false;
   }
-  if (claimsAuthority && !(typeof binding!.selectedRevision === "string" && binding!.selectedRevision.length > 0)) {
+  if (claimsAuthority && !(typeof binding!.selectedRevision === "string" && binding!.selectedRevision.trim().length > 0)) {
     // Bound means a revision was durably selected; a bound state without one
     // has no working set to read or write through.
     return false;
@@ -1041,27 +1041,52 @@ export function markPeerUnavailable(goal: MultiGoal, reason: string): MultiGoal 
 }
 
 /**
- * The peer answered again on the revision Goal still believes is selected.
+ * Restore availability from a VERIFIED peer answer.
  *
- * An empty revision is refused rather than written: `bound-available` admits
- * execution, but checkOperationLegality reads an empty selected revision as
- * missing, so the goal would be runnable and unable to plan a single backend
- * operation — and isGoalBackend rejects that snapshot, so the goal would run
- * until it reloaded and then be skipped as malformed. A writer that produces a
- * state the reader refuses turns a live goal into an unloadable one.
+ * This is an exported state transition that hands execution authority back, so
+ * it cannot take a caller's word for the revision. It previously accepted any
+ * non-empty string: any caller could resume Goal execution and plan writes
+ * against an arbitrary revision while the authoritative backend was still
+ * unavailable, with no peer response, scope, generation or contract identity
+ * ever checked.
+ *
+ * It now takes the request and the answer, verifies the receipt exactly as step
+ * 3 of the recoverable ordering does, and additionally requires the receipt to
+ * be for the scope IN FORCE — the current stage, contract revision and
+ * execution generation, on the branch the binding was made against. A receipt
+ * for a superseded epoch or another branch cannot resurrect authority.
+ *
+ * There is deliberately no unverified variant. If a recovery path ever needs
+ * one it should be a differently-named operation whose contract states what it
+ * does not check, rather than this one being permissive again.
  */
-export function markPeerAvailable(goal: MultiGoal, selectedRevision: string): MultiGoal {
-  if (goal.backend.state !== "bound-unavailable" || !goal.backend.binding) {
+export function markPeerAvailable(
+  goal: MultiGoal,
+  request: PeerRequest,
+  response: PeerResponse,
+): MultiGoal {
+  const binding = goal.backend.binding;
+  if (goal.backend.state !== "bound-unavailable" || !binding) {
     return goal;
   }
-  if (typeof selectedRevision !== "string" || selectedRevision.trim().length === 0) {
+  const verified = verifyReceipt(request, response);
+  if (!verified.ok) {
+    return goal;
+  }
+  // The receipt verified against its own request; that request must also be the
+  // one this goal would issue right now, or it proves nothing about this scope.
+  const expected = goalScope(goal, {
+    sessionId: binding.sessionId,
+    branchAnchorId: binding.branchAnchorId,
+  });
+  if (!scopesEqual(verified.receipt.scope, expected)) {
     return goal;
   }
   const next = cloneGoal(goal);
   next.backend = {
     ...next.backend,
     state: "bound-available",
-    binding: { ...next.backend.binding!, selectedRevision },
+    binding: { ...binding, selectedRevision: verified.receipt.selectedRevision },
     reason: null,
   };
   return next;

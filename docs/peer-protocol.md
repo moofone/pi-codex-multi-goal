@@ -207,6 +207,21 @@ only if it correlates to that intent AND its outcome is a terminal code.**
 `test/backend-binding.test.ts` asserts this over a generated answer space
 rather than over the branches known at the time of writing.
 
+**Absent, present-and-valid, and present-but-malformed are three cases.** A
+field the protocol marks mandatory is not exempt from checking because it
+happens to be missing rather than wrong — both mean "this is not a valid
+answer". Leniency toward an absent field belongs only where the field is
+OPTIONAL, and `operationId` is optional on an error and nowhere else: it is
+mandatory on a committed receipt and on a pending answer, where a missing one
+makes the answer unattributable. The mandatory fields of a committed receipt
+are `protocolVersion`, `operationId`, `scope`, `selectedRevision` (non-blank),
+`payloadDigest` and `committedAt`; a receipt missing any of them is
+`incompatible`, which is retryable, because a malformed answer is ambiguous
+rather than a refusal. The same predicate is applied by the verifier that
+decides whether to persist a receipt and by the snapshot validator that decides
+whether a persisted one is loadable, so the two cannot drift apart and accept
+what the other rejects.
+
 **An absent field is not an empty value.** A `read` or `detach` answer that
 omits `projection`, or whose projection omits `memory`, means the peer told the
 caller *nothing*; it does not mean the working set is empty. The two must stay
@@ -341,7 +356,7 @@ The five persisted states of §3's table. `MultiGoal.backend.state`:
 | `unbound` | **Exactly today's Goal-only behaviour.** The 8 KiB memory record, the evidence path, and compaction are untouched. The peer is not consulted at all. An unrelated peer checkpoint has no effect: discovering one does not bind, does not change state, and does not reject a working Goal-only memory write |
 | `binding-pending` | The intended migration is persisted and Goal-owned execution is withheld during the switch. Goal-only memory writes are refused, so two writable authorities are never exposed |
 | `bound-available` | The peer is the sole working-memory authority. Goal reads a revision-tagged projection and writes through the adapter. Any retained Goal blob is a read-only, revision-tagged cache |
-| `bound-unavailable` | The binding, the memory pointers and the allowances are preserved. Goal-owned execution is paused with a visible reason. The old blob is not resurrected and completion requirements are not weakened (invariant 8) |
+| `bound-unavailable` | The binding, the memory pointers and the allowances are preserved. Goal-owned execution is paused with a visible reason. The old blob is not resurrected and completion requirements are not weakened (invariant 8). Returning to `bound-available` requires a VERIFIED peer answer for the scope in force — not a caller-supplied revision — because that transition hands execution authority back |
 | `detached` | Goal-only mode, entered only after a validated export of the selected current-stage projection and a persisted backend switch. The binding is RELEASED, not kept as a decoration — a binding in a state that disclaims authority is a contradiction — and its provenance moves to `reason`. If the export cannot fit the 8 KiB record without losing required continuity, the switch stays pending and reports why; it is never silently truncated |
 
 Optional means the peer is not required to *start* an unbound goal. It does not

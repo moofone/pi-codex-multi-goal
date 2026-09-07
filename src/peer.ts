@@ -145,6 +145,39 @@ export interface PeerRequirements {
   profile?: string;
 }
 
+/**
+ * Is this a structurally complete receipt?
+ *
+ * Shared deliberately between the verifier (the WRITER, which decides whether
+ * to persist a receipt) and the snapshot validator (the READER, which decides
+ * whether a persisted one is loadable). When these two drifted apart, a receipt
+ * missing a mandatory field could be accepted and retained as a committed
+ * operation that the validator then rejected — the goal ran until it reloaded
+ * and was skipped as malformed. Every field here is mandatory: absent and
+ * malformed are the same answer, "not a receipt".
+ */
+export function isWellFormedReceipt(value: unknown): value is PeerReceipt {
+  if (!value || typeof value !== "object") {
+    return false;
+  }
+  const receipt = value as PeerReceipt;
+  return (
+    receipt.protocolVersion === PEER_PROTOCOL_VERSION &&
+    typeof receipt.operationId === "string" &&
+    receipt.operationId.length > 0 &&
+    !!receipt.scope &&
+    typeof receipt.scope === "object" &&
+    typeof receipt.selectedRevision === "string" &&
+    // Blank counts as absent: a revision identifier of nothing but whitespace
+    // is not a usable identifier, and the state that carries it admits work.
+    receipt.selectedRevision.trim().length > 0 &&
+    typeof receipt.payloadDigest === "string" &&
+    receipt.payloadDigest.length > 0 &&
+    typeof receipt.committedAt === "number" &&
+    Number.isFinite(receipt.committedAt)
+  );
+}
+
 export type ReceiptRejection = PeerErrorCode | "pending";
 
 export type ReceiptCheck =
@@ -324,7 +357,15 @@ export async function discoverPeer(
     return { ok: false, code: outcome.code, message: outcome.message };
   }
   const capabilities = outcome.value;
-  if (!capabilities || typeof capabilities !== "object" || typeof capabilities.protocolVersion !== "number") {
+  if (
+    !capabilities ||
+    typeof capabilities !== "object" ||
+    typeof capabilities.protocolVersion !== "number" ||
+    typeof capabilities.peerId !== "string" ||
+    capabilities.peerId.length === 0
+  ) {
+    // `peerId` is mandatory too, and it is recorded on the binding: an
+    // unnameable peer cannot be one Goal binds to.
     return { ok: false, code: "incompatible", message: "the peer announced no readable capabilities" };
   }
   if (capabilities.protocolVersion !== PEER_PROTOCOL_VERSION) {
@@ -365,13 +406,29 @@ export async function discoverPeer(
  * A mismatch is therefore reported as `incompatible`, which is retryable: the
  * caller learns nothing, and loses nothing.
  *
- * The ID is optional on an error, so its ABSENCE is not a mismatch — a
- * transport that cannot correlate is not thereby lying, and callPeer's own
- * synthesised errors carry the request's ID anyway. Only a present and
- * different ID is a mismatch.
+ * The ID is optional on an ERROR and on nothing else, so its absence is not a
+ * mismatch THERE — a transport that cannot correlate is not thereby lying, and
+ * callPeer's own synthesised errors carry the request's ID anyway. Absent,
+ * present-and-valid, and present-but-malformed are three cases, not two:
+ * callers for whom the field is mandatory pass `required: true`, and then a
+ * missing or non-string ID is a malformed answer rather than a silent pass.
  */
-function correlationFailure(request: PeerRequest, operationId: unknown): ReceiptCheck | null {
-  if (typeof operationId !== "string" || operationId === request.operationId) {
+function correlationFailure(
+  request: PeerRequest,
+  operationId: unknown,
+  options: { required?: boolean } = {},
+): ReceiptCheck | null {
+  if (typeof operationId !== "string" || operationId.length === 0) {
+    if (!options.required) {
+      return null;
+    }
+    return {
+      ok: false,
+      code: "incompatible",
+      message: "the answer carries no usable operation id, and this kind of answer must correlate",
+    };
+  }
+  if (operationId === request.operationId) {
     return null;
   }
   return {
@@ -412,7 +469,9 @@ export function verifyReceipt(request: PeerRequest, response: PeerResponse): Rec
     return { ok: false, code: response.code, message: response.message };
   }
   if (response.status === "pending") {
-    const miscorrelated = correlationFailure(request, response.operationId);
+    // `operationId` is mandatory on a pending answer as well: without it the
+    // answer cannot be attributed to anything.
+    const miscorrelated = correlationFailure(request, response.operationId, { required: true });
     if (miscorrelated) {
       return miscorrelated;
     }
@@ -433,7 +492,18 @@ export function verifyReceipt(request: PeerRequest, response: PeerResponse): Rec
       message: `the receipt is protocol version ${receipt.protocolVersion}, not ${PEER_PROTOCOL_VERSION}`,
     };
   }
-  const miscorrelated = correlationFailure(request, receipt.operationId);
+  // Shape before identity: every field below is mandatory on a receipt, so a
+  // missing one is a malformed answer, never a field to be compared leniently.
+  // This is the same predicate the snapshot validator applies on read, so a
+  // receipt that is accepted here can always be loaded back.
+  if (!isWellFormedReceipt(receipt)) {
+    return {
+      ok: false,
+      code: "incompatible",
+      message: "the receipt is missing a field this protocol version requires",
+    };
+  }
+  const miscorrelated = correlationFailure(request, receipt.operationId, { required: true });
   if (miscorrelated) {
     // The same rule as the error and pending branches: an answer about another
     // operation is `incompatible` (retryable), never a terminal refusal that
@@ -479,7 +549,7 @@ export function verifyReceipt(request: PeerRequest, response: PeerResponse): Rec
       message: `operation ${request.operationId} was committed with a different payload`,
     };
   }
-  if (typeof receipt.selectedRevision !== "string" || receipt.selectedRevision.length === 0) {
+  if (typeof receipt.selectedRevision !== "string" || receipt.selectedRevision.trim().length === 0) {
     return {
       ok: false,
       code: "refused",

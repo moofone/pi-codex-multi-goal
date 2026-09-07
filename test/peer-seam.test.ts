@@ -279,7 +279,30 @@ test("B02: a malformed answer is incompatible, never a silent success", () => {
     },
   });
   assert.equal(noSelection.ok, false, "a receipt without a durably selected revision is not a commit");
-  assert.equal(noSelection.ok === false ? noSelection.code : null, "refused");
+  // Reclassified from `refused` (terminal) to `incompatible` (retryable), and
+  // deliberately: a receipt that omits the field which MAKES a commit a commit
+  // is a malformed answer, not a definitive refusal. It is ambiguous — the peer
+  // may well have committed and merely answered badly — and this series has
+  // established that ambiguity must not discard a valid pending intent, because
+  // a retry is idempotent while a quarantine is not reversible. The substantive
+  // claim above is unchanged; only the classification moved, and it moved to
+  // the safer side.
+  assert.equal(noSelection.ok === false ? noSelection.code : null, "incompatible");
+
+  // Whitespace is not a revision either, and is classified the same way.
+  const blankSelection = verifyReceipt(req, {
+    status: "committed",
+    receipt: {
+      protocolVersion: PEER_PROTOCOL_VERSION,
+      operationId: req.operationId,
+      scope: req.scope,
+      selectedRevision: "   ",
+      payloadDigest: canonicalDigest(req.payload),
+      committedAt: 1,
+    },
+  });
+  assert.equal(blankSelection.ok, false, "a blank selected revision is not a durable selection");
+  assert.equal(blankSelection.ok === false ? blankSelection.code : null, "incompatible");
 });
 
 test("canonicalDigest is key-order independent so an identical payload replays as identical", () => {
