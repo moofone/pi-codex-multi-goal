@@ -194,12 +194,18 @@ pending-reference reconciliation, never from an in-memory snapshot.
 **Every answer that carries an operation ID must correlate.** A response whose
 `operationId` is present and is not the request's is an answer to someone
 else's request: it says nothing about this one and must not be applied to it.
-That matters most on the error path, because `scope-conflict`,
-`replay-conflict`, `stale-selection`, `stale-epoch` and `refused` are terminal
-and would discard a valid pending intent. A mismatch is reported as
-`incompatible`, which is retryable — the caller learns nothing and loses
-nothing. The ID is optional on an error, so its ABSENCE is not a mismatch; only
-a present and different ID is.
+This holds on **every** branch — committed, pending and error alike — because
+`scope-conflict`, `replay-conflict`, `stale-selection`, `stale-epoch` and
+`refused` are terminal and would discard a valid pending intent. A mismatch is
+reported as `incompatible`, which is retryable — the caller learns nothing and
+loses nothing. The ID is optional on an error, so its ABSENCE is not a
+mismatch; only a present and different ID is.
+
+Stated as the invariant it is, because it has now been breached through three
+separate branches: **an answer may reduce a pending intent to `quarantined`
+only if it correlates to that intent AND its outcome is a terminal code.**
+`test/backend-binding.test.ts` asserts this over a generated answer space
+rather than over the branches known at the time of writing.
 
 **An absent field is not an empty value.** A `read` or `detach` answer that
 omits `projection`, or whose projection omits `memory`, means the peer told the
@@ -259,11 +265,24 @@ storage. §4's four steps map onto these functions:
    non-empty `selectedRevision`. Only after that does it persist the
    corresponding backend state, revision pointer and acknowledgement. Success is
    published only after this step.
-4. **Replay** — `resolveReplay(backend, operationId, payloadDigest)` returns
-   `novel`, `identical` (the retained receipt is returned as-is, nothing is
-   re-run), `quarantined` (re-plan under a new id), or `conflict` (the same id
-   with a different payload — refused, and nothing is mutated). A pending
-   operation never causes a second credit, mutation, completion or kickoff.
+4. **Replay** — `resolveReplay` returns `novel`, `identical` (the retained
+   receipt is returned as-is, nothing is re-run), `quarantined` (re-plan under a
+   new id), or `conflict` (refused, and nothing is mutated). A pending operation
+   never causes a second credit, mutation, completion or kickoff.
+
+   **Replay identity is the whole intent, not the id and payload.** An
+   operation ID is a name; two operations are the same operation only when
+   their **kind, scope (consumer, work scope, contract revision, execution
+   epoch and branch selection), expected revision, and payload digest** all
+   match. Anything else under a used ID is a `conflict`: §4 step 4 refuses a
+   conflicting payload, and a different kind or scope is a conflicting REQUEST
+   even when the payload bytes are equal. This is load-bearing rather than
+   pedantic — replay resolution deliberately runs BEFORE the legality checks of
+   §6.1 so that recovery still works after the state has legitimately moved on,
+   so a replay matched on too little would bypass the legality matrix entirely
+   and be acknowledged with an unrelated operation's receipt. For the same
+   reason a retained record stores the identity it was planned with, not just
+   its ID and digest.
 
 ### 5.1 Partial-write boundaries
 
@@ -302,8 +321,10 @@ resume execution or grant credit to a new generation.
 ### 5.3 Operation retention
 
 `backend.operations` is a bounded FIFO of
-`{operationId, kind, payloadDigest, outcome, receipt|null, reason|null}`, capped
-at `MAX_RETAINED_OPERATIONS` (16). Retention scope is **the lifetime in which an
+`{operationId, kind, scope, expectedRevision, payloadDigest, outcome,
+receipt|null, reason|null}`, capped at `MAX_RETAINED_OPERATIONS` (16). It
+retains the planned identity, not just the ID and digest, because that is what
+a replay is matched against. Retention scope is **the lifetime in which an
 operation can be retried**, which is the stage:
 
 - a stage transition clears the list, because the next stage has a different

@@ -88,6 +88,14 @@ test("B10: a bound backend survives a reload intact", () => {
       {
         operationId: "op-1",
         kind: "bind",
+        scope: {
+          consumer: "pi-codex-multi-goal",
+          scopeId: `goal:${goal.goalId}:stage:${goal.stages[0]!.id}`,
+          contractRevision: goal.contractRevision,
+          epoch: 0,
+          selection: { sessionId: "session-a", branchAnchorId: "anchor-1" },
+        },
+        expectedRevision: null,
         payloadDigest: "a".repeat(64),
         outcome: "committed",
         receipt: {
@@ -544,6 +552,8 @@ function committedRecord(overrides: Record<string, unknown> = {}): any {
   return {
     operationId: "op-done",
     kind: "bind",
+    scope: SCOPE,
+    expectedRevision: null,
     payloadDigest: DIGEST,
     outcome: "committed",
     receipt: receipt(),
@@ -556,6 +566,8 @@ function quarantinedRecord(overrides: Record<string, unknown> = {}): any {
   return {
     operationId: "op-gone",
     kind: "write",
+    scope: SCOPE,
+    expectedRevision: "rev-3",
     payloadDigest: DIGEST,
     outcome: "quarantined",
     receipt: null,

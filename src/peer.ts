@@ -187,6 +187,21 @@ export function selectionsEqual(left: PeerSelection, right: PeerSelection): bool
 }
 
 /**
+ * Total scope equality. Two operations differ if ANY identity field differs —
+ * the same discipline as the injective key encodings: an identity established
+ * over a subset of what distinguishes two things is not an identity.
+ */
+export function scopesEqual(left: PeerScope, right: PeerScope): boolean {
+  return (
+    left.consumer === right.consumer &&
+    left.scopeId === right.scopeId &&
+    left.contractRevision === right.contractRevision &&
+    left.epoch === right.epoch &&
+    selectionsEqual(left.selection, right.selection)
+  );
+}
+
+/**
  * Scope identity within one peer: consumer namespace plus work scope.
  *
  * Both fields are caller-controlled, so the encoding has to be INJECTIVE or the
@@ -418,12 +433,12 @@ export function verifyReceipt(request: PeerRequest, response: PeerResponse): Rec
       message: `the receipt is protocol version ${receipt.protocolVersion}, not ${PEER_PROTOCOL_VERSION}`,
     };
   }
-  if (receipt.operationId !== request.operationId) {
-    return {
-      ok: false,
-      code: "refused",
-      message: `the receipt answers operation ${receipt.operationId}, not ${request.operationId}`,
-    };
+  const miscorrelated = correlationFailure(request, receipt.operationId);
+  if (miscorrelated) {
+    // The same rule as the error and pending branches: an answer about another
+    // operation is `incompatible` (retryable), never a terminal refusal that
+    // would discard this caller's valid intent.
+    return miscorrelated;
   }
   const scope = receipt.scope;
   if (!scope || typeof scope !== "object") {

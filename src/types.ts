@@ -184,6 +184,14 @@ export type OperationOutcome = "committed" | "quarantined";
 export interface RetainedOperation {
   operationId: string;
   kind: PeerOperationKind;
+  /**
+   * The identity the operation was planned with. Retained so a replay must
+   * match the whole intent: two operations that differ in kind, scope,
+   * selection or expected revision can carry byte-equal payloads, and matching
+   * on the id and payload alone would hand one of them the other's receipt.
+   */
+  scope: PeerScope;
+  expectedRevision: string | null;
   payloadDigest: string;
   outcome: OperationOutcome;
   receipt: PeerReceipt | null;

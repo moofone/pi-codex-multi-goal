@@ -3,6 +3,7 @@ import {
   PEER_PROTOCOL_VERSION,
   callPeer,
   canonicalDigest,
+  scopesEqual,
   selectionsEqual,
   verifyReceipt,
   type PeerClient,
@@ -193,6 +194,8 @@ function isRetainedOperation(value: unknown): value is RetainedOperation {
     typeof record.operationId !== "string" ||
     record.operationId.length === 0 ||
     !OPERATION_KINDS.includes(record.kind) ||
+    !isScope(record.scope) ||
+    !(record.expectedRevision === null || typeof record.expectedRevision === "string") ||
     !DIGEST_PATTERN.test(record.payloadDigest)
   ) {
     return false;
@@ -392,34 +395,73 @@ export type ReplayVerdict =
   | { verdict: "conflict"; message: string };
 
 /**
- * Classify an operation ID against everything this stage remembers. Retention
- * is bounded but must cover the lifetime in which an operation can be retried,
- * which is why a quarantined ID keeps its record: a late receipt for an
- * operation that was abandoned still has to be refusable.
+ * What distinguishes one durable operation from another. An operation id alone
+ * is a name, not an identity: the same id with the same payload bytes can still
+ * be a completely different request if its kind, scope, branch selection or
+ * expected revision differ.
  */
-export function resolveReplay(
-  backend: GoalBackend,
-  operationId: string,
-  payloadDigest: string,
-): ReplayVerdict {
+export interface ReplayIdentity {
+  operationId: string;
+  kind: PeerOperationKind;
+  scope: PeerScope;
+  expectedRevision: string | null;
+  payloadDigest: string;
+}
+
+function sameIntent(
+  identity: ReplayIdentity,
+  other: { kind: PeerOperationKind; scope: PeerScope; expectedRevision: string | null; payloadDigest: string },
+): string | null {
+  if (other.kind !== identity.kind) {
+    return `it was a ${other.kind} operation, not a ${identity.kind}`;
+  }
+  if (!scopesEqual(other.scope, identity.scope)) {
+    return "it was planned for a different scope, contract revision, execution epoch or branch selection";
+  }
+  if (other.expectedRevision !== identity.expectedRevision) {
+    return `it was planned against revision ${other.expectedRevision ?? "none"}, not ${identity.expectedRevision ?? "none"}`;
+  }
+  if (other.payloadDigest !== identity.payloadDigest) {
+    return "it carried a different payload";
+  }
+  return null;
+}
+
+/**
+ * Classify an operation id against everything this stage remembers. Retention
+ * is bounded but must cover the lifetime in which an operation can be retried,
+ * which is why a quarantined id keeps its record: a late receipt for an
+ * operation that was abandoned still has to be refusable.
+ *
+ * Matching is over the WHOLE intent, not the id and payload alone. §4 step 4
+ * refuses a conflicting payload, and a different kind or scope is a conflicting
+ * REQUEST even when the payload bytes match. This is load-bearing rather than
+ * pedantic: replay resolution deliberately runs BEFORE checkOperationLegality
+ * so that recovery still works after the state has legitimately moved on, which
+ * means a mis-matched replay would bypass the legality matrix entirely and be
+ * acknowledged with an unrelated operation's receipt.
+ */
+export function resolveReplay(backend: GoalBackend, identity: ReplayIdentity): ReplayVerdict {
   const pending = backend.pending;
-  if (pending && pending.operationId === operationId) {
-    if (pending.payloadDigest !== payloadDigest) {
+  if (pending && pending.operationId === identity.operationId) {
+    const difference = sameIntent(identity, pending);
+    if (difference) {
       return {
         verdict: "conflict",
-        message: `operation ${operationId} is already pending with a different payload`,
+        message: `operation ${identity.operationId} is already pending, and ${difference}`,
       };
     }
     return { verdict: "pending", pending };
   }
-  const record = backend.operations.find((entry) => entry.operationId === operationId);
+  const record = backend.operations.find((entry) => entry.operationId === identity.operationId);
   if (!record) {
     return { verdict: "novel" };
   }
-  if (record.payloadDigest !== payloadDigest) {
+  const difference = sameIntent(identity, record);
+  if (difference) {
     return {
       verdict: "conflict",
-      message: `operation ${operationId} already exists with a different payload`,
+      message: `operation ${identity.operationId} already exists, and ${difference}`,
     };
   }
   return record.outcome === "committed" ? { verdict: "identical", record } : { verdict: "quarantined", record };
@@ -588,7 +630,14 @@ export function beginOperation(goal: MultiGoal, params: OperationParams): BeginR
   }
   const backend = goal.backend;
   const digest = canonicalDigest(params.payload);
-  const replay = resolveReplay(backend, params.operationId, digest);
+  const identity: ReplayIdentity = {
+    operationId: params.operationId,
+    kind: params.kind,
+    scope: goalScope(goal, params.selection),
+    expectedRevision: params.expectedRevision,
+    payloadDigest: digest,
+  };
+  const replay = resolveReplay(backend, identity);
   if (replay.verdict === "conflict") {
     return { ok: false, goal, code: "replay-conflict", message: replay.message };
   }
@@ -682,20 +731,32 @@ function settledState(preferred: GoalBackendState, binding: GoalBackend["binding
   return binding ? "bound-available" : "unbound";
 }
 
+/** A retained record, stamped with the identity the operation was planned with. */
+function recordOf(
+  pending: PendingOperation,
+  outcome: RetainedOperation["outcome"],
+  receipt: PeerReceipt | null,
+  reason: string | null,
+): RetainedOperation {
+  return {
+    operationId: pending.operationId,
+    kind: pending.kind,
+    scope: cloneScope(pending.scope),
+    expectedRevision: pending.expectedRevision,
+    payloadDigest: pending.payloadDigest,
+    outcome,
+    receipt,
+    reason,
+  };
+}
+
 function quarantine(goal: MultiGoal, pending: PendingOperation, reason: string, state?: GoalBackendState): MultiGoal {
   const next = cloneGoal(goal);
   next.backend = {
     ...next.backend,
     state: settledState(state ?? pending.previousState, next.backend.binding),
     pending: null,
-    operations: retain(next.backend, {
-      operationId: pending.operationId,
-      kind: pending.kind,
-      payloadDigest: pending.payloadDigest,
-      outcome: "quarantined",
-      receipt: null,
-      reason,
-    }),
+    operations: retain(next.backend, recordOf(pending, "quarantined", null, reason)),
     reason,
   };
   return next;
@@ -727,7 +788,13 @@ export function acceptReceipt(
       const record = goal.backend.operations.find(
         (entry) => entry.operationId === response.receipt.operationId && entry.outcome === "committed",
       );
-      if (record && record.payloadDigest === response.receipt.payloadDigest) {
+      // Identity is the whole intent here too: an id and a payload digest do
+      // not distinguish two operations that differ in scope or selection.
+      if (
+        record &&
+        record.payloadDigest === response.receipt.payloadDigest &&
+        scopesEqual(record.scope, response.receipt.scope)
+      ) {
         return { ok: true, goal, receipt: response.receipt };
       }
     }
@@ -829,14 +896,7 @@ export function acceptReceipt(
       // Goal no longer writes through. The provenance goes into `reason`.
       binding: null,
       pending: null,
-      operations: retain(next.backend, {
-        operationId: pending.operationId,
-        kind: pending.kind,
-        payloadDigest: pending.payloadDigest,
-        outcome: "committed",
-        receipt,
-        reason: null,
-      }),
+      operations: retain(next.backend, recordOf(pending, "committed", receipt, null)),
       reason: released
         ? `detached from ${released.peerId} (task ${released.taskId}) at revision ${receipt.selectedRevision}; ` +
           "the exported projection is now the Goal record"
@@ -870,14 +930,7 @@ export function acceptReceipt(
       selectedRevision: receipt.selectedRevision,
     },
     pending: null,
-    operations: retain(next.backend, {
-      operationId: pending.operationId,
-      kind: pending.kind,
-      payloadDigest: pending.payloadDigest,
-      outcome: "committed",
-      receipt,
-      reason: null,
-    }),
+    operations: retain(next.backend, recordOf(pending, "committed", receipt, null)),
     reason: null,
   };
   return { ok: true, goal: next, receipt, projection: response.status === "committed" ? response.projection : undefined };

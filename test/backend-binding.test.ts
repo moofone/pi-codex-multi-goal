@@ -18,7 +18,13 @@ import {
   runPeerOperation,
   type OperationParams,
 } from "../src/backend.ts";
-import { callPeer, canonicalDigest, verifyReceipt, type PeerSelection } from "../src/peer.ts";
+import {
+  callPeer,
+  canonicalDigest,
+  verifyReceipt,
+  type PeerRequest,
+  type PeerSelection,
+} from "../src/peer.ts";
 import {
   acceptCompletion,
   currentStage,
@@ -85,7 +91,7 @@ function bindParams(goal: MultiGoal, id = operationId("bind"), selection = SELEC
   };
 }
 
-function writeParams(goal: MultiGoal, memory: unknown, id = operationId("write")): OperationParams {
+function writeParams(goal: MultiGoal, memory: unknown, id: string = operationId("write")): OperationParams {
   return {
     operationId: id,
     kind: "write",
@@ -356,17 +362,37 @@ test("B05: resolveReplay classifies novel, identical, quarantined and conflictin
   const goal = twoStepGoal();
   const id = operationId("bind");
   const params = bindParams(goal, id);
-  const digest = canonicalDigest(params.payload);
+  const identity = {
+    operationId: id,
+    kind: params.kind,
+    scope: goalScope(goal, SELECTION_A),
+    expectedRevision: params.expectedRevision,
+    payloadDigest: canonicalDigest(params.payload),
+  };
 
   assert.deepEqual(
-    resolveReplay(goal.backend, id, digest),
+    resolveReplay(goal.backend, identity),
     { verdict: "novel" },
     "sanity: an unknown ID is novel",
   );
 
   const bound = (await runPeerOperation(goal, peer, params)).goal;
-  assert.equal(resolveReplay(bound.backend, id, digest).verdict, "identical");
-  assert.equal(resolveReplay(bound.backend, id, canonicalDigest({ other: true })).verdict, "conflict");
+  assert.equal(resolveReplay(bound.backend, identity).verdict, "identical");
+  assert.equal(
+    resolveReplay(bound.backend, { ...identity, payloadDigest: canonicalDigest({ other: true }) }).verdict,
+    "conflict",
+    "a different payload under the same id conflicts",
+  );
+  assert.equal(
+    resolveReplay(bound.backend, { ...identity, kind: "write" }).verdict,
+    "conflict",
+    "and so does a different kind, even with identical payload bytes",
+  );
+  assert.equal(
+    resolveReplay(bound.backend, { ...identity, scope: goalScope(goal, SELECTION_B) }).verdict,
+    "conflict",
+    "and so does a different branch selection",
+  );
 });
 
 // --- B06: partial-write boundaries ---------------------------------------
@@ -486,7 +512,13 @@ test("B04: branch movement does not attach a pending operation to a different br
   const late = acceptReceipt(moved, response, SELECTION_B);
   assert.equal(late.ok, false, "a late receipt matches no current intent on this branch");
   assert.equal(
-    resolveReplay(moved.backend, pendingId, canonicalDigest(begun.request.payload)).verdict,
+    resolveReplay(moved.backend, {
+      operationId: pendingId,
+      kind: begun.request.kind,
+      scope: begun.request.scope,
+      expectedRevision: begun.request.expectedRevision,
+      payloadDigest: canonicalDigest(begun.request.payload),
+    }).verdict,
     "quarantined",
     "and replaying it asks for a new operation ID rather than committing again",
   );
@@ -1210,4 +1242,265 @@ test("B21: a small configured budget produces a goal that can load itself", () =
   assert.ok(result.ok && result.goal, result.message);
   assert.equal(result.goal.execution.totalLimit, 5, "sanity: the configured total is honoured");
   assert.equal(isMultiGoal(result.goal), true, "a goal must be able to load itself");
+});
+
+// --- B23: the invariant, over the whole answer space ---------------------
+
+/**
+ * Three rounds of review have found the same defect behind three different
+ * doors: a peer answer that says nothing about the caller's operation being
+ * allowed to destroy it. Unknown error codes, then misdirected errors and
+ * pending answers, and now misdirected COMMITTED receipts, which still returned
+ * `refused` while the other two branches had been corrected.
+ *
+ * Patching the fourth door is not the fix. This asserts the invariant itself,
+ * generated over the answer space rather than over the branches anyone happens
+ * to have thought of:
+ *
+ *   an answer may reduce a pending intent to `quarantined` ONLY IF it
+ *   correlates to that intent AND its outcome is a terminal code.
+ *
+ * A fifth door fails here instead of in review.
+ */
+
+/** The terminal set, from docs/peer-protocol.md §4.4 — the contract, not the code. */
+const TERMINAL_REJECTIONS = new Set([
+  "stale-selection",
+  "stale-epoch",
+  "scope-conflict",
+  "replay-conflict",
+  "refused",
+]);
+
+const FOREIGN_OPERATION = "an-operation-this-caller-never-issued";
+
+interface Answer {
+  label: string;
+  response: any;
+  /** Does this answer say anything at all about the caller's operation? */
+  correlates: boolean;
+}
+
+/** Every shape a peer can answer with, correlated and misdirected. */
+function answerSpace(request: PeerRequest): Answer[] {
+  const receipt = (overrides: Record<string, unknown> = {}) => ({
+    protocolVersion: 1,
+    operationId: request.operationId,
+    scope: request.scope,
+    selectedRevision: "rev-9",
+    payloadDigest: canonicalDigest(request.payload),
+    committedAt: 1,
+    ...overrides,
+  });
+  const mutations: Array<[string, Record<string, unknown>]> = [
+    ["a valid receipt", {}],
+    ["another consumer's scope", { scope: { ...request.scope, consumer: "pi-research" } }],
+    ["another work scope", { scope: { ...request.scope, scopeId: "goal:other:stage:other" } }],
+    ["a spent execution epoch", { scope: { ...request.scope, epoch: request.scope.epoch + 1 } }],
+    [
+      "another branch selection",
+      { scope: { ...request.scope, selection: { sessionId: "session-a", branchAnchorId: "anchor-99" } } },
+    ],
+    ["another contract revision", { scope: { ...request.scope, contractRevision: "f".repeat(64) } }],
+    ["a different payload", { payloadDigest: canonicalDigest({ something: "else" }) }],
+    ["no durably selected revision", { selectedRevision: "" }],
+    ["an unreadable protocol version", { protocolVersion: 99 }],
+  ];
+
+  const answers: Answer[] = [];
+  for (const [label, overrides] of mutations) {
+    answers.push({ label: `committed, correlated, ${label}`, response: { status: "committed", receipt: receipt(overrides) }, correlates: true });
+    answers.push({
+      label: `committed, MISDIRECTED, ${label}`,
+      response: { status: "committed", receipt: receipt({ ...overrides, operationId: FOREIGN_OPERATION }) },
+      correlates: false,
+    });
+  }
+  answers.push({ label: "committed with no receipt at all", response: { status: "committed" }, correlates: false });
+
+  answers.push({
+    label: "pending, correlated",
+    response: { status: "pending", operationId: request.operationId, reason: "reference append not acknowledged" },
+    correlates: true,
+  });
+  answers.push({
+    label: "pending, MISDIRECTED",
+    response: { status: "pending", operationId: FOREIGN_OPERATION, reason: "reference append not acknowledged" },
+    correlates: false,
+  });
+
+  const codes = [
+    "unavailable",
+    "timeout",
+    "incompatible",
+    "stale-selection",
+    "stale-epoch",
+    "scope-conflict",
+    "replay-conflict",
+    "refused",
+    "a-code-from-a-future-version",
+  ];
+  for (const code of codes) {
+    answers.push({
+      label: `error ${code}, correlated`,
+      response: { status: "error", code, message: "no", operationId: request.operationId },
+      correlates: true,
+    });
+    answers.push({
+      label: `error ${code}, MISDIRECTED`,
+      response: { status: "error", code, message: "no", operationId: FOREIGN_OPERATION },
+      correlates: false,
+    });
+    // The id is optional on an error, so its absence is not a mismatch.
+    answers.push({
+      label: `error ${code}, no correlation id`,
+      response: { status: "error", code, message: "no" },
+      correlates: true,
+    });
+  }
+  return answers;
+}
+
+test("B23: no peer answer discards a pending intent unless it correlates and is terminal", async () => {
+  const peer = createFakePeer();
+  const bound = await bind(twoStepGoal(), peer);
+
+  const plan = () => {
+    const begun = beginOperation(
+      bound,
+      writeParams(bound, { revision: 1, proved: ["real work"], unresolved: [], next: "" }, "op-under-test"),
+    );
+    assert.ok(begun.ok);
+    return begun;
+  };
+  const planned = plan();
+  const space = answerSpace(planned.request);
+  assert.ok(space.length > 40, `sanity: the answer space is generated, not enumerated by branch (${space.length})`);
+
+  let quarantines = 0;
+  let misdirected = 0;
+  for (const answer of space) {
+    const before = plan().goal;
+    assert.ok(before.backend.pending, `sanity: there is an intent to protect (${answer.label})`);
+
+    const after = acceptReceipt(before, answer.response, SELECTION_A);
+    const discarded =
+      after.goal.backend.pending === null &&
+      after.goal.backend.operations.some(
+        (record) => record.operationId === "op-under-test" && record.outcome === "quarantined",
+      );
+
+    if (discarded) {
+      quarantines += 1;
+      const code = after.ok ? "(accepted)" : after.code;
+      assert.ok(
+        answer.correlates,
+        `an answer for another operation must not discard this one: ${answer.label}`,
+      );
+      assert.ok(
+        TERMINAL_REJECTIONS.has(code),
+        `a non-terminal outcome (${code}) must not discard the intent: ${answer.label}`,
+      );
+    }
+
+    if (!answer.correlates) {
+      misdirected += 1;
+      assert.ok(
+        after.goal.backend.pending !== null || after.ok,
+        `a misdirected answer must leave the intent recoverable: ${answer.label}`,
+      );
+      assert.equal(after.ok, false, `and must not be accepted as success: ${answer.label}`);
+    }
+  }
+
+  assert.ok(quarantines >= 5, `sanity: the space exercises the quarantine path (${quarantines} times)`);
+  assert.ok(misdirected >= 10, `sanity: the space exercises misdirection (${misdirected} answers)`);
+});
+
+// --- B24: replay identity is the whole intent ----------------------------
+
+/**
+ * Review finding (P1, src/backend.ts): retained operations were matched as
+ * `identical` on operation id and payload digest alone. Two operations that
+ * differ in kind, scope, selection, or expected revision can carry byte-equal
+ * payloads, so a caller reusing an id got the old receipt and skipped the peer
+ * — falsely acknowledging an operation that never happened.
+ *
+ * It matters more than a correctness nit because replay resolution runs BEFORE
+ * checkOperationLegality (deliberately, so recovery works after the state has
+ * moved on), which means a mis-matched replay bypasses the legality matrix
+ * entirely. §4 step 4 refuses a conflicting payload; a different kind or scope
+ * is a conflicting REQUEST even when the payload bytes match.
+ */
+test("B24: reusing an operation id for a different operation is a conflict", async () => {
+  const peer = createFakePeer();
+  const bound = await bind(twoStepGoal(), peer);
+  const id = "op-reused";
+  const payload = { memory: { revision: 1, proved: ["shared bytes"], unresolved: [], next: "" } };
+
+  const first = await runPeerOperation(bound, peer, {
+    operationId: id,
+    kind: "write",
+    expectedState: "bound-available",
+    payload,
+    selection: SELECTION_A,
+    expectedRevision: bound.backend.binding?.selectedRevision ?? null,
+  });
+  assert.equal(first.ok, true, first.ok ? "" : first.message);
+  const after = first.goal;
+  const selected = after.backend.binding?.selectedRevision ?? null;
+  const callsBefore = peer.calls.length;
+
+  const variants: Array<[string, Partial<OperationParams>]> = [
+    ["a different kind", { kind: "transition" }],
+    ["a different expected revision", { expectedRevision: "rev-from-another-time" }],
+    ["a different branch selection", { selection: SELECTION_B }],
+  ];
+
+  for (const [label, override] of variants) {
+    const attempt = await runPeerOperation(after, peer, {
+      operationId: id,
+      kind: "write",
+      expectedState: "bound-available",
+      payload,
+      selection: SELECTION_A,
+      expectedRevision: selected,
+      ...override,
+    });
+    assert.equal(attempt.ok, false, `a reused id with ${label} must not be acknowledged`);
+    assert.equal(
+      attempt.ok === false ? attempt.code : null,
+      "replay-conflict",
+      `and must be reported as a conflict: ${label}`,
+    );
+  }
+  assert.equal(peer.calls.length, callsBefore, "none of them reached the peer");
+  assert.equal(peer.commits, 2, "and nothing was committed a second time");
+});
+
+test("B24: a true replay of the same intent still returns its receipt", async () => {
+  // Regression preservation: idempotent recovery must keep working, including
+  // after the backend state has legitimately moved on.
+  const peer = createFakePeer();
+  const bound = await bind(twoStepGoal(), peer);
+  const params: OperationParams = {
+    operationId: "op-identical",
+    kind: "write",
+    expectedState: "bound-available",
+    payload: { memory: { revision: 1, proved: ["x"], unresolved: [], next: "" } },
+    selection: SELECTION_A,
+    expectedRevision: bound.backend.binding?.selectedRevision ?? null,
+  };
+
+  const first = await runPeerOperation(bound, peer, params);
+  assert.equal(first.ok, true, first.ok ? "" : first.message);
+  const callsBefore = peer.calls.length;
+
+  const replayed = await runPeerOperation(first.goal, peer, params);
+  assert.equal(replayed.ok, true, replayed.ok ? "" : replayed.message);
+  assert.ok(replayed.ok);
+  assert.equal(replayed.replayed, true, "recognised as a replay");
+  assert.deepEqual(replayed.receipt, first.ok ? first.receipt : null, "the same receipt comes back");
+  assert.equal(peer.calls.length, callsBefore, "without a peer round trip");
+  assert.equal(peer.commits, 2, "and without a second commit");
 });
