@@ -1,3 +1,4 @@
+import { creditKeyDigest } from "./evidence.js";
 import { cloneGoal } from "./state.js";
 import {
   BUDGET_WARNING_FRACTION,
@@ -159,17 +160,22 @@ export interface CreditOutcome {
  * edit/write/apply_patch names alone never reach this function.
  */
 export function creditVerifiedEvidence(goal: MultiGoal, keys: string[]): CreditOutcome {
-  const already = new Set(goal.execution.creditedEvidence ?? []);
-  const fresh = [...new Set(keys)].filter((key) => !already.has(key));
+  const already = new Set(goal.creditedEvidence ?? []);
+  const unique = [...new Set(keys)];
+  const fresh = unique.filter((key) => !already.has(creditKeyDigest(key)));
   if (fresh.length === 0) {
     return { goal, creditedKeys: [] };
   }
   const next = cloneGoal(goal);
-  const credited = [...(next.execution.creditedEvidence ?? []), ...fresh];
+  const credited = [...(next.creditedEvidence ?? []), ...fresh.map(creditKeyDigest)];
   const renewed = next.execution.totalRemaining + next.execution.evidenceGrant * fresh.length;
+  // The dedupe record lives on the goal, not the execution grant: a step
+  // transition resets the budgets but must NOT forget what was already paid
+  // for. Re-submitting a step-1 artifact against a step-2 criterion is not new
+  // work, and with D4 in place it would otherwise buy another grant.
+  next.creditedEvidence = credited.slice(-MAX_CREDITED_EVIDENCE);
   next.execution = {
     ...next.execution,
-    creditedEvidence: credited.slice(-MAX_CREDITED_EVIDENCE),
     noProgressRemaining: next.execution.noProgressLimit,
     turnRequests: 0,
     totalRemaining: Math.min(next.execution.totalLimit, renewed),

@@ -27,8 +27,21 @@ export const DEFAULT_EVIDENCE_GRANT = 50;
 export const DEFAULT_LIFETIME_CEILING = 1000;
 /** Consumed fraction of any one budget before the footer starts showing it. */
 export const BUDGET_WARNING_FRACTION = 0.8;
-/** Maximum credited-evidence dedupe keys kept on one execution grant. */
-export const MAX_CREDITED_EVIDENCE = 64;
+/**
+ * Maximum credited-evidence dedupe keys remembered for one goal.
+ *
+ * This is a security bound, not a display bound. A credit renews the working
+ * request budget by `evidenceGrant` (D4), so any key that ages out of this
+ * record buys another grant for an artifact that has not changed and cost no
+ * new work. Keys are stored as short digests (see `creditKeyDigest`) so the
+ * record can be large enough that eviction is not reachable in a real step,
+ * and the lifetime ceiling remains the backstop if it ever were.
+ */
+export const MAX_CREDITED_EVIDENCE = 4096;
+
+/** Hex characters of the stored dedupe digest. */
+export const CREDIT_DIGEST_HEX_CHARS = 16;
+
 /**
  * Durable operation receipts kept per stage. Retention only has to cover the
  * lifetime in which an operation can be retried (GOAL_WITH_DAG_SUPPORT §4), and
@@ -104,8 +117,6 @@ export interface GoalExecution {
   /** Unrenewable hard stop for `lifetimeRequests`. */
   lifetimeCeiling: number;
   tokenUsage: number | null;
-  /** Dedupe keys of evidence refs that already received progress credit. */
-  creditedEvidence: string[];
 }
 
 /**
@@ -220,6 +231,14 @@ export interface MultiGoal {
    * the wrong contract. See `computeContractRevision`.
    */
   contractRevision: string;
+  /**
+   * Digests of evidence refs that already received progress credit, for the
+   * lifetime of this goal. Deliberately NOT on the execution grant: a step
+   * transition resets budgets, and forgetting what was already paid for would
+   * let a step-1 artifact be re-submitted against a step-2 criterion for
+   * another grant, with no new work done.
+   */
+  creditedEvidence: string[];
   createdAt: number;
   updatedAt: number;
   memory: GoalMemory;
