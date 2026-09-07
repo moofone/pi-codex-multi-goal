@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 
+import { computeContractRevision } from "./contract.js";
 import { parseStageTitles, validateSteps, validateTitles } from "./parse.js";
 import {
   CUSTOM_ENTRY_TYPE,
@@ -88,11 +89,29 @@ function normalizeExecution(execution: GoalExecution): GoalExecution {
   };
 }
 
+/**
+ * The current step's contract revision, recomputed from the criteria. Every
+ * goal that enters memory goes through cloneGoal, so recomputing here is what
+ * keeps the field from ever drifting from the contract it identifies — an
+ * older snapshot that predates the field gets one, and a stale or tampered
+ * stored value is overwritten by the truth.
+ */
+function currentContractRevision(goal: Omit<MultiGoal, "contractRevision">): string {
+  const stage = goal.stages[goal.index];
+  return stage ? computeContractRevision(stage) : "";
+}
+
+/** Stamp a freshly constructed goal with the identity of its current contract. */
+function sealGoal(goal: Omit<MultiGoal, "contractRevision">): MultiGoal {
+  return { ...goal, contractRevision: currentContractRevision(goal) };
+}
+
 export function cloneGoal(goal: MultiGoal): MultiGoal {
   return {
     goalId: goal.goalId,
     status: goal.status,
     index: goal.index,
+    contractRevision: currentContractRevision(goal),
     createdAt: goal.createdAt,
     updatedAt: goal.updatedAt,
     isolationCutoff: goal.isolationCutoff ?? null,
@@ -125,7 +144,7 @@ export function currentStage(goal: MultiGoal): Stage {
  * nonempty human criteria.
  */
 export function createGoal(titles: string[], now = unixSeconds()): MultiGoal {
-  return {
+  return sealGoal({
     goalId: randomUUID(),
     status: "active",
     index: 0,
@@ -141,7 +160,7 @@ export function createGoal(titles: string[], now = unixSeconds()): MultiGoal {
       status: index === 0 ? "active" : "pending",
       criteria: [{ id: randomUUID(), text: title }],
     })),
-  };
+  });
 }
 
 function createGoalFromSteps(
@@ -149,7 +168,7 @@ function createGoalFromSteps(
   now = unixSeconds(),
   limits?: { noProgressLimit: number; totalLimit: number },
 ): MultiGoal {
-  return {
+  return sealGoal({
     goalId: randomUUID(),
     status: "active",
     index: 0,
@@ -165,7 +184,7 @@ function createGoalFromSteps(
       status: index === 0 ? "active" : "pending",
       criteria: step.criteria.map((text) => ({ id: randomUUID(), text })),
     })),
-  };
+  });
 }
 
 export function replaceGoalFromSteps(
@@ -223,6 +242,9 @@ export function completeCurrentStage(current: MultiGoal | null, now = unixSecond
 
   next.index += 1;
   next.stages[next.index] = { ...next.stages[next.index]!, status: "active" };
+  // The step moved, so the contract in force moved with it. cloneGoal stamped
+  // the OLD step's revision above; restamp before anyone can read it.
+  next.contractRevision = currentContractRevision(next);
   return {
     ok: true,
     message: `Stage ${next.index + 1}/${next.stages.length} active.`,
@@ -618,7 +640,7 @@ function isV1ClearEntry(data: unknown): data is { kind: "clear" } {
  */
 export function migrateV1Goal(v1: V1GoalShape): MultiGoal {
   const complete = v1.status === "complete";
-  return {
+  return sealGoal({
     goalId: v1.goalId,
     status: complete ? "complete" : "paused",
     index: v1.index,
@@ -634,7 +656,7 @@ export function migrateV1Goal(v1: V1GoalShape): MultiGoal {
       status: stage.status,
       criteria: [],
     })),
-  };
+  });
 }
 
 export function reconstructGoal(entries: Iterable<SessionEntryLike>): MultiGoal | null {

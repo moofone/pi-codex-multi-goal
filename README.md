@@ -50,6 +50,18 @@ Missing or empty `criteria` refuse to start. In the TUI, leaving the criteria
 blank means "the objective is the sole criterion" and still requires an explicit
 contract confirm.
 
+### Contract identity
+
+Every persisted goal snapshot carries a `contractRevision`: the sha256 of the
+current step's objective, its ordered criterion IDs and text, and its
+human-decision flags. It gives a peer extension a stable name for "the contract
+in force right now" without re-reading the criteria, and a step transition
+necessarily changes it.
+
+It is derived, never authored. It is recomputed from the criteria on every load,
+so a stale or tampered stored value is corrected rather than trusted, and a
+snapshot written before the field existed gets one.
+
 ## Model-facing tools
 
 - `update_goal { goalId, step, generation, status: "complete" | "blocked", evidence? }`
