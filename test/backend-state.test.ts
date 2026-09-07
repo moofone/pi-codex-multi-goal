@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
 
-import { backendAdmitsExecution } from "../src/backend.ts";
+import { backendAdmitsExecution, isGoalBackend } from "../src/backend.ts";
 import { registerMultiGoal } from "../src/runtime.ts";
 import { cloneGoal, createGoal, reconstructGoal, replaceGoalFromSteps, setEntry } from "../src/state.ts";
 import { CUSTOM_ENTRY_TYPE, type GoalBackend, type MultiGoal } from "../src/types.ts";
@@ -90,7 +90,20 @@ test("B10: a bound backend survives a reload intact", () => {
         kind: "bind",
         payloadDigest: "a".repeat(64),
         outcome: "committed",
-        receipt: null,
+        receipt: {
+          protocolVersion: 1,
+          operationId: "op-1",
+          scope: {
+            consumer: "pi-codex-multi-goal",
+            scopeId: `goal:${goal.goalId}:stage:${goal.stages[0]!.id}`,
+            contractRevision: goal.contractRevision,
+            epoch: 0,
+            selection: { sessionId: "session-a", branchAnchorId: "anchor-1" },
+          },
+          selectedRevision: "rev-3",
+          payloadDigest: "a".repeat(64),
+          committedAt: 1,
+        },
         reason: null,
       },
     ],
@@ -268,22 +281,50 @@ test("B01: an unbound goal with a foreign checkpoint on its branch keeps working
   assert.equal(charged.execution.noProgressRemaining, executionBefore.noProgressRemaining);
 });
 
+/**
+ * A seeded snapshot in one of the bound states, built the way the state machine
+ * actually builds it: a bound state carries its binding and no bind intent, and
+ * `binding-pending` carries the bind intent that is switching authority and no
+ * binding yet.
+ */
 function boundSnapshot(state: GoalBackend["state"], reason: string | null): unknown {
   const goal = createGoal(["first", "second"]);
+  const scope = {
+    consumer: "pi-codex-multi-goal",
+    scopeId: `goal:${goal.goalId}:stage:${goal.stages[0]!.id}`,
+    contractRevision: goal.contractRevision,
+    epoch: 0,
+    selection: { sessionId: "backend-session", branchAnchorId: "anchor-1" },
+  };
+  const switching = state === "binding-pending";
   const backend: GoalBackend = {
     state,
-    binding: {
-      peerId: "fake-dag-peer",
-      taskId: "task-1",
-      goalId: goal.goalId,
-      stageId: goal.stages[0]!.id,
-      generation: 0,
-      contractRevision: goal.contractRevision,
-      sessionId: "backend-session",
-      branchAnchorId: "anchor-1",
-      selectedRevision: "rev-3",
-    },
-    pending: null,
+    binding: switching
+      ? null
+      : {
+          peerId: "fake-dag-peer",
+          taskId: "task-1",
+          goalId: goal.goalId,
+          stageId: goal.stages[0]!.id,
+          generation: 0,
+          contractRevision: goal.contractRevision,
+          sessionId: "backend-session",
+          branchAnchorId: "anchor-1",
+          selectedRevision: "rev-3",
+        },
+    pending: switching
+      ? {
+          operationId: "op-bind",
+          kind: "bind",
+          expectedState: "bound-available",
+          previousState: "unbound",
+          scope,
+          expectedRevision: null,
+          payloadDigest: "b".repeat(64),
+          payload: { contract: {}, memory: null },
+          createdAt: 1,
+        }
+      : null,
     operations: [],
     reason,
   };
@@ -431,4 +472,277 @@ test("B11: a bound goal that completes stage 1 can still run stage 2, user-reach
   assert.match(status, /Backend: unbound/);
   assert.match(status, /ended with that stage/);
   assert.match(status, /fake-dag-peer/, "and which peer it was bound to");
+});
+
+/**
+ * B15/B16 (review findings, P1): the validator checked a field's shape when it
+ * was PRESENT but never checked that a state's REQUIRED fields were there. So
+ * the state machine's invariants could be entered from disk without ever
+ * passing the guard that enforces them — `bound-available` with no binding,
+ * `binding-pending` with no intent, a `committed` retained record with no
+ * receipt for `resolveReplay` to bless as `identical`.
+ *
+ * The rule this repo already adopted applies: a malformed backend record makes
+ * the whole snapshot malformed rather than being repaired, so a corrupt record
+ * cannot be laundered into authority. These cases are that rule enforced
+ * thoroughly: each state declares what it requires AND what it forbids.
+ */
+
+const SCOPE = {
+  consumer: "pi-codex-multi-goal",
+  scopeId: "goal:g-1:stage:s-1",
+  contractRevision: "c".repeat(64),
+  epoch: 0,
+  selection: { sessionId: "session-a", branchAnchorId: "anchor-1" },
+};
+
+const DIGEST = "d".repeat(64);
+
+function binding(overrides: Partial<GoalBackend["binding"] & object> = {}): any {
+  return {
+    peerId: "fake-dag-peer",
+    taskId: "task-1",
+    goalId: "g-1",
+    stageId: "s-1",
+    generation: 0,
+    contractRevision: "c".repeat(64),
+    sessionId: "session-a",
+    branchAnchorId: "anchor-1",
+    selectedRevision: "rev-3",
+    ...overrides,
+  };
+}
+
+function pendingOp(overrides: Record<string, unknown> = {}): any {
+  return {
+    operationId: "op-pending",
+    kind: "bind",
+    expectedState: "bound-available",
+    previousState: "unbound",
+    scope: SCOPE,
+    expectedRevision: null,
+    payloadDigest: DIGEST,
+    payload: { contract: {}, memory: null },
+    createdAt: 1,
+    ...overrides,
+  };
+}
+
+function receipt(overrides: Record<string, unknown> = {}): any {
+  return {
+    protocolVersion: 1,
+    operationId: "op-done",
+    scope: SCOPE,
+    selectedRevision: "rev-3",
+    payloadDigest: DIGEST,
+    committedAt: 1,
+    ...overrides,
+  };
+}
+
+function committedRecord(overrides: Record<string, unknown> = {}): any {
+  return {
+    operationId: "op-done",
+    kind: "bind",
+    payloadDigest: DIGEST,
+    outcome: "committed",
+    receipt: receipt(),
+    reason: null,
+    ...overrides,
+  };
+}
+
+function quarantinedRecord(overrides: Record<string, unknown> = {}): any {
+  return {
+    operationId: "op-gone",
+    kind: "write",
+    payloadDigest: DIGEST,
+    outcome: "quarantined",
+    receipt: null,
+    reason: "the branch moved",
+    ...overrides,
+  };
+}
+
+function backend(overrides: Record<string, unknown> = {}): any {
+  return { state: "unbound", binding: null, pending: null, operations: [], reason: null, ...overrides };
+}
+
+test("B15: a backend that contradicts its own state is malformed", () => {
+  const cases: Array<[string, any]> = [
+    // A state that claims authority must show what grants it.
+    ["bound-available with no binding", backend({ state: "bound-available" })],
+    [
+      "bound-available whose binding selected nothing",
+      backend({ state: "bound-available", binding: binding({ selectedRevision: null }) }),
+    ],
+    [
+      "bound-available whose selected revision is empty",
+      backend({ state: "bound-available", binding: binding({ selectedRevision: "" }) }),
+    ],
+    ["bound-unavailable with no binding", backend({ state: "bound-unavailable" })],
+    // A state that claims no authority must not carry one.
+    ["unbound carrying a binding", backend({ binding: binding() })],
+    ["detached carrying a binding", backend({ state: "detached", binding: binding() })],
+    // An intent implies a switch in progress, and only a bind switches authority.
+    ["unbound carrying a pending intent", backend({ pending: pendingOp() })],
+    ["detached carrying a pending intent", backend({ state: "detached", pending: pendingOp() })],
+    ["binding-pending with no pending intent", backend({ state: "binding-pending" })],
+    [
+      "binding-pending whose intent is not a bind",
+      backend({
+        state: "binding-pending",
+        pending: pendingOp({ kind: "write", expectedRevision: "rev-3", previousState: "bound-available" }),
+      }),
+    ],
+    [
+      "a bind intent outside binding-pending",
+      backend({
+        state: "bound-available",
+        binding: binding(),
+        pending: pendingOp({ kind: "bind" }),
+      }),
+    ],
+    // The field acceptReceipt promotes on must be reachable by the kind.
+    [
+      "an intent whose expected state its kind cannot reach",
+      backend({
+        state: "bound-available",
+        binding: binding(),
+        pending: pendingOp({ kind: "write", expectedState: "detached", expectedRevision: "rev-3" }),
+      }),
+    ],
+    // A state with no authority cannot hold a committed operation to replay.
+    ["unbound holding a committed operation", backend({ operations: [committedRecord()] })],
+  ];
+
+  for (const [label, value] of cases) {
+    assert.equal(isGoalBackend(value), false, `must be rejected: ${label}`);
+  }
+});
+
+test("B16: a retained record must carry what its outcome claims", () => {
+  const bound = (operations: any[]) =>
+    backend({ state: "bound-available", binding: binding(), operations });
+
+  const cases: Array<[string, any]> = [
+    ["committed with no receipt", bound([committedRecord({ receipt: null })])],
+    ["committed with a missing receipt field", bound([committedRecord({ receipt: undefined })])],
+    ["committed with a malformed receipt", bound([committedRecord({ receipt: { nonsense: true } })])],
+    [
+      "committed whose receipt answers another operation",
+      bound([committedRecord({ receipt: receipt({ operationId: "op-somebody-else" }) })]),
+    ],
+    [
+      "committed whose receipt digest disagrees with the record",
+      bound([committedRecord({ receipt: receipt({ payloadDigest: "e".repeat(64) }) })]),
+    ],
+    [
+      "committed whose receipt selected nothing",
+      bound([committedRecord({ receipt: receipt({ selectedRevision: "" }) })]),
+    ],
+    [
+      "committed whose receipt is from another protocol version",
+      bound([committedRecord({ receipt: receipt({ protocolVersion: 99 }) })]),
+    ],
+    ["quarantined carrying a receipt", bound([quarantinedRecord({ receipt: receipt() })])],
+    ["quarantined with no reason", bound([quarantinedRecord({ reason: null })])],
+    [
+      "the same operation id retained twice",
+      bound([committedRecord(), quarantinedRecord({ operationId: "op-done" })]),
+    ],
+    [
+      "an id that is both pending and retained",
+      backend({
+        state: "binding-pending",
+        pending: pendingOp({ operationId: "op-done" }),
+        operations: [committedRecord()],
+      }),
+    ],
+  ];
+
+  for (const [label, value] of cases) {
+    assert.equal(isGoalBackend(value), false, `must be rejected: ${label}`);
+  }
+});
+
+test("B15/B16: the arrangements the state machine actually produces still load", () => {
+  const valid: Array<[string, any]> = [
+    ["a fresh unbound backend", backend()],
+    ["unbound after a bind was abandoned", backend({ operations: [quarantinedRecord()], reason: "abandoned" })],
+    ["a bind in flight", backend({ state: "binding-pending", pending: pendingOp() })],
+    ["a live binding", backend({ state: "bound-available", binding: binding(), operations: [committedRecord()] })],
+    [
+      "a write in flight against a live binding",
+      backend({
+        state: "bound-available",
+        binding: binding(),
+        pending: pendingOp({
+          operationId: "op-write",
+          kind: "write",
+          previousState: "bound-available",
+          expectedRevision: "rev-3",
+        }),
+        operations: [committedRecord()],
+      }),
+    ],
+    [
+      "a bound backend that stopped answering",
+      backend({ state: "bound-unavailable", binding: binding(), reason: "the peer was unloaded" }),
+    ],
+    ["a detached backend", backend({ state: "detached", operations: [committedRecord({ kind: "detach" })] })],
+  ];
+
+  for (const [label, value] of valid) {
+    assert.equal(isGoalBackend(value), true, `must be accepted: ${label}`);
+  }
+});
+
+test("B15: a snapshot cannot assert bound-available from disk without a bind behind it", () => {
+  // The route the recurring beginOperation finding actually describes: not a
+  // call that skips the guard, but a snapshot that asserts the state the guard
+  // exists to protect. reconstructGoal keeps the last VALID snapshot.
+  const goal = twoStepGoal();
+  const honest = setEntry(goal, "runtime");
+  const forged = JSON.parse(JSON.stringify(setEntry(goal, "runtime")));
+  forged.goal.backend = {
+    state: "bound-available",
+    binding: null,
+    pending: null,
+    operations: [],
+    reason: null,
+  };
+
+  const reloaded = reconstructGoal([
+    { type: "custom", customType: CUSTOM_ENTRY_TYPE, data: honest },
+    { type: "custom", customType: CUSTOM_ENTRY_TYPE, data: forged },
+  ]);
+
+  assert.ok(reloaded, "the last valid snapshot is kept");
+  assert.equal(reloaded.backend.state, "unbound", "the forged authority was skipped, not adopted");
+  assert.equal(reloaded.backend.binding, null);
+});
+
+test("B16: a committed record with no receipt cannot be loaded and replayed as success", () => {
+  const goal = twoStepGoal();
+  const honest = setEntry(goal, "runtime");
+  const forged = JSON.parse(JSON.stringify(setEntry(goal, "runtime")));
+  forged.goal.backend = {
+    state: "bound-available",
+    binding: binding({ goalId: goal.goalId, stageId: goal.stages[0]!.id }),
+    pending: null,
+    // resolveReplay would call this `identical` and hand back a null receipt as
+    // success, without ever contacting the peer.
+    operations: [committedRecord({ receipt: null })],
+    reason: null,
+  };
+
+  const reloaded = reconstructGoal([
+    { type: "custom", customType: CUSTOM_ENTRY_TYPE, data: honest },
+    { type: "custom", customType: CUSTOM_ENTRY_TYPE, data: forged },
+  ]);
+
+  assert.ok(reloaded);
+  assert.equal(reloaded.backend.state, "unbound", "the receiptless commit was skipped");
+  assert.deepEqual(reloaded.backend.operations, []);
 });

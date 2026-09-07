@@ -302,7 +302,7 @@ The five persisted states of §3's table. `MultiGoal.backend.state`:
 | `binding-pending` | The intended migration is persisted and Goal-owned execution is withheld during the switch. Goal-only memory writes are refused, so two writable authorities are never exposed |
 | `bound-available` | The peer is the sole working-memory authority. Goal reads a revision-tagged projection and writes through the adapter. Any retained Goal blob is a read-only, revision-tagged cache |
 | `bound-unavailable` | The binding, the memory pointers and the allowances are preserved. Goal-owned execution is paused with a visible reason. The old blob is not resurrected and completion requirements are not weakened (invariant 8) |
-| `detached` | Goal-only mode, entered only after a validated export of the selected current-stage projection and a persisted backend switch. If the export cannot fit the 8 KiB record without losing required continuity, the switch stays pending and reports why; it is never silently truncated |
+| `detached` | Goal-only mode, entered only after a validated export of the selected current-stage projection and a persisted backend switch. The binding is RELEASED, not kept as a decoration — a binding in a state that disclaims authority is a contradiction — and its provenance moves to `reason`. If the export cannot fit the 8 KiB record without losing required continuity, the switch stays pending and reports why; it is never silently truncated |
 
 Optional means the peer is not required to *start* an unbound goal. It does not
 mean an authoritative backend may disappear without recovery: an explicit
@@ -344,6 +344,48 @@ on it because no intent would exist, and the goal would be wedged with no
 user-reachable exit. Task 5.3 replaces this rule with the durable transition
 operation that archives the old stage and installs the next stage's protected
 contract in one scoped mutation, and carries the binding across as part of it.
+
+### 6.2 Snapshot consistency
+
+§6.1 governs operations. It is not enough on its own, because a persisted
+snapshot **asserts** a state rather than reaching it through an operation: a
+backend loaded from disk enters the state machine's invariants without passing
+the guard that enforces them. So a snapshot must satisfy its own state, and one
+that does not is malformed — the whole snapshot, not a field to be repaired, so
+that a corrupt record can never be laundered into authority. Reconstruction
+keeps the last valid snapshot when it skips one.
+
+| State | Requires | Forbids |
+|---|---|---|
+| `unbound` | — | a binding; a pending intent; any `committed` retained record |
+| `binding-pending` | a pending intent whose kind is `bind` | a binding |
+| `bound-available` | a binding with a non-empty `selectedRevision` | a pending intent whose kind is `bind` |
+| `bound-unavailable` | a binding with a non-empty `selectedRevision` | a pending intent whose kind is `bind` |
+| `detached` | — | a binding; a pending intent |
+
+Read as two biconditionals: **a binding exists exactly when the state is
+`bound-available` or `bound-unavailable`**, and **a pending `bind` intent exists
+exactly when the state is `binding-pending`**. Only a bind switches authority,
+and planning one moves the state with it, so the two imply each other.
+
+Retained operation records:
+
+| Outcome | Requires | Forbids |
+|---|---|---|
+| `committed` | a complete receipt: this protocol version, the record's own `operationId`, a valid scope, a non-empty `selectedRevision`, and a `payloadDigest` equal to the record's | — |
+| `quarantined` | a `reason` | a receipt |
+
+A `committed` record is what answers an identical replay **without contacting
+the peer**, so an incomplete one would let a replay return success out of
+nothing. A `quarantined` record exists to refuse a late receipt and to tell the
+user why, so it must carry a reason and must not carry proof of a commit.
+
+Operation IDs are unique across the retained list, and a pending intent's ID may
+not also appear in it: otherwise replay resolution would depend on list order,
+which is not an identity. Payload digests are sha256 hex.
+
+A pending intent's `expectedState` must be the state its kind can reach (§6.1),
+because that field is what the acknowledgement promotes on.
 
 ### 6.1 Operation legality
 

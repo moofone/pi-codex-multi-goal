@@ -903,3 +903,34 @@ test("B14: failOperation treats an unrecognised code as retryable, never termina
   assert.ok(after.backend.pending, "an unrecognised code must never permanently discard a retryable intent");
   assert.deepEqual(after.backend.operations.filter((r) => r.outcome === "quarantined"), []);
 });
+
+test("B15: a really detached goal survives a reload", async () => {
+  // Regression preservation for the state-consistency validator: the snapshot
+  // the detach path actually writes must still load.
+  const peer = createFakePeer();
+  const goal = twoStepGoal();
+  let bound = await bind(goal, peer);
+  const written = await runPeerOperation(
+    bound,
+    peer,
+    writeParams(bound, { revision: 1, proved: ["kept"], unresolved: [], next: "onward" }),
+  );
+  assert.equal(written.ok, true, written.ok ? "" : written.message);
+  bound = written.goal;
+
+  const detached = await runPeerOperation(bound, peer, {
+    operationId: operationId("detach"),
+    kind: "detach",
+    expectedState: "detached",
+    payload: { profile: "current-scope@1" },
+    selection: SELECTION_A,
+    expectedRevision: bound.backend.binding?.selectedRevision ?? null,
+  });
+  assert.equal(detached.ok, true, detached.ok ? "" : detached.message);
+  assert.equal(detached.goal.backend.state, "detached", "sanity: it detached");
+
+  const reloaded = reload(detached.goal);
+  assert.equal(reloaded.backend.state, "detached", "a detached snapshot is not skipped as malformed");
+  assert.equal(goalOwnsMemory(reloaded.backend), true);
+  assert.deepEqual(reloaded.memory.proved, ["kept"], "and the exported record survives the round trip");
+});

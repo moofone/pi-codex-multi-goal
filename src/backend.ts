@@ -109,12 +109,114 @@ function isScope(value: unknown): boolean {
   );
 }
 
+const DIGEST_PATTERN = /^[0-9a-f]{64}$/;
+
+function isBinding(value: unknown): boolean {
+  if (!value || typeof value !== "object") {
+    return false;
+  }
+  const binding = value as GoalBackend["binding"] & object;
+  return (
+    typeof binding.peerId === "string" &&
+    typeof binding.taskId === "string" &&
+    typeof binding.goalId === "string" &&
+    typeof binding.stageId === "string" &&
+    Number.isInteger(binding.generation) &&
+    typeof binding.contractRevision === "string" &&
+    typeof binding.sessionId === "string" &&
+    typeof binding.branchAnchorId === "string" &&
+    (binding.selectedRevision === null || typeof binding.selectedRevision === "string")
+  );
+}
+
+function isPendingOperation(value: unknown): value is PendingOperation {
+  if (!value || typeof value !== "object") {
+    return false;
+  }
+  const pending = value as PendingOperation;
+  return (
+    typeof pending.operationId === "string" &&
+    pending.operationId.length > 0 &&
+    OPERATION_KINDS.includes(pending.kind) &&
+    pending.kind !== "read" &&
+    BACKEND_STATES.includes(pending.expectedState) &&
+    BACKEND_STATES.includes(pending.previousState) &&
+    isScope(pending.scope) &&
+    (pending.expectedRevision === null || typeof pending.expectedRevision === "string") &&
+    DIGEST_PATTERN.test(pending.payloadDigest) &&
+    typeof pending.createdAt === "number" &&
+    // The field acceptReceipt promotes on must be one this kind can reach, or a
+    // persisted intent could take a branch its operation never earned.
+    pending.expectedState === REACHABLE_STATE[pending.kind]
+  );
+}
+
 /**
- * Snapshot validation. A malformed backend record makes the whole snapshot
- * malformed rather than being repaired into `unbound`: invariant 8 says
- * previously authoritative but unreadable backend state cannot silently
- * downgrade to stale Goal memory, and reconstructGoal keeps the last VALID
- * branch snapshot when it skips one.
+ * A receipt is only proof of a commit if it is complete. A retained record that
+ * says `committed` is what answers an identical replay WITHOUT contacting the
+ * peer, so a record whose receipt is missing, malformed, or about some other
+ * operation would let a replay return success out of nothing.
+ */
+function isCompleteReceipt(value: unknown, record: RetainedOperation): boolean {
+  if (!value || typeof value !== "object") {
+    return false;
+  }
+  const receipt = value as PeerReceipt;
+  return (
+    receipt.protocolVersion === PEER_PROTOCOL_VERSION &&
+    receipt.operationId === record.operationId &&
+    isScope(receipt.scope) &&
+    typeof receipt.selectedRevision === "string" &&
+    receipt.selectedRevision.length > 0 &&
+    receipt.payloadDigest === record.payloadDigest &&
+    typeof receipt.committedAt === "number"
+  );
+}
+
+function isRetainedOperation(value: unknown): value is RetainedOperation {
+  if (!value || typeof value !== "object") {
+    return false;
+  }
+  const record = value as RetainedOperation;
+  if (
+    typeof record.operationId !== "string" ||
+    record.operationId.length === 0 ||
+    !OPERATION_KINDS.includes(record.kind) ||
+    !DIGEST_PATTERN.test(record.payloadDigest)
+  ) {
+    return false;
+  }
+  if (record.outcome === "committed") {
+    return isCompleteReceipt(record.receipt, record);
+  }
+  if (record.outcome === "quarantined") {
+    // No receipt, and a reason — a quarantined operation that cannot say why is
+    // one the user can never be told about.
+    return (
+      (record.receipt === null || record.receipt === undefined) && typeof record.reason === "string"
+    );
+  }
+  return false;
+}
+
+/**
+ * Snapshot validation, state by state.
+ *
+ * A malformed backend record makes the whole snapshot malformed rather than
+ * being repaired: invariant 8 says previously authoritative but unreadable
+ * backend state cannot silently downgrade to stale Goal memory, and
+ * reconstructGoal keeps the last VALID branch snapshot when it skips one.
+ *
+ * Checking each field's SHAPE when present is not enough. The state machine's
+ * invariants are enforced by checkOperationLegality on the way in, but a
+ * snapshot asserts a state directly — so a backend that does not satisfy its
+ * own state would enter those invariants from disk without ever passing the
+ * guard. `bound-available` with no binding would admit execution with no
+ * authoritative memory source behind it; `binding-pending` with no intent would
+ * withhold execution forever; a `committed` record with no receipt would let
+ * resolveReplay answer a replay with success out of nothing. So each state
+ * declares what it REQUIRES and what it FORBIDS, and anything else is
+ * malformed.
  */
 export function isGoalBackend(value: unknown): value is GoalBackend {
   if (!value || typeof value !== "object") {
@@ -127,50 +229,65 @@ export function isGoalBackend(value: unknown): value is GoalBackend {
   if (!(backend.reason === null || backend.reason === undefined || typeof backend.reason === "string")) {
     return false;
   }
-  const binding = backend.binding;
-  if (binding !== null && binding !== undefined) {
-    if (
-      typeof binding.peerId !== "string" ||
-      typeof binding.taskId !== "string" ||
-      typeof binding.goalId !== "string" ||
-      typeof binding.stageId !== "string" ||
-      !Number.isInteger(binding.generation) ||
-      typeof binding.contractRevision !== "string" ||
-      typeof binding.sessionId !== "string" ||
-      typeof binding.branchAnchorId !== "string" ||
-      !(binding.selectedRevision === null || typeof binding.selectedRevision === "string")
-    ) {
-      return false;
-    }
+
+  const binding = backend.binding ?? null;
+  if (binding !== null && !isBinding(binding)) {
+    return false;
   }
-  const pending = backend.pending;
-  if (pending !== null && pending !== undefined) {
-    if (
-      typeof pending.operationId !== "string" ||
-      !OPERATION_KINDS.includes(pending.kind) ||
-      !BACKEND_STATES.includes(pending.expectedState) ||
-      !BACKEND_STATES.includes(pending.previousState) ||
-      !isScope(pending.scope) ||
-      !(pending.expectedRevision === null || typeof pending.expectedRevision === "string") ||
-      typeof pending.payloadDigest !== "string" ||
-      typeof pending.createdAt !== "number"
-    ) {
-      return false;
-    }
+  const pending = backend.pending ?? null;
+  if (pending !== null && !isPendingOperation(pending)) {
+    return false;
   }
   const operations = backend.operations;
   if (!Array.isArray(operations) || operations.length > MAX_RETAINED_OPERATIONS) {
     return false;
   }
-  return operations.every(
-    (record) =>
-      !!record &&
-      typeof record === "object" &&
-      typeof record.operationId === "string" &&
-      OPERATION_KINDS.includes(record.kind) &&
-      typeof record.payloadDigest === "string" &&
-      (record.outcome === "committed" || record.outcome === "quarantined"),
-  );
+  if (!operations.every(isRetainedOperation)) {
+    return false;
+  }
+
+  // One operation ID names one operation. A duplicate — or an ID that is both
+  // pending and retained — would make resolveReplay's answer depend on list
+  // order, which is not an identity.
+  const ids = new Set(operations.map((record) => record.operationId));
+  if (ids.size !== operations.length) {
+    return false;
+  }
+  if (pending && ids.has(pending.operationId)) {
+    return false;
+  }
+
+  // A binding exists exactly when the backend claims a peer holds the working
+  // memory. Anything else is a contradiction: authority with nothing granting
+  // it, or a grant in a state that disclaims authority.
+  const claimsAuthority = backend.state === "bound-available" || backend.state === "bound-unavailable";
+  if (claimsAuthority !== (binding !== null)) {
+    return false;
+  }
+  if (claimsAuthority && !(typeof binding!.selectedRevision === "string" && binding!.selectedRevision.length > 0)) {
+    // Bound means a revision was durably selected; a bound state without one
+    // has no working set to read or write through.
+    return false;
+  }
+
+  // Only a bind switches authority, and beginOperation moves the state with it,
+  // so a bind intent and `binding-pending` imply each other exactly.
+  const isBindIntent = pending?.kind === "bind";
+  if ((backend.state === "binding-pending") !== isBindIntent) {
+    return false;
+  }
+  // A state with no authority and no switch in progress has nothing to submit.
+  if ((backend.state === "unbound" || backend.state === "detached") && pending !== null) {
+    return false;
+  }
+  // Nor can it hold a committed operation for a replay to answer with: there is
+  // no path that reaches these states while retaining one, and allowing it
+  // would let a replay report success for a scope nothing is bound to.
+  if (backend.state === "unbound" && operations.some((record) => record.outcome === "committed")) {
+    return false;
+  }
+
+  return true;
 }
 
 /**
@@ -661,12 +778,16 @@ export function acceptReceipt(
       return { ok: false, goal: held, code: "refused", message };
     }
     next.memory = { ...exported };
+    const released = next.backend.binding;
     next.backend = {
       ...next.backend,
       state: "detached",
-      binding: next.backend.binding
-        ? { ...next.backend.binding, selectedRevision: receipt.selectedRevision }
-        : null,
+      // Detached means Goal-only mode has resumed, so the binding is released
+      // rather than kept as a decoration: a binding record in a state that
+      // disclaims authority is a contradiction the snapshot validator rejects,
+      // and keeping one would leave a stale association pointing at a scope
+      // Goal no longer writes through. The provenance goes into `reason`.
+      binding: null,
       pending: null,
       operations: retain(next.backend, {
         operationId: pending.operationId,
@@ -676,7 +797,10 @@ export function acceptReceipt(
         receipt,
         reason: null,
       }),
-      reason: null,
+      reason: released
+        ? `detached from ${released.peerId} (task ${released.taskId}) at revision ${receipt.selectedRevision}; ` +
+          "the exported projection is now the Goal record"
+        : `detached at revision ${receipt.selectedRevision}`,
     };
     return { ok: true, goal: next, receipt, projection: response.status === "committed" ? response.projection : undefined };
   }

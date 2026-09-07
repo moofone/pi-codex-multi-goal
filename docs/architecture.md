@@ -167,6 +167,12 @@ durable operation, and a bounded list of retained operation receipts.
   starts unbound and runnable, with the empty memory record a transition
   mandates, and the recorded reason names the peer it was previously bound to.
   No state reachable today is permanently unrecoverable.
+- A persisted snapshot must satisfy its own backend state: a binding exists
+  exactly when the backend is bound, a pending bind intent exists exactly when a
+  switch is in progress, and a retained record marked committed must carry a
+  complete receipt. A snapshot that contradicts itself is malformed and is
+  skipped in favour of the last valid one, so a corrupt record cannot be
+  laundered into authority.
 - Which operations are legal for which backend state is enforced before an
   intent is persisted, not delegated to the peer: `bind` is the only operation
   legal from unbound, a second bind over a live binding is refused, and every
