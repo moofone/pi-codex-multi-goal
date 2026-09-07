@@ -4,7 +4,7 @@ Status: implemented by the goal-memory-and-limits feature. Invariants 1–6 are
 enforced in code and covered by maintained regressions in `test/*.test.ts`
 (run with typecheck via `npm test`); findings F01–F09 from
 [qa-architecture.md](qa-architecture.md) carry current dispositions. The
-implementation choices below (20/200 allowances, 8 KiB memory) are provisional
+implementation choices below (the 20/40/400/1000 allowances, 8 KiB memory) are provisional
 constants, and the recorded host limitations in qa-architecture.md bound what is
 claimed: admission is a schedule-side fallback, and end-to-end behavior in a
 live agent loop is not behaviorally verified.
@@ -22,7 +22,8 @@ maintains a small evidence record, and reports completion or a blocker.
   goal-owned work before another goal-owned context can begin.
 - A full context means one context-window fill (a `session_compact`). Provider
   requests inside a continuing tool loop do not spend the no-progress allowance.
-  A separate total request budget still bounds those loops. Kickoff,
+  A per-agent-turn request bound catches a runaway loop instead, and a separate
+  evidence-renewed working total bounds the step. Kickoff,
   continuation, retries, and recovery cannot bypass accounting by using a
   different entry path.
 - Useful progress is new, verifiable movement toward the current objective:
@@ -145,7 +146,7 @@ without repeatedly asking it to reconsider the goal.
 The implementation should demonstrate these properties with deterministic
 runtime tests, including controlled model responses:
 
-- An endless bookkeeping/tool loop is bounded by the total request budget, stops
+- An endless bookkeeping/tool loop is bounded by the per-turn request bound, stops
   when that budget is spent, and admits no further goal-owned model request.
   Unproductive full context windows pause at the configured no-progress limit
   and stop proven goal-owned work.
@@ -180,13 +181,17 @@ verified evidence:
   `/goal-multi` collects per-step criteria behind one sequence confirm; headless
   starts only from the documented JSON contract. The undocumented ` || `
   splitting is retired.
-- **Accounting (invariant 1):** dual-unit and durable. No-progress is charged
-  once per full context (`session_compact`); the total budget is charged once
-  per goal-owned provider request. No unlimited settings. Exhaustion pauses and
-  withdraws proven goal-owned work. Verified evidence — validated on the same
-  path as completion — resets only the no-progress streak, once per novel ref.
-  Explicit resume grants a fresh bounded no-progress streak; totals never
-  refill.
+- **Accounting (invariant 1):** four durable fuses in three units. No-progress
+  is charged once per full context (`session_compact`); the per-turn bound, the
+  working total, and the lifetime ceiling are charged once per goal-owned
+  provider request. No unlimited settings. Exhaustion pauses and withdraws
+  proven goal-owned work, naming the fuse that blew. Verified evidence —
+  validated on the same path as completion — resets the no-progress streak,
+  clears the per-turn bound, and returns a capped grant to the working total,
+  once per novel ref; it never refunds `lifetimeRequests`. Explicit resume
+  grants a fresh bounded no-progress streak and a new turn; the working total
+  never refills and the ceiling never lifts. Being long and being stuck are
+  bounded separately: a step doing real work is not killed for its length.
 - **Continuation (invariants 3, 4):** queued / delivered /
   eligible-for-next-boundary with delivery acknowledgement; one kickoff, zero
   per-turn reminders, one snapshot per eligible boundary; peer-owned sessions
@@ -199,7 +204,7 @@ verified evidence:
   withholds the kickoff paused instead of running the next step in the old
   transcript.
 
-Explicit provisional choices: 20 no-progress full contexts / 200 total requests per grant,
+Explicit provisional choices: 20 no-progress full contexts, a 40-request per-turn loop bound, a 400-request evidence-renewed working total and a 1000-request lifetime ceiling per grant,
 8 KiB memory record, validated in fixtures before being treated as product
 numbers; bytes are not tokens. Recovery reads the selected session branch and
 never silently resumes or refills.

@@ -3,6 +3,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import {
   allowanceExhaustion,
   allowancePauseReason,
+  beginAgentTurn,
   chargeContext,
   chargeRequest,
   creditVerifiedEvidence,
@@ -247,6 +248,25 @@ export function registerMultiGoal(pi: ExtensionAPI): void {
       return;
     }
     applyCharge(ctx, goal, chargeRequest(goal.execution));
+  };
+
+  // The per-turn loop bound counts goal-owned provider requests inside ONE
+  // agent turn, so every turn boundary starts it over. This replenishes no
+  // budget: the working total, the lifetime total, and the no-progress streak
+  // are untouched. Persisted only when it actually changes, so an idle session
+  // writes nothing.
+  const startAgentTurn = (ctx: ExtensionContext): void => {
+    const goal = persistence.getGoal();
+    if (!goal || persistenceBroken) {
+      return;
+    }
+    const execution = beginAgentTurn(goal.execution);
+    if (execution === goal.execution) {
+      return;
+    }
+    const next = cloneGoal(goal);
+    next.execution = execution;
+    persist(next, "runtime", ctx);
   };
 
   // No-progress accounting at a full context: one session_compact is one
@@ -584,7 +604,13 @@ export function registerMultiGoal(pi: ExtensionAPI): void {
 
   const commandHost = {
     getGoal: () => persistence.getGoal(),
-    limits: { noProgressLimit: settings.noProgressLimit, totalLimit: settings.totalLimit },
+    limits: {
+      noProgressLimit: settings.noProgressLimit,
+      totalLimit: settings.totalLimit,
+      turnLimit: settings.turnLimit,
+      evidenceGrant: settings.evidenceGrant,
+      lifetimeCeiling: settings.lifetimeCeiling,
+    },
     setGoal,
     clearGoal,
     requestContinuation: (ctx: ExtensionContext, kind?: GoalContinuationKind) =>
@@ -621,12 +647,14 @@ export function registerMultiGoal(pi: ExtensionAPI): void {
 
   // In-flight goal ownership: the loop (and each turn inside it) is goal-owned
   // when it was triggered by the delivered goal continuation.
-  pi.on("agent_start", (_event, _ctx) => {
+  pi.on("agent_start", (_event, ctx) => {
     continuation.agentLoopStarted();
+    startAgentTurn(ctx);
   });
 
-  pi.on("turn_start", (_event, _ctx) => {
+  pi.on("turn_start", (_event, ctx) => {
     continuation.agentLoopStarted();
+    startAgentTurn(ctx);
   });
 
   pi.on("session_start", (_event, ctx) => {

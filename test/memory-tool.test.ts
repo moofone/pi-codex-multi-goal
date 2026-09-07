@@ -236,5 +236,5 @@ test("update_goal_memory replace reject stale and oversized", async t => {
   // --- human /goal status shows the memory record and the counters.
   const status = h.goalStatus();
   assert.match(status, /Memory: revision 2/);
-  assert.match(status, /no-progress 19\/20, total 199\/200/);
+  assert.match(status, /no-progress 19\/20, total 399\/400/);
 });
