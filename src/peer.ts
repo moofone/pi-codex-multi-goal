@@ -106,6 +106,28 @@ export type PeerErrorCode =
  * `pending` is never success (§4 step 2: "a SQLite-only pending_ref result is
  * not success"). It leaves the caller's intent in place and publishes nothing.
  */
+/**
+ * The closed set, as data. A code outside it is not a new failure class the
+ * caller must guess at: it is an answer this protocol version cannot read, so
+ * it is reported as `incompatible` — which is retryable. Treating an
+ * unrecognised code as terminal would permanently discard an intent for the
+ * failure most likely to produce one (a malformed or incompatible peer).
+ */
+export const PEER_ERROR_CODES: ReadonlySet<string> = new Set<PeerErrorCode>([
+  "unavailable",
+  "timeout",
+  "incompatible",
+  "stale-selection",
+  "stale-epoch",
+  "scope-conflict",
+  "replay-conflict",
+  "refused",
+]);
+
+export function isPeerErrorCode(value: unknown): value is PeerErrorCode {
+  return typeof value === "string" && PEER_ERROR_CODES.has(value);
+}
+
 export type PeerResponse =
   | { status: "committed"; receipt: PeerReceipt; projection?: unknown }
   | { status: "pending"; operationId: string; reason: string }
@@ -216,7 +238,9 @@ function isPeerResponse(value: unknown): value is PeerResponse {
   if (response.status === "pending") {
     return typeof (response as { operationId?: unknown }).operationId === "string";
   }
-  return response.status === "error" && typeof (response as { code?: unknown }).code === "string";
+  // The error code is validated against the closed set here, in the parser, so
+  // an invented code never reaches a caller that would have to classify it.
+  return response.status === "error" && isPeerErrorCode((response as { code?: unknown }).code);
 }
 
 /**
@@ -242,10 +266,14 @@ export async function callPeer(
     return { status: "error", code: outcome.code, message: outcome.message, operationId: request.operationId };
   }
   if (!isPeerResponse(outcome.value)) {
+    const code = (outcome.value as { code?: unknown } | null)?.code;
     return {
       status: "error",
       code: "incompatible",
-      message: "the peer returned a response this protocol version cannot read",
+      message:
+        typeof code === "string" && !PEER_ERROR_CODES.has(code)
+          ? `the peer answered with error code "${code}", which is not in this protocol version's set`
+          : "the peer returned a response this protocol version cannot read",
       operationId: request.operationId,
     };
   }
@@ -314,6 +342,16 @@ export async function discoverPeer(
  */
 export function verifyReceipt(request: PeerRequest, response: PeerResponse): ReceiptCheck {
   if (response.status === "error") {
+    // Defence in depth for callers that build a response by hand: an
+    // unrecognised code is `incompatible` (retryable), never passed through to
+    // be classified as terminal by whoever receives it.
+    if (!isPeerErrorCode(response.code)) {
+      return {
+        ok: false,
+        code: "incompatible",
+        message: `the peer answered with error code "${String(response.code)}", which this protocol version does not define`,
+      };
+    }
     return { ok: false, code: response.code, message: response.message };
   }
   if (response.status === "pending") {

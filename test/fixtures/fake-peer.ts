@@ -57,6 +57,17 @@ export interface FakePeerOptions {
    * before the intent is persisted.
    */
   laxScope?: boolean;
+  /**
+   * Answer a committed `read` with a receipt but NO projection. A peer or
+   * transport that drops the payload must never look like a valid empty export.
+   */
+  omitProjection?: boolean;
+  /**
+   * Answer with an error code outside the protocol's closed set. A malformed or
+   * incompatible peer must not be able to invent a failure class the caller
+   * then treats as terminal.
+   */
+  badErrorCode?: string;
 }
 
 interface CommittedOperation {
@@ -171,6 +182,14 @@ export function createFakePeer(options: FakePeerOptions = {}): FakePeer {
         throw new Error(options.throws);
       }
       calls.push(request);
+      if (options.badErrorCode) {
+        return {
+          status: "error",
+          code: options.badErrorCode as PeerErrorCode,
+          message: "something the protocol has no name for",
+          operationId: request.operationId,
+        };
+      }
       if (request.protocolVersion !== PEER_PROTOCOL_VERSION) {
         return error("incompatible", `unsupported protocol version ${request.protocolVersion}`, request.operationId);
       }
@@ -250,16 +269,20 @@ export function createFakePeer(options: FakePeerOptions = {}): FakePeer {
 
       if (request.kind === "read") {
         // Reads mutate nothing and never move the selection.
+        const receipt: PeerReceipt = {
+          protocolVersion: PEER_PROTOCOL_VERSION,
+          operationId: request.operationId,
+          scope: request.scope,
+          selectedRevision: held.revision,
+          payloadDigest: canonicalDigest(request.payload),
+          committedAt: 1_700_000_000_000,
+        };
+        if (options.omitProjection) {
+          return { status: "committed", receipt };
+        }
         return {
           status: "committed",
-          receipt: {
-            protocolVersion: PEER_PROTOCOL_VERSION,
-            operationId: request.operationId,
-            scope: request.scope,
-            selectedRevision: held.revision,
-            payloadDigest: canonicalDigest(request.payload),
-            committedAt: 1_700_000_000_000,
-          },
+          receipt,
           projection: { revision: held.revision, memory: held.memory, contract: held.contract },
         };
       }

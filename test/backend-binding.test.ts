@@ -6,6 +6,7 @@ import {
   acceptReceipt,
   backendAdmitsExecution,
   beginOperation,
+  failOperation,
   goalOwnsMemory,
   goalScope,
   markPeerUnavailable,
@@ -712,4 +713,193 @@ test("B12: a permissive peer cannot promote Goal to bound-available without a bi
   assert.equal(result.goal.backend.state, "unbound", "the goal is still unbound");
   assert.equal(result.goal.backend.binding, null, "no binding was installed by a receipt");
   assert.equal(result.goal.backend.pending, null, "and no intent was left behind");
+});
+
+// --- B13: a detach export must be present, not merely absent -------------
+
+/**
+ * Review finding (P1, src/backend.ts): a committed `read` may omit
+ * `projection`. Treating that as an empty memory record turned "the peer told
+ * me nothing" into "the peer told me the working set is empty", which replaced
+ * the Goal record with empty data and released authority — the exact loss the
+ * read-then-detach ordering exists to prevent. §3: if the export cannot be
+ * produced, leave the switch pending and report why; never silently truncate.
+ */
+test("B13: a detach whose export never arrives keeps the record and the binding", async () => {
+  const peer = createFakePeer({ omitProjection: true });
+  const goal = twoStepGoal();
+  let bound = await bind(goal, peer);
+  const written = await runPeerOperation(
+    bound,
+    peer,
+    writeParams(bound, { revision: 1, proved: ["a real finding"], unresolved: [], next: "keep going" }),
+  );
+  assert.equal(written.ok, true, written.ok ? "" : written.message);
+  bound = written.goal;
+
+  const memoryBefore = JSON.stringify(bound.memory);
+  const commitsBefore = peer.commits;
+
+  const detached = await runPeerOperation(bound, peer, {
+    operationId: operationId("detach"),
+    kind: "detach",
+    expectedState: "detached",
+    payload: { profile: "current-scope@1" },
+    selection: SELECTION_A,
+    expectedRevision: bound.backend.binding?.selectedRevision ?? null,
+  });
+
+  assert.equal(detached.ok, false, "a receipt with no projection is not an export");
+  assert.match(
+    detached.ok === false ? detached.message : "",
+    /projection|export/i,
+    "and the reason names what was missing",
+  );
+  assert.equal(detached.goal.backend.state, "bound-available", "authority was not released");
+  assert.ok(detached.goal.backend.pending, "the switch stays pending so it can be retried or abandoned");
+  assert.equal(JSON.stringify(detached.goal.memory), memoryBefore, "the Goal record was not replaced");
+  assert.equal(peer.commits, commitsBefore, "and nothing was committed");
+});
+
+test("B13: a detach whose export is present but malformed is refused the same way", async () => {
+  const peer = createFakePeer();
+  const goal = twoStepGoal();
+  let bound = await bind(goal, peer);
+  // A peer whose records do not fit Goal's record shape at all.
+  const written = await runPeerOperation(bound, peer, writeParams(bound, { proved: "not an array" }));
+  assert.equal(written.ok, true, written.ok ? "" : written.message);
+  bound = written.goal;
+  const memoryBefore = JSON.stringify(bound.memory);
+
+  const detached = await runPeerOperation(bound, peer, {
+    operationId: operationId("detach"),
+    kind: "detach",
+    expectedState: "detached",
+    payload: { profile: "current-scope@1" },
+    selection: SELECTION_A,
+    expectedRevision: bound.backend.binding?.selectedRevision ?? null,
+  });
+
+  assert.equal(detached.ok, false);
+  assert.equal(detached.goal.backend.state, "bound-available");
+  assert.equal(JSON.stringify(detached.goal.memory), memoryBefore);
+});
+
+test("B13: an export that is genuinely empty is still a valid export", async () => {
+  // Absent must be distinguishable from empty: a peer whose current working set
+  // holds nothing has said something, and detach must succeed on it.
+  const peer = createFakePeer();
+  const goal = twoStepGoal();
+  let bound = await bind(goal, peer);
+  const written = await runPeerOperation(bound, peer, writeParams(bound, { proved: [], unresolved: [], next: "" }));
+  assert.equal(written.ok, true, written.ok ? "" : written.message);
+  bound = written.goal;
+
+  const detached = await runPeerOperation(bound, peer, {
+    operationId: operationId("detach"),
+    kind: "detach",
+    expectedState: "detached",
+    payload: { profile: "current-scope@1" },
+    selection: SELECTION_A,
+    expectedRevision: bound.backend.binding?.selectedRevision ?? null,
+  });
+
+  assert.equal(detached.ok, true, detached.ok ? "" : detached.message);
+  assert.equal(detached.goal.backend.state, "detached");
+  assert.deepEqual(
+    {
+      proved: detached.goal.memory.proved,
+      unresolved: detached.goal.memory.unresolved,
+      next: detached.goal.memory.next,
+    },
+    { proved: [], unresolved: [], next: "" },
+  );
+});
+
+// --- B14: an unrecognised error code must not discard a retryable intent --
+
+/**
+ * Review finding (P1, src/peer.ts): the parser accepted any string as an error
+ * code, verifyReceipt passed it through, and acceptReceipt treated anything
+ * outside the retryable set as terminal — so a malformed answer permanently
+ * quarantined an intent. The failure most likely to produce a garbage code is
+ * an incompatible peer, which this design classifies as RETRYABLE, so the
+ * unrecognised case landed in exactly the wrong bucket.
+ */
+test("B14: a peer answering with a code outside the protocol keeps the intent retryable", async () => {
+  const peer = createFakePeer();
+  const goal = twoStepGoal();
+  const bound = await bind(goal, peer);
+
+  const rogue = createFakePeer({ badErrorCode: "not-a-protocol-code" });
+  const result = await runPeerOperation(
+    bound,
+    rogue,
+    writeParams(bound, { revision: 1, proved: ["x"], unresolved: [], next: "" }),
+  );
+
+  assert.equal(result.ok, false, "sanity: the operation did not succeed");
+  assert.equal(
+    result.ok === false ? result.code : null,
+    "incompatible",
+    "an answer this protocol version cannot read is incompatible, not a new terminal class",
+  );
+  assert.ok(
+    result.goal.backend.pending,
+    "the intent survives: a malformed answer must never discard recoverable work",
+  );
+  assert.equal(result.goal.backend.state, "bound-unavailable", "and the backend is visibly not answering");
+  assert.deepEqual(result.goal.backend.operations.filter((r) => r.outcome === "quarantined"), []);
+});
+
+test("B14: the response parser rejects an unknown error code", async () => {
+  const rogue = createFakePeer({ badErrorCode: "kaboom" });
+  const response = await callPeer(rogue, {
+    protocolVersion: 1,
+    operationId: "op-1",
+    kind: "read",
+    scope: goalScope(twoStepGoal(), SELECTION_A),
+    expectedRevision: null,
+    payload: { profile: "current-scope@1" },
+  });
+
+  assert.equal(response.status, "error");
+  assert.equal(
+    response.status === "error" ? response.code : null,
+    "incompatible",
+    "the closed set is enforced in the parser, so no unknown code reaches a caller",
+  );
+});
+
+test("B14: verifyReceipt maps an unknown error code to incompatible", () => {
+  const request = {
+    protocolVersion: 1,
+    operationId: "op-1",
+    kind: "write" as const,
+    scope: goalScope(twoStepGoal(), SELECTION_A),
+    expectedRevision: "rev-1",
+    payload: { memory: null },
+  };
+  const checked = verifyReceipt(request, {
+    status: "error",
+    code: "invented-code" as never,
+    message: "peer says no",
+  });
+
+  assert.equal(checked.ok, false, "sanity: it is still a failure");
+  assert.equal(checked.ok === false ? checked.code : null, "incompatible");
+});
+
+test("B14: failOperation treats an unrecognised code as retryable, never terminal", async () => {
+  const peer = createFakePeer();
+  const goal = twoStepGoal();
+  const bound = await bind(goal, peer);
+  const begun = beginOperation(bound, writeParams(bound, { revision: 1, proved: ["x"], unresolved: [], next: "" }));
+  assert.ok(begun.ok);
+  assert.ok(begun.goal.backend.pending, "sanity: there is an intent to lose");
+
+  const after = failOperation(begun.goal, { code: "who-knows", message: "an answer with no known class" });
+
+  assert.ok(after.backend.pending, "an unrecognised code must never permanently discard a retryable intent");
+  assert.deepEqual(after.backend.operations.filter((r) => r.outcome === "quarantined"), []);
 });

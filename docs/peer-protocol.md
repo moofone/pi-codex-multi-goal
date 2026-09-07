@@ -150,6 +150,10 @@ Payloads by kind:
 | `transition` | `{ contract: {...}, acceptedEvidence: EvidenceRef[] }` — archive this scope, install the next contract | yes |
 | `detach` | `{ profile: string }` — export the selected projection and release authority | yes |
 
+A `read` answer carries `projection`; `bind`, `write` and `transition` answers
+need not. See "An absent field is not an empty value" below for what a missing
+projection means.
+
 The `read` payload deliberately carries no consumer semantics: a profile
 declares its own version, required sections, and rendering budget on the peer
 side. Profile-specific rendering never creates a second writable summary.
@@ -178,6 +182,15 @@ response leaves the Goal-side intent in place, publishes nothing, and grants
 nothing. It is reconciled on the next attempt through the peer's own
 pending-reference reconciliation, never from an in-memory snapshot.
 
+**An absent field is not an empty value.** A `read` or `detach` answer that
+omits `projection`, or whose projection omits `memory`, means the peer told the
+caller *nothing*; it does not mean the working set is empty. The two must stay
+distinguishable, because collapsing them turns a dropped payload into a valid
+instruction to replace the caller's record with nothing. A peer with an empty
+working set says so explicitly, with a present `memory` whose fields are present
+and correctly typed: `{ proved: [], unresolved: [], next: "" }` is an export;
+a missing `projection` is a failed read.
+
 ### 4.4 Error codes
 
 | Code | Meaning | Intent kept? |
@@ -195,6 +208,17 @@ pending-reference reconciliation, never from an in-memory snapshot.
 so the same `operationId` and payload can be replayed; a terminal failure moves
 the intent into the retained-operations list as `quarantined` so a late receipt
 for it can still be refused, and the caller must re-plan under a new id.
+
+**The set is closed, and unrecognised codes are `incompatible`.** A response
+carrying a code outside this table is rejected by the response parser and
+reported as `incompatible`, which is retryable. It is never treated as a new
+terminal class: the failure most likely to produce a code this protocol version
+does not know is an incompatible or malformed peer, and calling that terminal
+would permanently discard an intent that is in fact recoverable. Classification
+is by the closed TERMINAL set — `stale-selection`, `stale-epoch`,
+`scope-conflict`, `replay-conflict`, `refused` — so anything a caller does not
+recognise keeps its intent rather than losing it. An intent is only ever
+discarded by a code that positively means "this can never succeed".
 
 ## 5. The recoverable ordering
 

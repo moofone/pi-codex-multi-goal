@@ -428,6 +428,13 @@ function requestOf(pending: PendingOperation): PeerRequest {
  * the peer's good behaviour.
  *
  * Reads persist no intent: they mutate nothing, so there is nothing to recover.
+ *
+ * Order matters and is load-bearing: replay is resolved first (so idempotent
+ * recovery still works after the state has legitimately moved on), then
+ * `checkOperationLegality` enforces the state machine, then the one-pending
+ * check — and only after all three is anything written to the snapshot. The
+ * legality guard is inside this function, a few lines below, not at the call
+ * sites: no caller can persist an intent without passing it.
  */
 export function beginOperation(goal: MultiGoal, params: OperationParams): BeginResult {
   if (params.kind === "read") {
@@ -604,16 +611,22 @@ export function acceptReceipt(
 
   const verified = verifyReceipt(requestOf(pending), response);
   if (!verified.ok) {
-    // Retryable transport failures keep the intent (see failOperation); a
-    // verification failure is terminal for this ID.
-    if (verified.code === "unavailable" || verified.code === "timeout" || verified.code === "incompatible") {
-      return { ok: false, goal: failOperation(goal, { code: verified.code, message: verified.message }), code: verified.code, message: verified.message };
-    }
     if (verified.code === "pending") {
       // Not durably selected: publish nothing, keep the intent for the retry.
       const held = cloneGoal(goal);
       held.backend = { ...held.backend, reason: verified.message };
       return { ok: false, goal: held, code: "pending", message: verified.message };
+    }
+    // Only a code that positively means "this can never succeed" discards the
+    // intent. Everything else — transport failures, and anything this build
+    // does not recognise — keeps it for the retry (see TERMINAL_CODES).
+    if (!TERMINAL_CODES.has(verified.code)) {
+      return {
+        ok: false,
+        goal: failOperation(goal, { code: verified.code, message: verified.message }),
+        code: verified.code,
+        message: verified.message,
+      };
     }
     return {
       ok: false,
@@ -629,12 +642,25 @@ export function acceptReceipt(
   if (pending.expectedState === "detached") {
     // A detach may only complete against a VALIDATED export: §3 forbids
     // silently truncating a projection that does not fit the 8 KiB record.
-    if (!options.export) {
+    // Defence in depth: this is the function that actually replaces the Goal
+    // record, so it re-validates rather than trusting its caller. An absent
+    // export and an invalid one both hold the switch; neither truncates.
+    const exported = options.export;
+    const exportCheck = exported
+      ? validateMemoryContent(
+          { proved: exported.proved, unresolved: exported.unresolved, next: exported.next },
+          exported.revision,
+        )
+      : null;
+    if (!exported || !exportCheck?.ok) {
+      const message = exportCheck && !exportCheck.ok
+        ? `a detach needs a valid export before Goal-only mode resumes. ${exportCheck.message}`
+        : "a detach needs a validated export before Goal-only mode resumes";
       const held = cloneGoal(goal);
-      held.backend = { ...held.backend, reason: "the detach has no validated export" };
-      return { ok: false, goal: held, code: "refused", message: "a detach needs a validated export before Goal-only mode resumes" };
+      held.backend = { ...held.backend, reason: message };
+      return { ok: false, goal: held, code: "refused", message };
     }
-    next.memory = { ...options.export };
+    next.memory = { ...exported };
     next.backend = {
       ...next.backend,
       state: "detached",
@@ -693,7 +719,23 @@ export function acceptReceipt(
   return { ok: true, goal: next, receipt, projection: response.status === "committed" ? response.projection : undefined };
 }
 
-const RETRYABLE = new Set(["unavailable", "timeout", "incompatible"]);
+/**
+ * The codes that positively mean "this operation can never succeed". Anything
+ * else — including a code this build does not recognise — keeps its intent.
+ *
+ * The default matters: an unrecognised code most likely came from a malformed
+ * or incompatible peer, which this design classifies as retryable. Discarding
+ * the intent on it would turn a recoverable transport problem into permanent
+ * loss of the operation, so classification is by this closed TERMINAL set
+ * rather than by a closed retryable set with a terminal default.
+ */
+const TERMINAL_CODES: ReadonlySet<string> = new Set<ReceiptRejection>([
+  "stale-selection",
+  "stale-epoch",
+  "scope-conflict",
+  "replay-conflict",
+  "refused",
+]);
 
 /**
  * Apply a failed attempt. The code decides recovery:
@@ -716,7 +758,7 @@ export function failOperation(goal: MultiGoal, failure: { code: string; message:
   if (!pending) {
     return goal;
   }
-  if (!RETRYABLE.has(failure.code)) {
+  if (TERMINAL_CODES.has(failure.code)) {
     return quarantine(goal, pending, failure.message);
   }
   const next = cloneGoal(goal);
@@ -855,7 +897,9 @@ export type OperationResult =
  * `detach` is the one kind with an extra step: the export is READ and validated
  * against Goal's 8 KiB record before the peer is asked to release authority.
  * Validating after the release would leave Goal unable to un-release; §3
- * requires the switch to stay pending and report why instead.
+ * requires the switch to stay pending and report why instead. The export must be
+ * PRESENT to be validated: a committed read that carries no projection is a
+ * failed export, not an empty one.
  */
 export async function runPeerOperation(
   goal: MultiGoal,
@@ -891,20 +935,41 @@ export async function runPeerOperation(
         message: readVerified.message,
       };
     }
-    const projection = (readResponse.status === "committed" ? readResponse.projection : null) as
-      | { memory?: unknown }
-      | null;
-    const memory = (projection?.memory ?? {}) as { proved?: unknown; unresolved?: unknown; next?: unknown };
-    const validated = validateMemoryContent(
-      { proved: memory.proved ?? [], unresolved: memory.unresolved ?? [], next: memory.next ?? "" },
-      goal.memory.revision + 1,
-    );
-    if (!validated.ok) {
+    // An ABSENT export is not an empty one. A committed read that carries no
+    // projection — or a projection with no memory record — means the peer said
+    // nothing, and defaulting that to an empty record would let a dropped
+    // payload replace the Goal record with nothing and release authority. That
+    // is the exact loss this read-then-detach ordering exists to prevent, so
+    // absent and empty stay distinguishable: a peer whose working set really is
+    // empty says so with a present, correctly typed { proved: [], unresolved:
+    // [], next: "" }. Missing fields are left missing here rather than filled
+    // in, so validateMemoryContent refuses them on the schema check.
+    const projection = readResponse.status === "committed" ? readResponse.projection : undefined;
+    const record =
+      projection && typeof projection === "object"
+        ? (projection as { memory?: unknown }).memory
+        : undefined;
+    const holdSwitch = (message: string): OperationResult => {
       // The switch stays pending with a visible reason; nothing is truncated
       // and authority is never released on an export Goal cannot hold.
       const held = cloneGoal(begun.goal);
-      held.backend = { ...held.backend, reason: validated.message };
-      return { ok: false, goal: held, code: "refused", message: validated.message };
+      held.backend = { ...held.backend, reason: message };
+      return { ok: false, goal: held, code: "refused", message };
+    };
+    if (!record || typeof record !== "object") {
+      return holdSwitch(
+        "Detach refused: the peer acknowledged the export read but returned no projection record, " +
+          "so there is nothing to validate. An absent export is not an empty one; the backend switch " +
+          "stays pending. Retry it, or abandon the switch.",
+      );
+    }
+    const memory = record as { proved?: unknown; unresolved?: unknown; next?: unknown };
+    const validated = validateMemoryContent(
+      { proved: memory.proved, unresolved: memory.unresolved, next: memory.next },
+      goal.memory.revision + 1,
+    );
+    if (!validated.ok) {
+      return holdSwitch(`Detach refused: the exported projection is not a valid Goal record. ${validated.message}`);
     }
     exported = {
       revision: goal.memory.revision + 1,
