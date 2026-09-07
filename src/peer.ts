@@ -186,9 +186,19 @@ export function selectionsEqual(left: PeerSelection, right: PeerSelection): bool
   return left.sessionId === right.sessionId && left.branchAnchorId === right.branchAnchorId;
 }
 
-/** Scope identity within one peer: consumer namespace plus work scope. */
+/**
+ * Scope identity within one peer: consumer namespace plus work scope.
+ *
+ * Both fields are caller-controlled, so the encoding has to be INJECTIVE or the
+ * key is forgeable: joining them with a delimiter lets ("a", "b c") and
+ * ("a b", "c") name the same scope, which is an ownership conflict at best and,
+ * in a peer that keys storage on it, the wrong record. JSON is the same
+ * discipline canonicalDigest and computeContractRevision already use, and for
+ * the same reason — its escaping makes the field boundary unambiguous, so no
+ * value can be crafted to reach across it.
+ */
 export function scopeKey(scope: PeerScope): string {
-  return `${scope.consumer} ${scope.scopeId}`;
+  return JSON.stringify([scope.consumer, scope.scopeId]);
 }
 
 /**
@@ -331,6 +341,34 @@ export async function discoverPeer(
 }
 
 /**
+ * Correlation, on every answer that carries an ID.
+ *
+ * A delayed answer for someone else's request says NOTHING about this one, so
+ * applying it would be wrong in either direction — and it is wrong in the
+ * expensive direction, because `scope-conflict`, `replay-conflict` and
+ * `refused` are legitimately terminal and would discard a valid pending intent.
+ * A mismatch is therefore reported as `incompatible`, which is retryable: the
+ * caller learns nothing, and loses nothing.
+ *
+ * The ID is optional on an error, so its ABSENCE is not a mismatch — a
+ * transport that cannot correlate is not thereby lying, and callPeer's own
+ * synthesised errors carry the request's ID anyway. Only a present and
+ * different ID is a mismatch.
+ */
+function correlationFailure(request: PeerRequest, operationId: unknown): ReceiptCheck | null {
+  if (typeof operationId !== "string" || operationId === request.operationId) {
+    return null;
+  }
+  return {
+    ok: false,
+    code: "incompatible",
+    message:
+      `the peer's answer correlates to operation ${operationId}, not ${request.operationId}; ` +
+      "an answer for another request cannot be applied to this one",
+  };
+}
+
+/**
  * Step 3 of the recoverable ordering, caller side: verify the answer against
  * the request that produced it before anything is persisted or published.
  *
@@ -352,9 +390,17 @@ export function verifyReceipt(request: PeerRequest, response: PeerResponse): Rec
         message: `the peer answered with error code "${String(response.code)}", which this protocol version does not define`,
       };
     }
+    const miscorrelated = correlationFailure(request, response.operationId);
+    if (miscorrelated) {
+      return miscorrelated;
+    }
     return { ok: false, code: response.code, message: response.message };
   }
   if (response.status === "pending") {
+    const miscorrelated = correlationFailure(request, response.operationId);
+    if (miscorrelated) {
+      return miscorrelated;
+    }
     return {
       ok: false,
       code: "pending",

@@ -9,6 +9,7 @@ import {
   failOperation,
   goalOwnsMemory,
   goalScope,
+  goalScopeId,
   markPeerUnavailable,
   reconcileSelection,
   resolveReplay,
@@ -933,4 +934,144 @@ test("B15: a really detached goal survives a reload", async () => {
   assert.equal(reloaded.backend.state, "detached", "a detached snapshot is not skipped as malformed");
   assert.equal(goalOwnsMemory(reloaded.backend), true);
   assert.deepEqual(reloaded.memory.proved, ["kept"], "and the exported record survives the round trip");
+});
+
+// --- B17/B18 in the Goal adapter -----------------------------------------
+
+test("B17: a misdirected terminal error does not discard the pending intent", async () => {
+  const peer = createFakePeer();
+  const goal = twoStepGoal();
+  const bound = await bind(goal, peer);
+
+  // A peer answering with someone else's `refused` — a delayed error for
+  // another request. It is terminal, so on the old code it quarantined a
+  // perfectly valid intent.
+  const misdirecting = createFakePeer({ misdirectedError: "refused" });
+  const result = await runPeerOperation(
+    bound,
+    misdirecting,
+    writeParams(bound, { revision: 1, proved: ["x"], unresolved: [], next: "" }),
+  );
+
+  assert.equal(result.ok, false, "sanity: the operation did not succeed");
+  assert.equal(
+    result.ok === false ? result.code : null,
+    "incompatible",
+    "an answer about another operation says nothing about this one",
+  );
+  assert.ok(result.goal.backend.pending, "the valid intent survives and stays retryable");
+  assert.deepEqual(
+    result.goal.backend.operations.filter((record) => record.outcome === "quarantined"),
+    [],
+    "and nothing was quarantined on the strength of someone else's refusal",
+  );
+});
+
+/**
+ * The concatenation sweep the scopeKey finding prompted. `goalScopeId` builds
+ * the protocol's scopeId from two fields taken off a persisted snapshot, and
+ * `migrateV1Goal` really does mint stage IDs containing `:stage:` — so the
+ * delimiter can appear inside a component and the identity is forgeable.
+ */
+test("B18: goalScopeId cannot be made to collide by moving the delimiter", () => {
+  assert.notEqual(
+    goalScopeId("a", "b:stage:c"),
+    goalScopeId("a:stage:b", "c"),
+    "two different goal/stage pairs must not name one scope",
+  );
+  assert.equal(goalScopeId("a", "b"), goalScopeId("a", "b"), "sanity: it is deterministic");
+
+  // The shape migrateV1Goal actually produces: `<goalId>:stage:<position>`.
+  assert.notEqual(
+    goalScopeId("g-1", "g-1:stage:0"),
+    goalScopeId("g-1:stage:0", ""),
+    "a migrated stage id must not be able to impersonate another goal's scope",
+  );
+
+  const pairs = [
+    ["a", "b:stage:c"],
+    ["a:stage:b", "c"],
+    ["a:", "stage:b:c"],
+    ["", "a:stage:b"],
+    ["a:stage:b", ""],
+  ] as const;
+  const ids = pairs.map(([goalId, stageId]) => goalScopeId(goalId, stageId));
+  assert.equal(new Set(ids).size, ids.length, "every distinct pair gets a distinct scope id");
+});
+
+/**
+ * The export read is a PRECONDITION of the detach, not the operation itself.
+ * Its id was derived by appending `:export` to the caller's, so a caller that
+ * had already committed an operation under that exact derived id would get
+ * that operation's receipt back and see a `replay-conflict` — terminal, which
+ * destroyed the detach intent. Neither the derivation nor the classification
+ * should be able to do that, so both are fixed: the id is injective, and a
+ * failed precondition holds the switch rather than burning the operation.
+ */
+test("B18: a failed export read holds the switch instead of discarding it", async () => {
+  const peer = createFakePeer({ readError: "refused" });
+  const goal = twoStepGoal();
+  const bound = await bind(goal, peer);
+  const memoryBefore = JSON.stringify(bound.memory);
+  const detachId = operationId("detach");
+
+  const detached = await runPeerOperation(bound, peer, {
+    operationId: detachId,
+    kind: "detach",
+    expectedState: "detached",
+    payload: { profile: "current-scope@1" },
+    selection: SELECTION_A,
+    expectedRevision: bound.backend.binding?.selectedRevision ?? null,
+  });
+
+  assert.equal(detached.ok, false, "sanity: the export could not be read");
+  assert.match(detached.ok === false ? detached.message : "", /export/i, "and the reason says so");
+  assert.equal(detached.goal.backend.state, "bound-available", "authority was not released");
+  assert.equal(JSON.stringify(detached.goal.memory), memoryBefore, "the record was not replaced");
+  assert.ok(
+    detached.goal.backend.pending,
+    "a failed precondition holds the switch pending; it never discards the detach intent",
+  );
+  assert.deepEqual(
+    detached.goal.backend.operations.filter((record) => record.operationId === detachId),
+    [],
+    "and the detach id is not burned, so the same operation can be retried",
+  );
+});
+
+test("B18: the export read cannot be made to name a caller's own operation", async () => {
+  const peer = createFakePeer();
+  const goal = twoStepGoal();
+  let bound = await bind(goal, peer);
+
+  // Commit a write under the id the old `${id}:export` derivation would have
+  // produced for the detach below.
+  const detachId = operationId("detach");
+  const collide = await runPeerOperation(bound, peer, {
+    ...writeParams(bound, { revision: 1, proved: ["earlier work"], unresolved: [], next: "" }),
+    operationId: `${detachId}:export`,
+  });
+  assert.equal(collide.ok, true, collide.ok ? "" : collide.message);
+  bound = collide.goal;
+
+  const detached = await runPeerOperation(bound, peer, {
+    operationId: detachId,
+    kind: "detach",
+    expectedState: "detached",
+    payload: { profile: "current-scope@1" },
+    selection: SELECTION_A,
+    expectedRevision: bound.backend.binding?.selectedRevision ?? null,
+  });
+
+  assert.equal(detached.ok, true, detached.ok ? "" : detached.message);
+  assert.equal(detached.goal.backend.state, "detached", "the detach was not derailed by the collision");
+  assert.deepEqual(detached.goal.memory.proved, ["earlier work"], "and it exported the real record");
+
+  const readCall = peer.calls.find((call) => call.kind === "read");
+  assert.ok(readCall, "sanity: the export read happened");
+  assert.notEqual(
+    readCall?.operationId,
+    `${detachId}:export`,
+    "the derived read id is not a concatenation a caller can predict and occupy",
+  );
 });

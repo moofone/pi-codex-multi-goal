@@ -68,6 +68,20 @@ export function fingerprintFile(absolutePath: string): string | null {
   }
 }
 
+/**
+ * The dedupe key for credited evidence. All three fields are model-supplied, so
+ * the encoding has to be injective or one artifact's credit could block
+ * another's — but it IS injective, and only because of two invariants enforced
+ * by validateEvidenceRefs before this is ever called: `operation` comes from
+ * the closed PRODUCING_OPERATIONS set (none of which contains `#`), and
+ * `fingerprint` is exactly FINGERPRINT_HEX_CHARS lowercase hex. With the first
+ * field drawn from a delimiter-free set and the last of fixed length, only
+ * `artifact` is free, and it cannot reach across either boundary.
+ *
+ * If either invariant is ever relaxed — a producing operation containing `#`,
+ * or a variable-width fingerprint — this must become a length-prefixed or JSON
+ * encoding, as scopeKey and goalScopeId are. Do not weaken them silently.
+ */
 export function evidenceKey(ref: EvidenceRefInput): string {
   return `${ref.operation}#${ref.artifact}#${ref.fingerprint}`;
 }

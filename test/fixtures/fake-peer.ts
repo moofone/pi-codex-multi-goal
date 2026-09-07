@@ -68,6 +68,16 @@ export interface FakePeerOptions {
    * then treats as terminal.
    */
   badErrorCode?: string;
+  /**
+   * Answer with a well-formed error that correlates to a DIFFERENT operation —
+   * a delayed answer for someone else's request. It must not be applied to the
+   * caller's pending intent.
+   */
+  misdirectedError?: PeerErrorCode;
+  /** Answer `pending`, correlated to a different operation. */
+  misdirectedPending?: boolean;
+  /** Refuse every `read`, so a detach's precondition fails terminally. */
+  readError?: PeerErrorCode;
 }
 
 interface CommittedOperation {
@@ -78,6 +88,8 @@ interface CommittedOperation {
 
 interface ScopeRecord {
   owner: string;
+  /** Stored explicitly, so ownership never has to be recovered from a key. */
+  scopeId: string;
   revision: string;
   contract: unknown;
   memory: unknown;
@@ -160,10 +172,15 @@ export function createFakePeer(options: FakePeerOptions = {}): FakePeer {
       loseNext = true;
     },
     revisionOf(scopeId, consumer) {
-      return scopes.get(`${consumer} ${scopeId}`)?.revision ?? null;
+      return peer.recordOf(scopeId, consumer)?.revision ?? null;
     },
     recordOf(scopeId, consumer) {
-      return scopes.get(`${consumer} ${scopeId}`) ?? null;
+      for (const record of scopes.values()) {
+        if (record.scopeId === scopeId && record.owner === consumer) {
+          return record;
+        }
+      }
+      return null;
     },
     async capabilities(): Promise<PeerCapabilities> {
       if (options.hang) {
@@ -182,6 +199,21 @@ export function createFakePeer(options: FakePeerOptions = {}): FakePeer {
         throw new Error(options.throws);
       }
       calls.push(request);
+      if (options.misdirectedError) {
+        return {
+          status: "error",
+          code: options.misdirectedError,
+          message: "an answer for another request entirely",
+          operationId: "somebody-elses-operation",
+        };
+      }
+      if (options.misdirectedPending) {
+        return {
+          status: "pending",
+          operationId: "somebody-elses-operation",
+          reason: "an answer for another request entirely",
+        };
+      }
       if (options.badErrorCode) {
         return {
           status: "error",
@@ -224,7 +256,7 @@ export function createFakePeer(options: FakePeerOptions = {}): FakePeer {
         if (otherKey === key) {
           continue;
         }
-        if (otherKey.endsWith(` ${request.scope.scopeId}`) && record.owner !== request.scope.consumer) {
+        if (record.scopeId === request.scope.scopeId && record.owner !== request.scope.consumer) {
           return error(
             "scope-conflict",
             `scope ${request.scope.scopeId} is owned by ${record.owner}`,
@@ -240,6 +272,7 @@ export function createFakePeer(options: FakePeerOptions = {}): FakePeer {
         const payload = (request.payload ?? {}) as { contract?: unknown; memory?: unknown };
         return commit(request, {
           owner: request.scope.consumer,
+          scopeId: request.scope.scopeId,
           revision: "",
           contract: payload.contract ?? null,
           memory: payload.memory ?? null,
@@ -254,6 +287,7 @@ export function createFakePeer(options: FakePeerOptions = {}): FakePeer {
         const payload = (request.payload ?? {}) as { memory?: unknown };
         return commit(request, {
           owner: request.scope.consumer,
+          scopeId: request.scope.scopeId,
           revision: "",
           contract: null,
           memory: payload.memory ?? null,
@@ -268,6 +302,9 @@ export function createFakePeer(options: FakePeerOptions = {}): FakePeer {
       }
 
       if (request.kind === "read") {
+        if (options.readError) {
+          return error(options.readError, "this peer will not render that profile", request.operationId);
+        }
         // Reads mutate nothing and never move the selection.
         const receipt: PeerReceipt = {
           protocolVersion: PEER_PROTOCOL_VERSION,

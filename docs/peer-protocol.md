@@ -95,13 +95,22 @@ interface PeerScope {
 | Protocol field | Goal adapter | Research adapter (future) |
 |---|---|---|
 | `consumer` | `"pi-codex-multi-goal"` | its own package name |
-| `scopeId` | `goal:<goalId>:stage:<Stage.id>` | `study:<studyId>:question:<questionId>` |
+| `scopeId` | `goal:<goalId>:stage:<Stage.id>`, each component percent-encoded | `study:<studyId>:question:<questionId>` |
 | `contractRevision` | `MultiGoal.contractRevision` (D7 sha256) | its accepted question/constraints hash |
 | `epoch` | `GoalExecution.generation` | its own execution epoch |
 | `selection` | the host session id and selected branch anchor | the same |
 
 `scopeId` uses `Stage.id`, never the displayed step number (D7). The displayed
 number changes meaning across a transition; the id does not.
+
+**Every identity built from more than one caller-controlled value must be
+injective.** Joining two free-form strings with a delimiter is not: `("a",
+"b c")` and `("a b", "c")` name the same thing, which lets one consumer collide
+with another's scope and, in a peer that keys storage on it, address the wrong
+record. Use a collision-free encoding — JSON, as `canonicalDigest` and
+`contractRevision` do, or per-component percent-encoding — so no value can
+reach across a field boundary. This applies to the scope key, the mapped
+`scopeId`, and any operation ID derived from another.
 
 The caller **cannot acquire ownership by supplying these fields**. The peer
 decides who owns a scope; a request from a consumer that does not own the
@@ -181,6 +190,16 @@ selection; a SQLite-only `pending_ref` result is not success." A `pending`
 response leaves the Goal-side intent in place, publishes nothing, and grants
 nothing. It is reconciled on the next attempt through the peer's own
 pending-reference reconciliation, never from an in-memory snapshot.
+
+**Every answer that carries an operation ID must correlate.** A response whose
+`operationId` is present and is not the request's is an answer to someone
+else's request: it says nothing about this one and must not be applied to it.
+That matters most on the error path, because `scope-conflict`,
+`replay-conflict`, `stale-selection`, `stale-epoch` and `refused` are terminal
+and would discard a valid pending intent. A mismatch is reported as
+`incompatible`, which is retryable — the caller learns nothing and loses
+nothing. The ID is optional on an error, so its ABSENCE is not a mismatch; only
+a present and different ID is.
 
 **An absent field is not an empty value.** A `read` or `detach` answer that
 omits `projection`, or whose projection omits `memory`, means the peer told the

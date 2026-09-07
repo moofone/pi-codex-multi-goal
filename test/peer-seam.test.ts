@@ -6,6 +6,7 @@ import {
   callPeer,
   canonicalDigest,
   discoverPeer,
+  scopeKey,
   verifyReceipt,
   type PeerRequest,
   type PeerScope,
@@ -290,5 +291,140 @@ test("canonicalDigest is key-order independent so an identical payload replays a
     a,
     canonicalDigest({ memory: { proved: ["x"], next: "z" }, note: 1 }),
     "a changed value is a different payload",
+  );
+});
+
+// --- B17: an answer must correlate to the request it is applied to -------
+
+/**
+ * Review finding (P1, src/peer.ts): verifyReceipt accepted every error
+ * response on its code alone and ignored the `operationId` the protocol
+ * already promises. A delayed error for another request could therefore be
+ * applied to the caller's pending intent — and the codes involved
+ * (`scope-conflict`, `refused`) are legitimately terminal, so it destroyed a
+ * valid operation instead of leaving it retryable.
+ *
+ * This is the third door onto the same failure: an unrelated answer discarding
+ * recoverable work. The committed path has always correlated through
+ * `receipt.operationId`; the error and pending paths now do too.
+ */
+test("B17: a terminal error correlated to another operation cannot be applied", () => {
+  const req = request(scope("pi-research", "study:1"), "write", { memory: {} }, "rev-1");
+
+  for (const code of ["refused", "scope-conflict", "replay-conflict", "stale-epoch"] as const) {
+    const checked = verifyReceipt(req, {
+      status: "error",
+      code,
+      message: "an answer for another request entirely",
+      operationId: "somebody-elses-operation",
+    });
+    assert.equal(checked.ok, false, "sanity: it is still a failure");
+    assert.equal(
+      checked.ok === false ? checked.code : null,
+      "incompatible",
+      `a ${code} answering another operation says nothing about this one, so it must not be terminal`,
+    );
+  }
+});
+
+test("B17: a correlated terminal error is still terminal", () => {
+  // Regression preservation: correlation must not soften a real refusal.
+  const req = request(scope("pi-research", "study:1"), "write", { memory: {} }, "rev-1");
+  const checked = verifyReceipt(req, {
+    status: "error",
+    code: "refused",
+    message: "the peer validated the mutation and rejected it",
+    operationId: req.operationId,
+  });
+  assert.equal(checked.ok, false);
+  assert.equal(checked.ok === false ? checked.code : null, "refused");
+});
+
+test("B17: an error with no operation ID is still applied to the request", () => {
+  // The field is optional: a transport that cannot correlate is not thereby a
+  // mismatch, and callPeer's own synthesised errors carry the request's ID.
+  const req = request(scope("pi-research", "study:1"), "write", { memory: {} }, "rev-1");
+  const checked = verifyReceipt(req, {
+    status: "error",
+    code: "refused",
+    message: "no correlation available",
+  });
+  assert.equal(checked.ok === false ? checked.code : null, "refused");
+});
+
+test("B17: a pending answer for another operation is not applied either", () => {
+  const req = request(scope("pi-research", "study:1"), "write", { memory: {} }, "rev-1");
+  const checked = verifyReceipt(req, {
+    status: "pending",
+    operationId: "somebody-elses-operation",
+    reason: "reference append not acknowledged",
+  });
+  assert.equal(checked.ok, false);
+  assert.equal(
+    checked.ok === false ? checked.code : null,
+    "incompatible",
+    "a pending answer about another operation tells this caller nothing",
+  );
+});
+
+// --- B18: identities must be injective -----------------------------------
+
+/**
+ * Review finding (P1, src/peer.ts): `${consumer} ${scopeId}` is not injective —
+ * ("a", "b c") and ("a b", "c") produce the same key. Both fields are
+ * caller-controlled, so a consumer could collide with another scope and cause
+ * ownership conflicts, or address the wrong record in a peer that keys storage
+ * on it. `canonicalDigest` and `contractRevision` already take this care; the
+ * scope key did not.
+ */
+test("B18: scopeKey cannot be made to collide by moving the delimiter", () => {
+  const left = scopeKey({ ...scope("a", "b c") });
+  const right = scopeKey({ ...scope("a b", "c") });
+  assert.notEqual(left, right, "two different identities must not share a key");
+
+  // And it is still a function: the same identity keys the same.
+  assert.equal(scopeKey({ ...scope("a", "b c") }), left, "sanity: the key is deterministic");
+
+  // Neither field can escape its own position, whatever it contains.
+  const tricky = [
+    ["a", 'b" ,"c'],
+    ['a" ,"b', "c"],
+    ["a", "b\\c"],
+    ["a\\", "c"],
+    ["", "a b"],
+    ["a b", ""],
+  ] as const;
+  const keys = tricky.map(([consumer, scopeId]) => scopeKey({ ...scope(consumer, scopeId) }));
+  assert.equal(new Set(keys).size, keys.length, "every distinct identity gets a distinct key");
+});
+
+test("B18: a legitimate scope is not blocked by a colliding neighbour", async () => {
+  const peer = createFakePeer();
+
+  // Two genuinely different consumers whose identities collide under a
+  // space-joined key: ("consumer-a", "scope one") and ("consumer-a scope", "one").
+  const first = scope("consumer-a", "scope one");
+  const firstBind = request(first, "bind", { contract: { objective: "mine" }, memory: null }, null);
+  const firstDone = verifyReceipt(firstBind, await callPeer(peer, firstBind));
+  assert.equal(firstDone.ok, true, "sanity: the first consumer bound its scope");
+
+  const second = scope("consumer-a scope", "one");
+  const secondBind = request(second, "bind", { contract: { objective: "also mine" }, memory: null }, null);
+  const secondDone = verifyReceipt(secondBind, await callPeer(peer, secondBind));
+
+  assert.equal(
+    secondDone.ok,
+    true,
+    "a different consumer's own scope must not be refused because its key collided",
+  );
+  assert.notEqual(
+    firstDone.ok === true ? firstDone.receipt.selectedRevision : null,
+    secondDone.ok === true ? secondDone.receipt.selectedRevision : null,
+    "and the two scopes are separate records, not one",
+  );
+  assert.deepEqual(
+    peer.recordOf("scope one", "consumer-a")?.contract,
+    { objective: "mine" },
+    "the first consumer's record is untouched",
   );
 });

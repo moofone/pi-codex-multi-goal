@@ -51,6 +51,17 @@ export const GOAL_CONSUMER = "pi-codex-multi-goal";
 /** The projection profile Goal needs a peer to be able to render. */
 export const GOAL_PROJECTION_PROFILE = "current-scope@1";
 
+/**
+ * The identity of the export read a detach performs before it releases
+ * authority. It has to be derived (so a retry re-reads under the same id) and
+ * injective (so it cannot be made to name a caller's own operation): the same
+ * reasoning as scopeKey and goalScopeId. JSON escaping keeps the two parts
+ * from reaching across each other.
+ */
+export function exportReadId(operationId: string): string {
+  return JSON.stringify(["export", operationId]);
+}
+
 export function emptyBackend(): GoalBackend {
   return { state: "unbound", binding: null, pending: null, operations: [], reason: null };
 }
@@ -294,9 +305,17 @@ export function isGoalBackend(value: unknown): value is GoalBackend {
  * The stage's scope identity. `Stage.id` and not the displayed step number,
  * because the displayed number changes meaning at every transition while the id
  * does not (D7).
+ *
+ * Percent-encoded per component, because plain interpolation is not injective
+ * and both components come off a persisted snapshot: `goalScopeId("a",
+ * "b:stage:c")` and `goalScopeId("a:stage:b", "c")` would name one scope. This
+ * is not theoretical — migrateV1Goal mints stage IDs of the form
+ * `<goalId>:stage:<position>`, so the delimiter really does occur inside a
+ * component. encodeURIComponent escapes `:`, so an encoded component can never
+ * contain the separator and the identity cannot be forged from the other half.
  */
 export function goalScopeId(goalId: string, stageId: string): string {
-  return `goal:${goalId}:stage:${stageId}`;
+  return `goal:${encodeURIComponent(goalId)}:stage:${encodeURIComponent(stageId)}`;
 }
 
 /** The identity every mutation and transition carries (§3). */
@@ -1041,9 +1060,19 @@ export async function runPeerOperation(
 
   let exported: GoalMemory | undefined;
   if (params.kind === "detach") {
+    const holdSwitch = (message: string): OperationResult => {
+      // The switch stays pending with a visible reason; nothing is truncated
+      // and authority is never released on an export Goal cannot hold.
+      const held = cloneGoal(begun.goal);
+      held.backend = { ...held.backend, reason: message };
+      return { ok: false, goal: held, code: "refused", message };
+    };
     const read: PeerRequest = {
       protocolVersion: PEER_PROTOCOL_VERSION,
-      operationId: `${params.operationId}:export`,
+      // Injectively derived, not concatenated: `${id}:export` lets a caller
+      // whose own operation id happens to be `<detachId>:export` collide with
+      // this read at the peer, and be answered with that operation's receipt.
+      operationId: exportReadId(params.operationId),
       kind: "read",
       scope: cloneScope(begun.request.scope),
       expectedRevision: params.expectedRevision,
@@ -1052,11 +1081,20 @@ export async function runPeerOperation(
     const readResponse = await callPeer(client, read, options);
     const readVerified = verifyReceipt(read, readResponse);
     if (!readVerified.ok) {
+      // The export read is a PRECONDITION of the detach, not the operation
+      // itself, so its failure must never burn the detach's operation id. A
+      // retryable failure keeps the intent and marks the backend unavailable
+      // as usual; a terminal one holds the switch pending with the reason
+      // rather than quarantining an operation the peer never saw.
+      const message = `Detach refused: the export could not be read. ${readVerified.message}`;
+      if (TERMINAL_CODES.has(readVerified.code)) {
+        return holdSwitch(message);
+      }
       return {
         ok: false,
-        goal: failOperation(begun.goal, { code: readVerified.code, message: readVerified.message }),
+        goal: failOperation(begun.goal, { code: readVerified.code, message }),
         code: readVerified.code,
-        message: readVerified.message,
+        message,
       };
     }
     // An ABSENT export is not an empty one. A committed read that carries no
@@ -1073,13 +1111,6 @@ export async function runPeerOperation(
       projection && typeof projection === "object"
         ? (projection as { memory?: unknown }).memory
         : undefined;
-    const holdSwitch = (message: string): OperationResult => {
-      // The switch stays pending with a visible reason; nothing is truncated
-      // and authority is never released on an export Goal cannot hold.
-      const held = cloneGoal(begun.goal);
-      held.backend = { ...held.backend, reason: message };
-      return { ok: false, goal: held, code: "refused", message };
-    };
     if (!record || typeof record !== "object") {
       return holdSwitch(
         "Detach refused: the peer acknowledged the export read but returned no projection record, " +
