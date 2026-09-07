@@ -377,3 +377,34 @@ test("pause withdraws goal work not peer", async t => {
   assert.equal(ho.sent.length, 1, "and no goal continuation is scheduled for the peer's turns");
   void refused;
 });
+
+test("full-context exhaustion stops in-flight goal work, turns do not", async t => {
+  const limits = { noProgressLimit: 2, totalLimit: 200 };
+  const h = harness(t, { limits });
+  await h.emit("session_start");
+  await h.command(CONTRACT);
+  await h.deliver();
+  await h.emit("turn_start", { turnIndex: 0 });
+
+  await h.providerRequest();
+  await h.providerRequest();
+  await h.providerRequest();
+  assert.equal(h.current().status, "active", "tool-loop turns must not spend the full-context allowance");
+  assert.deepEqual(h.counters(), {
+    noProgressRemaining: 2,
+    totalRemaining: 197,
+    lifetimeRequests: 3,
+  });
+  assert.equal(h.aborted(), 0);
+
+  await h.compact();
+  assert.equal(h.current().status, "active");
+  assert.equal(h.current().execution.noProgressRemaining, 1);
+  assert.equal(h.aborted(), 0, "the last remaining context must still run");
+
+  await h.compact();
+  assert.equal(h.current().status, "paused");
+  assert.match(h.current().pauseReason ?? "", /full contexts/);
+  assert.equal(h.current().execution.noProgressRemaining, 0);
+  assert.equal(h.aborted(), 1, "valid exhaustion aborts in-flight goal-owned work once");
+});

@@ -132,8 +132,9 @@ function harness(t: any) {
       emit("before_provider_request", {
         payload: { model: "fake-model", messages: [{ role: "user", content: "<goal>turn</goal>" }], tools: [] },
       }),
-    spend: async (requests: number) => {
-      for (let i = 0; i < requests; i += 1) await h.providerRequest();
+    compact: () => emit("session_compact", { reason: "threshold" }),
+    spend: async (contexts: number) => {
+      for (let i = 0; i < contexts; i += 1) await h.compact();
     },
     counters: () => {
       for (let i = branch.length - 1; i >= 0; i -= 1) {
@@ -161,9 +162,10 @@ test("verified evidence resets no-progress once", async t => {
   const grantLimit = h.current().execution.noProgressLimit;
   assert.equal(grantLimit, 20, "sanity: the default grant limit");
 
-  // Spend three no-progress requests: 17/20, 197/200, 3 lifetime.
+  // Spend three no-progress full contexts: 17/20. Total/lifetime are the
+  // request budget and stay untouched by compactons.
   await h.spend(3);
-  assert.deepEqual(h.counters(), { noProgressRemaining: 17, totalRemaining: 197, lifetimeRequests: 3 });
+  assert.deepEqual(h.counters(), { noProgressRemaining: 17, totalRemaining: 200, lifetimeRequests: 0 });
 
   // A memory rewrite without evidence is a successful tool exit that changes
   // memory text — it must not reset the streak.
@@ -176,7 +178,7 @@ test("verified evidence resets no-progress once", async t => {
   assert.equal(first.ok !== false, true, "the memory rewrite itself succeeds");
   assert.deepEqual(
     h.counters(),
-    { noProgressRemaining: 17, totalRemaining: 197, lifetimeRequests: 3 },
+    { noProgressRemaining: 17, totalRemaining: 200, lifetimeRequests: 0 },
     "a memory rewrite resets nothing",
   );
 
@@ -194,8 +196,8 @@ test("verified evidence resets no-progress once", async t => {
   assert.equal(identical.ok !== false, true, "identical memory with verified evidence is accepted");
   assert.equal(h.ack(identical).credited, 1, "novel evidence on identical memory still credits once");
   assert.equal(h.counters()!.noProgressRemaining, grantLimit, "the credit resets the no-progress streak");
-  assert.equal(h.counters()!.totalRemaining, 197, "the credit never refills the total allowance");
-  assert.equal(h.counters()!.lifetimeRequests, 3, "the credit never touches lifetime requests");
+  assert.equal(h.counters()!.totalRemaining, 200, "the credit never refills the total allowance");
+  assert.equal(h.counters()!.lifetimeRequests, 0, "the credit never touches lifetime requests");
   assert.equal(h.identity().revision, revisionAfterFirst, "crediting identical memory does not bump the revision");
 
   // Repeating that same evidence on the same identical memory: no second credit.
@@ -203,7 +205,7 @@ test("verified evidence resets no-progress once", async t => {
   assert.equal(h.ack(repeatIdentical).credited, 0, "the same evidence on identical memory never credits twice");
   assert.deepEqual(
     h.counters(),
-    { noProgressRemaining: grantLimit, totalRemaining: 197, lifetimeRequests: 3 },
+    { noProgressRemaining: grantLimit, totalRemaining: 200, lifetimeRequests: 0 },
     "the repeat neither resets nor refills anything",
   );
   assert.equal(h.identity().revision, revisionAfterFirst, "the repeat still does not bump the revision");
@@ -220,8 +222,8 @@ test("verified evidence resets no-progress once", async t => {
   assert.equal(credited.ok !== false, true, "verified evidence is accepted");
   assert.equal(h.ack(credited).credited, 1, "the acknowledgement reports the credit");
   assert.equal(h.counters()!.noProgressRemaining, grantLimit, "verified evidence resets the no-progress streak");
-  assert.equal(h.counters()!.totalRemaining, 197, "a passing check never refills the total allowance");
-  assert.equal(h.counters()!.lifetimeRequests, 3, "a passing check never zeroes lifetime requests");
+  assert.equal(h.counters()!.totalRemaining, 200, "a passing check never refills the total allowance");
+  assert.equal(h.counters()!.lifetimeRequests, 0, "a passing check never zeroes lifetime requests");
 
   // Spend two, then repeat the SAME evidence: no second reset.
   await h.spend(2);
@@ -274,8 +276,8 @@ test("verified evidence resets no-progress once", async t => {
   });
   assert.equal(h.ack(investigate).credited, 1, "the investigation fixture earns its credit");
   assert.equal(h.counters()!.noProgressRemaining, grantLimit, "the investigation evidence resets the streak");
-  assert.equal(h.counters()!.totalRemaining, 192, "the total allowance is still untouched by credits");
-  assert.equal(h.counters()!.lifetimeRequests, 8, "lifetime requests are still untouched by credits");
+  assert.equal(h.counters()!.totalRemaining, 200, "the total allowance is still untouched by credits");
+  assert.equal(h.counters()!.lifetimeRequests, 0, "lifetime requests are still untouched by credits");
 
   // --- bare names and unverifiable refs still earn nothing.
   const before = h.counters();

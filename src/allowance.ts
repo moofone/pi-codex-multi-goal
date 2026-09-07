@@ -2,13 +2,18 @@ import { cloneGoal } from "./state.js";
 import { MAX_CREDITED_EVIDENCE, type GoalExecution, type MultiGoal } from "./types.js";
 
 /**
- * Persisted request accounting. The allowance is finite and durable: it lives
- * in the goal snapshot (goal.execution) and is charged once per goal-owned
- * provider request at before_provider_request time. There is no unlimited
- * mode, and nothing refunds it — reloads and retries re-read the persisted
- * numbers. Verified mid-step progress credit (Task 8) may later reset ONLY the
- * no-progress streak; nothing in this module resets anything on memory text,
- * tool success, or edit/write/apply_patch tool names.
+ * Persisted dual-unit accounting. The grant is finite and durable: it lives
+ * in the goal snapshot (goal.execution).
+ *
+ * - no-progress is one full context (a session_compact / context-window fill).
+ *   Provider requests inside a tool loop do not spend it. The legacy
+ *   `maxCompactionsWithoutMutation` number maps onto this unit.
+ * - total/lifetime is one goal-owned provider request, charged at
+ *   before_provider_request. Reloads and retries never refund.
+ *
+ * There is no unlimited mode. Verified mid-step progress credit (Task 8) may
+ * later reset ONLY the no-progress streak; nothing in this module resets
+ * anything on memory text, tool success, or edit/write/apply_patch tool names.
  */
 
 export type AllowanceExhaustion = "no-progress" | "total";
@@ -33,28 +38,52 @@ export type ChargeOutcome =
   | { type: "charged"; execution: GoalExecution }
   | { type: "charged-exhausted"; execution: GoalExecution; exhaustion: AllowanceExhaustion };
 
-/**
- * Charge exactly one goal-owned provider request. One call per provider
- * request, at provider entry, never below zero, never refunding: a refused
- * charge (allowance already at 0) records nothing, so lifetime totals only
- * ever count admitted requests.
- */
-export function chargeRequest(execution: GoalExecution): ChargeOutcome {
+function refuseIfExhausted(execution: GoalExecution): ChargeOutcome | null {
   const before = allowanceExhaustion(execution);
-  if (before) {
-    return { type: "unchanged", exhaustion: before };
-  }
-  const next: GoalExecution = {
-    ...execution,
-    noProgressRemaining: Math.max(0, execution.noProgressRemaining - 1),
-    totalRemaining: Math.max(0, execution.totalRemaining - 1),
-    lifetimeRequests: execution.lifetimeRequests + 1,
-  };
+  return before ? { type: "unchanged", exhaustion: before } : null;
+}
+
+function finishCharge(next: GoalExecution): ChargeOutcome {
   const after = allowanceExhaustion(next);
   if (after) {
     return { type: "charged-exhausted", execution: next, exhaustion: after };
   }
   return { type: "charged", execution: next };
+}
+
+/**
+ * Charge exactly one goal-owned provider request against the total budget.
+ * One call per provider request, at provider entry, never below zero, never
+ * refunding, and never touching the no-progress streak: a refused charge
+ * (allowance already at 0) records nothing, so lifetime totals only ever
+ * count admitted requests.
+ */
+export function chargeRequest(execution: GoalExecution): ChargeOutcome {
+  const refused = refuseIfExhausted(execution);
+  if (refused) {
+    return refused;
+  }
+  return finishCharge({
+    ...execution,
+    totalRemaining: Math.max(0, execution.totalRemaining - 1),
+    lifetimeRequests: execution.lifetimeRequests + 1,
+  });
+}
+
+/**
+ * Charge exactly one full context against the no-progress streak. One call
+ * per session_compact while the goal owns the session, never below zero,
+ * never refunding, and never touching the total request budget.
+ */
+export function chargeContext(execution: GoalExecution): ChargeOutcome {
+  const refused = refuseIfExhausted(execution);
+  if (refused) {
+    return refused;
+  }
+  return finishCharge({
+    ...execution,
+    noProgressRemaining: Math.max(0, execution.noProgressRemaining - 1),
+  });
 }
 
 /**
@@ -114,7 +143,7 @@ export function allowancePauseReason(
     );
   }
   return (
-    `Goal paused: ${execution.noProgressLimit} provider requests without verified progress ` +
+    `Goal paused: ${execution.noProgressLimit} full contexts without verified progress ` +
     `(no-progress allowance spent; ${execution.totalRemaining}/${execution.totalLimit} total ` +
     "requests left). /goal resume grants a fresh bounded no-progress allowance."
   );

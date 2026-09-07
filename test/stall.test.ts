@@ -1,7 +1,12 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { allowanceExhaustion, applyResumeGrant, chargeRequest } from "../src/allowance.ts";
+import {
+  allowanceExhaustion,
+  applyResumeGrant,
+  chargeContext,
+  chargeRequest,
+} from "../src/allowance.ts";
 import { createGoal } from "../src/state.ts";
 import { parseSettings } from "../src/settings.ts";
 
@@ -44,7 +49,7 @@ test("0 and null are not unlimited", () => {
   );
 });
 
-test("charges are finite, once per request, and never refund", () => {
+test("request charges spend total only, context charges spend no-progress only", () => {
   const goal = createGoal(["step"], 1);
   goal.execution = { ...goal.execution, noProgressRemaining: 3, totalRemaining: 3 };
 
@@ -56,7 +61,7 @@ test("charges are finite, once per request, and never refund", () => {
       assert.fail("a charge within the allowance must charge");
     }
     execution = outcome.execution;
-    assert.equal(execution.noProgressRemaining, i);
+    assert.equal(execution.noProgressRemaining, 3, "provider requests must not spend no-progress");
     assert.equal(execution.totalRemaining, i);
     assert.equal(execution.lifetimeRequests, 3 - i);
   }
@@ -67,9 +72,33 @@ test("charges are finite, once per request, and never refund", () => {
   const refused = chargeRequest(execution);
   assert.equal(refused.type, "unchanged");
   assert.equal(allowanceExhaustion(execution), "total");
-  assert.equal(execution.noProgressRemaining, 0);
+  assert.equal(execution.noProgressRemaining, 3);
   assert.equal(execution.totalRemaining, 0);
   assert.equal(execution.lifetimeRequests, 3);
+});
+
+test("full-context charges spend no-progress only, and never refund", () => {
+  const goal = createGoal(["step"], 1);
+  goal.execution = { ...goal.execution, noProgressRemaining: 3, totalRemaining: 10 };
+
+  let execution = goal.execution;
+  for (let i = 2; i >= 0; i -= 1) {
+    const outcome = chargeContext(execution);
+    if (outcome.type === "unchanged") {
+      assert.fail("a charge within the allowance must charge");
+    }
+    execution = outcome.execution;
+    assert.equal(execution.noProgressRemaining, i);
+    assert.equal(execution.totalRemaining, 10, "full contexts must not spend the total request budget");
+    assert.equal(execution.lifetimeRequests, 0, "full contexts are not provider requests");
+  }
+  assert.equal(allowanceExhaustion(execution), "no-progress");
+
+  const refused = chargeContext(execution);
+  assert.equal(refused.type, "unchanged");
+  assert.equal(execution.noProgressRemaining, 0);
+  assert.equal(execution.totalRemaining, 10);
+  assert.equal(execution.lifetimeRequests, 0);
 });
 
 test("user resume grants a bounded no-progress allowance only", () => {
