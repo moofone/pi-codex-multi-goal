@@ -2,11 +2,20 @@ import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
-import { DEFAULT_NO_PROGRESS_LIMIT, DEFAULT_TOTAL_LIMIT } from "./types.js";
+import {
+  DEFAULT_EVIDENCE_GRANT,
+  DEFAULT_LIFETIME_CEILING,
+  DEFAULT_NO_PROGRESS_LIMIT,
+  DEFAULT_TOTAL_LIMIT,
+  DEFAULT_TURN_LIMIT,
+} from "./types.js";
 
 export interface MultiGoalSettings {
   noProgressLimit: number;
   totalLimit: number;
+  turnLimit: number;
+  evidenceGrant: number;
+  lifetimeCeiling: number;
   settingsPath: string;
 }
 
@@ -34,6 +43,9 @@ export function parseSettings(raw: unknown, path: string): MultiGoalSettings {
   const fallback: MultiGoalSettings = {
     noProgressLimit: DEFAULT_NO_PROGRESS_LIMIT,
     totalLimit: DEFAULT_TOTAL_LIMIT,
+    turnLimit: DEFAULT_TURN_LIMIT,
+    evidenceGrant: DEFAULT_EVIDENCE_GRANT,
+    lifetimeCeiling: DEFAULT_LIFETIME_CEILING,
     settingsPath: path,
   };
   if (!raw || typeof raw !== "object") {
@@ -42,6 +54,9 @@ export function parseSettings(raw: unknown, path: string): MultiGoalSettings {
   const record = raw as {
     noProgressLimit?: unknown;
     totalLimit?: unknown;
+    turnLimit?: unknown;
+    evidenceGrant?: unknown;
+    lifetimeCeiling?: unknown;
     maxCompactionsWithoutMutation?: unknown;
   };
   const legacy = parsePositiveInteger(record.maxCompactionsWithoutMutation);
@@ -49,6 +64,9 @@ export function parseSettings(raw: unknown, path: string): MultiGoalSettings {
     noProgressLimit:
       parsePositiveInteger(record.noProgressLimit) ?? legacy ?? DEFAULT_NO_PROGRESS_LIMIT,
     totalLimit: parsePositiveInteger(record.totalLimit) ?? DEFAULT_TOTAL_LIMIT,
+    turnLimit: parsePositiveInteger(record.turnLimit) ?? DEFAULT_TURN_LIMIT,
+    evidenceGrant: parsePositiveInteger(record.evidenceGrant) ?? DEFAULT_EVIDENCE_GRANT,
+    lifetimeCeiling: parsePositiveInteger(record.lifetimeCeiling) ?? DEFAULT_LIFETIME_CEILING,
     settingsPath: path,
   };
 }

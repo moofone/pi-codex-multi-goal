@@ -3,8 +3,11 @@ import { randomUUID } from "node:crypto";
 import { parseStageTitles, validateSteps, validateTitles } from "./parse.js";
 import {
   CUSTOM_ENTRY_TYPE,
+  DEFAULT_EVIDENCE_GRANT,
+  DEFAULT_LIFETIME_CEILING,
   DEFAULT_NO_PROGRESS_LIMIT,
   DEFAULT_TOTAL_LIMIT,
+  DEFAULT_TURN_LIMIT,
   MAX_CREDITED_EVIDENCE,
   type Criterion,
   type GoalCustomEntry,
@@ -32,9 +35,22 @@ export function emptyMemory(): GoalMemory {
   return { revision: 0, proved: [], unresolved: [], next: "" };
 }
 
+/**
+ * The configurable limits of one execution grant. Only `noProgressLimit` and
+ * `totalLimit` are required; the fuses added with the D4 budget split fall back
+ * to their defaults so existing callers keep compiling and behaving.
+ */
+export interface ExecutionLimits {
+  noProgressLimit: number;
+  totalLimit: number;
+  turnLimit?: number;
+  evidenceGrant?: number;
+  lifetimeCeiling?: number;
+}
+
 /** A bounded grant: finite limits only, no unlimited mode. */
 export function freshExecution(
-  limits: { noProgressLimit: number; totalLimit: number } = {
+  limits: ExecutionLimits = {
     noProgressLimit: DEFAULT_NO_PROGRESS_LIMIT,
     totalLimit: DEFAULT_TOTAL_LIMIT,
   },
@@ -43,11 +59,32 @@ export function freshExecution(
     generation: 0,
     noProgressRemaining: limits.noProgressLimit,
     totalRemaining: limits.totalLimit,
+    turnRequests: 0,
     noProgressLimit: limits.noProgressLimit,
     totalLimit: limits.totalLimit,
+    turnLimit: limits.turnLimit ?? DEFAULT_TURN_LIMIT,
+    evidenceGrant: limits.evidenceGrant ?? DEFAULT_EVIDENCE_GRANT,
     lifetimeRequests: 0,
+    lifetimeCeiling: limits.lifetimeCeiling ?? DEFAULT_LIFETIME_CEILING,
     tokenUsage: null,
     creditedEvidence: [],
+  };
+}
+
+/**
+ * Materialise the fuses added with the D4 budget split on a snapshot written
+ * by an older build. Spent budgets are preserved exactly; only the missing
+ * limits are filled in. Without this an in-flight goal would fail validation
+ * after an upgrade and be skipped as malformed.
+ */
+function normalizeExecution(execution: GoalExecution): GoalExecution {
+  return {
+    ...execution,
+    turnRequests: execution.turnRequests ?? 0,
+    turnLimit: execution.turnLimit ?? DEFAULT_TURN_LIMIT,
+    evidenceGrant: execution.evidenceGrant ?? DEFAULT_EVIDENCE_GRANT,
+    lifetimeCeiling: execution.lifetimeCeiling ?? DEFAULT_LIFETIME_CEILING,
+    creditedEvidence: [...(execution.creditedEvidence ?? [])],
   };
 }
 
@@ -65,7 +102,7 @@ export function cloneGoal(goal: MultiGoal): MultiGoal {
       unresolved: [...goal.memory.unresolved],
       next: goal.memory.next,
     },
-    execution: { ...goal.execution, creditedEvidence: [...(goal.execution.creditedEvidence ?? [])] },
+    execution: normalizeExecution(goal.execution),
     pauseReason: goal.pauseReason,
     stages: goal.stages.map((stage) => ({
       ...stage,
@@ -224,13 +261,20 @@ export function acceptCompletion(
   if (typeof options.handoff === "string" && options.handoff.trim().length > 0) {
     next.memory.proved = [options.handoff.trim().slice(0, 512)];
   }
+  // A new step gets a fresh working budget, a fresh no-progress streak, and a
+  // fresh turn. lifetimeRequests deliberately carries across steps: the ceiling
+  // bounds the whole goal execution, not one step of it.
   next.execution = {
     generation: next.execution.generation + 1,
     noProgressRemaining: next.execution.noProgressLimit,
     totalRemaining: next.execution.totalLimit,
+    turnRequests: 0,
     noProgressLimit: next.execution.noProgressLimit,
     totalLimit: next.execution.totalLimit,
+    turnLimit: next.execution.turnLimit,
+    evidenceGrant: next.execution.evidenceGrant,
     lifetimeRequests: next.execution.lifetimeRequests,
+    lifetimeCeiling: next.execution.lifetimeCeiling,
     tokenUsage: next.execution.tokenUsage,
     creditedEvidence: [],
   };
@@ -380,6 +424,21 @@ function isGoalExecution(value: unknown): value is GoalExecution {
     (Array.isArray(credited) &&
       credited.length <= MAX_CREDITED_EVIDENCE &&
       credited.every((key) => typeof key === "string" && key.length <= 1024));
+  // The turn bound, evidence grant, and lifetime ceiling were added with the
+  // D4 budget split; snapshots persisted by earlier builds omit them and are
+  // accepted, then materialized by normalizeExecution on load.
+  const optionalCounter = (value: unknown): boolean =>
+    value === undefined || (Number.isInteger(value) && (value as number) >= 0);
+  const optionalLimit = (value: unknown): boolean =>
+    value === undefined || (Number.isInteger(value) && (value as number) > 0);
+  if (
+    !optionalCounter(execution.turnRequests) ||
+    !optionalLimit(execution.turnLimit) ||
+    !optionalLimit(execution.evidenceGrant) ||
+    !optionalLimit(execution.lifetimeCeiling)
+  ) {
+    return false;
+  }
   return (
     Number.isInteger(execution.generation) &&
     execution.generation >= 0 &&

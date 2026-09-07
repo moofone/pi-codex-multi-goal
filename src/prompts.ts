@@ -1,3 +1,4 @@
+import { budgetPressure } from "./allowance.js";
 import { currentStage } from "./state.js";
 import type { GoalMemory, MultiGoal } from "./types.js";
 
@@ -155,7 +156,13 @@ export function formatFooterStatus(
   }
   const stageLabel = `${goal.index + 1}/${goal.stages.length}`;
   if (goal.status === "active") {
-    return `Pursuing ${stageLabel}`;
+    // Budget pressure is shown only once a fuse passes its warning threshold,
+    // so an ordinary goal reads as "Pursuing 2/4" and a goal that is about to
+    // pause says which budget is running out before it does (D4).
+    const pressure = budgetPressure(goal.execution);
+    return pressure
+      ? `Pursuing ${stageLabel} · ${pressure.budget} ${pressure.percent}%`
+      : `Pursuing ${stageLabel}`;
   }
   if (goal.status === "paused") {
     return "Goal paused (/goal resume)";

@@ -67,30 +67,51 @@ contract confirm.
 
 ## Limits (provisional)
 
-Each step gets a finite execution grant. Defaults: **20** full contexts
-(compaction / context-window fills) without verified progress and **200**
-total provider requests. Turns inside a tool loop do not spend the no-progress
-allowance. There is no unlimited mode: `0`, `null`, and malformed values clamp
-to the finite defaults. Verified evidence (the same validation path completion
-uses) resets only the no-progress streak, once per novel evidence ref; memory
-rewrites, tool success, and `edit`/`write`/`apply_patch` calls alone earn
-nothing. Reloads, retries, and compaction never refund; lifetime totals never
-reset. Exhaustion pauses the goal with a persisted reason **and stops proven
-goal-owned work** (queued follow-up or in-flight goal loop). `/goal resume`
-grants a fresh bounded no-progress streak only.
+Each step gets a finite execution grant with four independent fuses, so that
+being long and being stuck are bounded separately:
+
+| Fuse | Unit | Default | Renewed by |
+|---|---|---|---|
+| no-progress | full contexts (compaction / context-window fills) | 20 | verified evidence, `/goal resume` |
+| turn | goal-owned provider requests inside one agent turn | 40 | the next agent turn, verified evidence |
+| working total | goal-owned provider requests this step | 400 | verified evidence, by a grant of 50, never above the cap |
+| lifetime | goal-owned provider requests, whole goal | 1000 | nothing |
+
+Turns inside a tool loop do not spend the no-progress allowance; a runaway loop
+is caught by the per-turn bound instead. There is no unlimited mode: `0`,
+`null`, and malformed values clamp to the finite defaults.
+
+Verified evidence (the same validation path completion uses) is what separates
+a long productive step from a stuck one. Once per novel evidence ref, it resets
+the no-progress streak, clears the per-turn bound, and returns a capped grant to
+the working total. Memory rewrites, tool success, and `edit`/`write`/`apply_patch`
+calls alone earn nothing, and nothing ever refunds `lifetimeRequests`. Reloads,
+retries, and compaction never refund. Exhaustion pauses the goal with a persisted
+reason naming the fuse that blew **and stops proven goal-owned work** (queued
+follow-up or in-flight goal loop). `/goal resume` grants a fresh bounded
+no-progress streak and starts a new turn; it never refills the working total and
+never lifts the lifetime ceiling. Once a budget passes 80 % the footer names it.
 
 Settings live in `~/.pi/agent/pi-codex-multi-goal.json`:
 
 ```json
-{ "noProgressLimit": 20, "totalLimit": 200 }
+{
+  "noProgressLimit": 20,
+  "turnLimit": 40,
+  "totalLimit": 400,
+  "evidenceGrant": 50,
+  "lifetimeCeiling": 1000
+}
 ```
 
 Migration: `maxCompactionsWithoutMutation` is the legacy name for the
 no-progress full-context limit. A positive legacy value migrates onto
 `noProgressLimit` (same unit: context windows). The old `0`/`null` "disable"
-meaning clamps to the finite defaults instead of disabling admission.
+meaning clamps to the finite defaults instead of disabling admission. A goal
+snapshot written before the per-turn bound existed loads with its spent budgets
+intact and the new limits materialized at their defaults.
 
-The 8 KiB memory limit and the 20/200 defaults are provisional pending long-run
+The 8 KiB memory limit and these defaults are provisional pending long-run
 fixture validation; bytes are not a token count.
 
 ## Host limitations (not advertised complete)

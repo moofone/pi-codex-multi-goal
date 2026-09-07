@@ -196,7 +196,7 @@ test("allowance three admits three never four", async t => {
   assertExecution(reloaded, { noProgressRemaining: 3, totalRemaining: 0, lifetimeRequests: 3 },
     "the third request exhausts the total allowance and is charged once");
   assert.match(reloaded.goalStatus(), /Status: paused/);
-  assert.match(reloaded.goalStatus(), /total request allowance exhausted/);
+  assert.match(reloaded.goalStatus(), /working budget of 3 provider requests is spent/);
 
   // Never a fourth: scheduling stops once remaining is 0, and no fourth
   // goal-owned provider entry is recorded — even though the host cannot be

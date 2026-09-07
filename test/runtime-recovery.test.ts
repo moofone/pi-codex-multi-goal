@@ -139,7 +139,7 @@ function harness(t: any, options: HarnessOptions) {
   };
 }
 
-/** Step-1 snapshot with a partially consumed execution grant (17/20, 195/200). */
+/** Step-1 snapshot with a partially consumed execution grant (17/20, 195/400). */
 function stepOneEntries() {
   const stepOne = createGoal(["first", "second", "third"], 100);
   stepOne.execution = {
@@ -168,7 +168,7 @@ function assertRestoredPausedAtStepOne(status: string): void {
   assert.match(status, /Paused: .+/, "the pause reason must be visible");
   assert.match(
     status,
-    /no-progress 17\/20, total 195\/200/,
+    /no-progress 17\/20, total 195\/400/,
     "a partially consumed grant must not be replenished",
   );
 }
@@ -219,7 +219,7 @@ test("malformed goal snapshots are skipped during branch restore", async t => {
   const status = h.goalStatus();
   assert.match(status, /Stage: 1\/3/, "a malformed tail must not lose the last valid snapshot");
   assert.match(status, /Status: paused/);
-  assert.match(status, /total 195\/200/, "malformed entries must not replenish the grant");
+  assert.match(status, /total 195\/400/, "malformed entries must not replenish the grant");
 });
 
 test("persist failure admits no goal work and notifies", async t => {

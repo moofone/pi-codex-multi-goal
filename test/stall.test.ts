@@ -12,7 +12,7 @@ import { parseSettings } from "../src/settings.ts";
 
 test("0 and null are not unlimited", () => {
   const path = "/tmp/pi-codex-multi-goal.json";
-  const defaults = { noProgressLimit: 20, totalLimit: 200 };
+  const defaults = { noProgressLimit: 20, totalLimit: 400 };
   const finite = (raw: unknown) => {
     const settings = parseSettings(raw, path);
     return { noProgressLimit: settings.noProgressLimit, totalLimit: settings.totalLimit };
@@ -39,7 +39,7 @@ test("0 and null are not unlimited", () => {
   );
   assert.deepEqual(
     finite({ maxCompactionsWithoutMutation: 7 }),
-    { noProgressLimit: 7, totalLimit: 200 },
+    { noProgressLimit: 7, totalLimit: 400 },
     "the legacy compaction key migrates onto the no-progress limit",
   );
   assert.deepEqual(
