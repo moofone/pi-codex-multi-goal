@@ -369,6 +369,30 @@ test("unfinished idle turn forces continuation with the current snapshot", async
   assert.equal(hDone.sent.length, 1, "a completed goal does not force continuation");
 });
 
+test("user-owned turns do not force goal continuation", async t => {
+  const hUser = harness(t);
+  await hUser.emit("session_start");
+  await hUser.command(CONTRACT);
+  await hUser.deliver();
+  await hUser.userSays("do this other thing instead");
+  await hUser.emit("turn_start", { turnIndex: 0 });
+  await hUser.emit("agent_end", { messages: [] });
+  assert.equal(hUser.current().status, "active", "a user turn leaves an active goal alone");
+  assert.equal(hUser.sent.length, 1, "a user-owned turn does not force an unsolicited goal continuation");
+
+  const hAbort = harness(t);
+  await hAbort.emit("session_start");
+  await hAbort.command(CONTRACT);
+  await hAbort.deliver();
+  await hAbort.userSays("stop");
+  await hAbort.emit("turn_start", { turnIndex: 0 });
+  await hAbort.emit("agent_end", {
+    messages: [{ role: "assistant", stopReason: "aborted" }],
+  });
+  assert.equal(hAbort.current().status, "active", "aborting a user-owned turn does not pause the goal");
+  assert.equal(hAbort.sent.length, 1, "an aborted user turn does not force an unsolicited goal continuation");
+});
+
 test("pause withdraws goal work not peer", async t => {
   // --- pause drops the queued follow-up and aborts exactly once.
   const h = harness(t);

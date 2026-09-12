@@ -761,9 +761,17 @@ export function registerMultiGoal(pi: ExtensionAPI): void {
       const stamp = (message as { timestamp?: unknown } | null)?.timestamp;
       return typeof stamp === "number" ? stamp : 0;
     };
-    const isCurrentGoalSnapshot = (message: unknown): boolean =>
-      (message as { role?: unknown } | null)?.role === "custom" &&
-      !isNonCurrentGoalMessage(message, goal);
+    const isCurrentGoalSnapshot = (message: unknown): boolean => {
+      if (!message || typeof message !== "object") {
+        return false;
+      }
+      const record = message as { role?: unknown; customType?: unknown };
+      return (
+        record.role === "custom" &&
+        record.customType === CUSTOM_ENTRY_TYPE &&
+        !isNonCurrentGoalMessage(message, goal)
+      );
+    };
     // Old-step tool-call identity: ids of accepted completions for this goal,
     // plus ids of tool calls issued at or before the boundary (the completing
     // turn's call is among them; a restart empties the in-memory map, the
@@ -856,6 +864,7 @@ export function registerMultiGoal(pi: ExtensionAPI): void {
     // only a goal-owned turn's abort invalidates goal execution. A peer or
     // user turn aborting is not ours to act on (F07).
     const goalOwnedTurn = continuation.goalTurnInFlight();
+    const goalOwned = continuation.goalOwned();
     continuation.agentLoopEnded();
     const aborted = event.messages.some(
       (message) => message.role === "assistant" && "stopReason" in message && message.stopReason === "aborted",
@@ -870,11 +879,13 @@ export function registerMultiGoal(pi: ExtensionAPI): void {
         }
       }
     }
-    // Force keep going: if the model ended a turn without completing, blocking,
-    // or pausing this stage, send exactly one current-snapshot continuation.
-    // Queued/idle/yield/exhaustion still gate it — this is not reminder spam
-    // inside a running turn; the loop already ended.
-    requestContinuation(ctx);
+    // Force keep going only for a goal-owned turn that was not aborted: a
+    // user-owned (or user-aborted) agent_end must not inject an unsolicited
+    // continuation over the user's interaction. Queued/idle/yield/exhaustion
+    // still gate the send — this is not reminder spam inside a running turn.
+    if (goalOwned && !aborted) {
+      requestContinuation(ctx);
+    }
   });
 
   pi.on("session_shutdown", (_event, ctx) => {
