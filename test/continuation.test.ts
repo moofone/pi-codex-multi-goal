@@ -19,7 +19,8 @@ import { CUSTOM_ENTRY_TYPE } from "../src/types.ts";
 //   - an unfinished idle turn after delivery sends exactly one continuation
 //     whose snapshot is the CURRENT goal (latest memory/contract), not the
 //     kickoff — force keep going, still at most one pending, including after
-//     a user-owned turn (talking is not waiting; abort/pause/complete still stop);
+//     a user-owned turn or an aborted turn (abort cancels the turn, not the goal);
+//     the harness stops only on complete, blocked, or no-progress exhaustion;
 //   - a context boundary sends at most one continuation, and only after the
 //     previous continuation's delivery was acknowledged (queued / delivered /
 //     eligible-for-next-boundary — no stacking);
@@ -357,8 +358,8 @@ test("unfinished idle turn forces continuation with the current snapshot", async
   await hAbort.emit("agent_end", {
     messages: [{ role: "assistant", stopReason: "aborted" }],
   });
-  assert.equal(hAbort.current().status, "paused");
-  assert.equal(hAbort.sent.length, 1, "an aborted goal turn does not force continuation");
+  assert.equal(hAbort.current().status, "active", "abort cancels the turn, not the goal");
+  assert.equal(hAbort.sent.length, 2, "an aborted unfinished turn must still keep going");
 
   const hDone = harness(t);
   await hDone.emit("session_start");
@@ -368,6 +369,28 @@ test("unfinished idle turn forces continuation with the current snapshot", async
   assert.equal(hDone.current().status, "complete");
   await hDone.emit("agent_end", { messages: [] });
   assert.equal(hDone.sent.length, 1, "a completed goal does not force continuation");
+
+  const hBlock = harness(t);
+  await hBlock.emit("session_start");
+  await hBlock.command(CONTRACT);
+  await hBlock.deliver();
+  await hBlock.block();
+  assert.equal(hBlock.current().status, "blocked");
+  const sentAfterBlock = hBlock.sent.length;
+  await hBlock.emit("agent_end", { messages: [] });
+  assert.equal(hBlock.sent.length, sentAfterBlock, "a blocked goal does not keep going");
+
+  const hBudget = harness(t, { limits: { noProgressLimit: 1, totalLimit: 200 } });
+  await hBudget.emit("session_start");
+  await hBudget.command(CONTRACT);
+  await hBudget.deliver();
+  const sentBeforeBudget = hBudget.sent.length;
+  await hBudget.compact();
+  assert.equal(hBudget.current().status, "paused", "no-progress budget is a legal stop");
+  assert.match(hBudget.current().pauseReason ?? "", /full contexts/);
+  assert.equal(hBudget.sent.length, sentBeforeBudget, "no-progress exhaustion does not keep going");
+  await hBudget.emit("agent_end", { messages: [] });
+  assert.equal(hBudget.sent.length, sentBeforeBudget, "an exhausted goal stays stopped after agent_end");
 });
 
 test("user-owned unfinished turns still force one continuation", async t => {
@@ -397,7 +420,7 @@ test("user-owned unfinished turns still force one continuation", async t => {
     messages: [{ role: "assistant", stopReason: "aborted" }],
   });
   assert.equal(hAbort.current().status, "active", "aborting a user-owned turn does not pause the goal");
-  assert.equal(hAbort.sent.length, 1, "an aborted user turn does not restart the goal");
+  assert.equal(hAbort.sent.length, 2, "an aborted user-owned turn must still keep going");
 });
 
 test("pause withdraws goal work not peer", async t => {
