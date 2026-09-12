@@ -866,33 +866,12 @@ export function registerMultiGoal(pi: ExtensionAPI): void {
     requestContinuation(ctx, undefined, { atContextBoundary: true });
   });
 
-  pi.on("agent_end", (event, ctx) => {
-    // Ownership of the abort is decided before the loop bookkeeping resets:
-    // only a goal-owned turn's abort invalidates goal execution. A peer or
-    // user turn aborting is not ours to act on (F07).
-    const goalOwnedTurn = continuation.goalTurnInFlight();
+  pi.on("agent_end", (_event, ctx) => {
     continuation.agentLoopEnded();
-    const aborted = event.messages.some(
-      (message) => message.role === "assistant" && "stopReason" in message && message.stopReason === "aborted",
-    );
-    if (aborted && goalOwnedTurn) {
-      const goal = persistence.getGoal();
-      if (goal?.status === "active") {
-        const paused = setGoalStatus(goal, "paused");
-        if (paused.ok && paused.goal) {
-          continuation.clear();
-          persist(paused.goal, "runtime", ctx);
-        }
-      }
-    }
-    // Force keep going: the model stopping is not completion. An unfinished
-    // idle agent_end — goal-owned or user-owned — sends exactly one current
-    // snapshot. Talking to the user is not waiting; the legal wait is
-    // update_goal blocked. Escape/abort is a stop and must not restart.
-    // Queued/idle/yield/exhaustion still gate the send.
-    if (!aborted) {
-      requestContinuation(ctx);
-    }
+    // Always keep going. Abort cancels the turn, not the goal. Admission
+    // already refuses complete, blocked, exhausted, paused, and yield — those
+    // are the only harness stops. Queued/idle still gate the send.
+    requestContinuation(ctx);
   });
 
   pi.on("session_shutdown", (_event, ctx) => {

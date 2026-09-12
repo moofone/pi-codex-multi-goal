@@ -93,9 +93,10 @@ inside a running turn, but do not let an unfinished stage go idle.
 - When an agent loop ends and the goal is still active, send exactly one
   continuation whose snapshot is the CURRENT goal (latest memory/contract).
   That is force keep going: the model stopping is not completion. User-owned
-  idle ends are included — talking is not waiting; the legal wait for the user
-  is `update_goal blocked`. An aborted turn (Escape) does not restart. At most
-  one continuation may be pending; queued/idle/yield/exhaustion still gate it.
+  and aborted turns are included — abort cancels the turn, not the goal. The
+  harness stops only on complete, a real `update_goal blocked`, or the
+  no-progress budget. At most one continuation may be pending; queued/idle/yield
+  still gate the send.
 - Compaction still refreshes the snapshot after a full context, so recovery
   after context loss is the same current goal, not a growing reminder history.
 - The provider-visible context keeps exactly one current-step snapshot — the
@@ -282,8 +283,9 @@ verified evidence:
   bounded separately: a step doing real work is not killed for its length.
 - **Continuation (invariants 3, 4):** queued / delivered /
   eligible-for-next-boundary with delivery acknowledgement; one kickoff; an
-  unfinished idle `agent_end` (goal-owned or user-owned) sends exactly one
-  current-snapshot continuation (force keep going); abort/pause/complete do not;
+  unfinished idle `agent_end` (goal-owned, user-owned, or aborted) sends exactly
+  one current-snapshot continuation (force keep going); complete, blocked, and
+  no-progress exhaustion do not;
   compact may refresh once after delivery; at most one
   pending; the context filter keeps only the latest current-step snapshot;
   peer-owned sessions are neither charged nor advanced and never aborted.
