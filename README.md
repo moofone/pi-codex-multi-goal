@@ -3,8 +3,10 @@
 Codex-style `/goal` for Pi: the human defines the objective and its success
 criteria; the harness owns execution limits, accounting, and step transitions.
 The model sees only the current step's contract plus one small working-memory
-record, injected at step start and at eligible context boundaries — never the
-whole sequence, other steps, or previous transcripts.
+record — the latest snapshot of THIS goal, injected at step start, again when
+an unfinished turn goes idle (force keep going), and at eligible context
+boundaries. Never the whole sequence, other steps, previous transcripts, or a
+pile of stale wrappers.
 
 ## Install
 

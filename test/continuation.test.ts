@@ -14,10 +14,14 @@ import { CUSTOM_ENTRY_TYPE } from "../src/types.ts";
 // and abort are host events the harness emits explicitly).
 //
 // Proven here:
-//   - the kickoff sends exactly once; ordinary agent_end turns never send;
-//   - a context boundary sends exactly one continuation, and only after the
+//   - the kickoff sends exactly once; a queued kickoff is not stacked by
+//     agent_end or compact;
+//   - an unfinished idle turn after delivery sends exactly one continuation
+//     whose snapshot is the CURRENT goal (latest memory/contract), not the
+//     kickoff — force keep going, still at most one pending;
+//   - a context boundary sends at most one continuation, and only after the
 //     previous continuation's delivery was acknowledged (queued / delivered /
-//     eligible-for-next-boundary — no per-turn reminder spam, no stacking);
+//     eligible-for-next-boundary — no stacking);
 //   - delivery is revalidated against goal/step/generation/status, so a stale
 //     continuation arms nothing;
 //   - pause/clear/block/replacement withdraw goal-owned work (drop the queued
@@ -74,6 +78,7 @@ function harness(t: any, options: HarnessOptions = {}) {
   const handlers = new Map<string, any>();
   const commands = new Map<string, any>();
   let goalTool: any;
+  const tools = new Map<string, any>();
   const sent: Array<{ message: any; options: any }> = [];
   const pending: any[] = [];
   let aborts = 0;
@@ -99,7 +104,10 @@ function harness(t: any, options: HarnessOptions = {}) {
   const pi: any = {
     on: (name: string, fn: any) => handlers.set(name, fn),
     registerCommand: (name: string, command: any) => commands.set(name, command),
-    registerTool: (tool: any) => { goalTool = tool; },
+    registerTool: (tool: any) => {
+      tools.set(tool.name, tool);
+      if (tool.name === "update_goal") goalTool = tool;
+    },
     appendEntry: (customType: string, data: unknown) => {
       const entry = { type: "custom", customType, data };
       entries.push(entry);
@@ -165,6 +173,8 @@ function harness(t: any, options: HarnessOptions = {}) {
         criteria,
       };
     },
+    memory: (params: any, id = "memory-call") =>
+      tools.get("update_goal_memory").execute(id, params, new AbortController().signal, undefined, ctx),
     complete: (id = "same-completion") => {
       const goal = entries.at(-1)?.data.goal;
       return goalTool.execute(id, {
@@ -221,11 +231,11 @@ test("one kickoff one boundary no per-turn spam", async t => {
   assert.equal(h.sent[0]!.message.details.kind, "command_resume");
   assert.equal(h.pending.length, 1);
 
-  // Ordinary turn ends never schedule goal work.
+  // A queued kickoff is not stacked by idle ends or a compact.
   await h.emit("agent_end", { messages: [] });
   await h.emit("agent_end", { messages: [] });
   await h.emit("agent_end", { messages: [] });
-  assert.equal(h.sent.length, 1, "ordinary agent_end does not send");
+  assert.equal(h.sent.length, 1, "queued kickoff is not stacked by agent_end");
 
   // A boundary while the kickoff is still queued must not stack a second one.
   await h.compact();
@@ -235,14 +245,14 @@ test("one kickoff one boundary no per-turn spam", async t => {
   await h.deliver();
 
   await h.emit("agent_end", { messages: [] });
-  assert.equal(h.sent.length, 1, "a delivered kickoff does not re-send on turn end");
-
-  // The eligible context boundary sends exactly one continuation.
-  await h.compact();
-  assert.equal(h.sent.length, 2, "an eligible context-boundary compact sends exactly one continuation");
+  assert.equal(h.sent.length, 2, "an unfinished idle turn forces exactly one continuation");
   assert.equal(h.sent[1]!.message.details.kind, "continuation");
   assert.match(JSON.stringify(h.sent[1]!.message.content), /<goal>/);
-  assert.equal(h.pending.length, 1, "the boundary continuation is itself queued until acknowledged");
+  assert.equal(h.pending.length, 1, "the forced continuation is itself queued until acknowledged");
+
+  // Compact must not stack on top of that queued follow-up.
+  await h.compact();
+  assert.equal(h.sent.length, 2, "compact does not stack on a queued forced continuation");
 
   // No stacking while that one is queued.
   await h.compact();
@@ -280,7 +290,107 @@ test("one kickoff one boundary no per-turn spam", async t => {
 
   await h.deliver();
   await h.emit("agent_end", { messages: [] });
-  assert.equal(h.sent.length, 5, "still no per-turn sends");
+  assert.equal(h.sent.length, 6, "an unfinished idle turn on the next step still forces one continuation");
+});
+
+test("unfinished idle turn forces continuation with the current snapshot", async t => {
+  const h = harness(t);
+  await h.emit("session_start");
+  await h.command(CONTRACT);
+  assert.equal(h.sent.length, 1, "kickoff sends once");
+  const kickoff = String(h.sent[0]!.message.content);
+  assert.equal(kickoff.includes("<proved>"), false, "sanity: kickoff has empty memory");
+
+  await h.deliver();
+  await h.emit("turn_start", { turnIndex: 0 });
+
+  const goal = h.current();
+  const proved = ["proved: noise-line blake3 key cached (artifact: rank32_pipeline.cu)"];
+  const unresolved = ["unresolved: CPU blake3 still dominates wall time"];
+  const next = "parallelize remaining CPU noise work";
+  await h.memory({
+    goalId: goal.goalId,
+    step: goal.index + 1,
+    generation: goal.execution.generation,
+    revision: goal.memory.revision,
+    proved,
+    unresolved,
+    next,
+  });
+  assert.equal(h.current().memory.revision, 1, "sanity: current memory replaced");
+
+  // The model stops without complete/blocked — the live failure mode.
+  await h.emit("agent_end", { messages: [] });
+  assert.equal(h.sent.length, 2, "an unfinished idle turn must force exactly one continuation");
+  assert.equal(h.sent[1]!.message.details.kind, "continuation");
+  assert.equal(h.sent[1]!.options.triggerTurn, true);
+  const snapshot = String(h.sent[1]!.message.content);
+  assert.match(snapshot, /<goal>/);
+  assert.ok(snapshot.includes(goal.goalId), "forced continuation is THIS goal");
+  assert.match(snapshot, /revision="1"/);
+  assert.ok(snapshot.includes(proved[0]!), "forced continuation uses current proved, not the kickoff");
+  assert.ok(snapshot.includes(unresolved[0]!));
+  assert.ok(snapshot.includes(next));
+  assert.ok(snapshot.includes("Do not stop until you call update_goal"), "snapshot tells the model to keep going");
+  assert.equal(kickoff.includes(proved[0]!), false, "kickoff must not have been rewritten in place");
+
+  await h.emit("agent_end", { messages: [] });
+  assert.equal(h.sent.length, 2, "queued forced continuation is not stacked");
+
+  await h.deliver();
+  await h.emit("agent_end", { messages: [] });
+  assert.equal(h.sent.length, 3, "after delivery the next idle end keeps the goal moving");
+  assert.ok(String(h.sent[2]!.message.content).includes(proved[0]!), "later continuations still carry current memory");
+
+  await h.command("pause");
+  const sentAfterPause = h.sent.length;
+  await h.emit("agent_end", { messages: [] });
+  assert.equal(h.current().status, "paused");
+  assert.equal(h.sent.length, sentAfterPause, "pause stops forced continuation");
+
+  const hAbort = harness(t);
+  await hAbort.emit("session_start");
+  await hAbort.command(CONTRACT);
+  await hAbort.deliver();
+  await hAbort.emit("turn_start", { turnIndex: 0 });
+  await hAbort.emit("agent_end", {
+    messages: [{ role: "assistant", stopReason: "aborted" }],
+  });
+  assert.equal(hAbort.current().status, "paused");
+  assert.equal(hAbort.sent.length, 1, "an aborted goal turn does not force continuation");
+
+  const hDone = harness(t);
+  await hDone.emit("session_start");
+  await hDone.command(CONTRACT);
+  await hDone.deliver();
+  await hDone.complete();
+  assert.equal(hDone.current().status, "complete");
+  await hDone.emit("agent_end", { messages: [] });
+  assert.equal(hDone.sent.length, 1, "a completed goal does not force continuation");
+});
+
+test("user-owned turns do not force goal continuation", async t => {
+  const hUser = harness(t);
+  await hUser.emit("session_start");
+  await hUser.command(CONTRACT);
+  await hUser.deliver();
+  await hUser.userSays("do this other thing instead");
+  await hUser.emit("turn_start", { turnIndex: 0 });
+  await hUser.emit("agent_end", { messages: [] });
+  assert.equal(hUser.current().status, "active", "a user turn leaves an active goal alone");
+  assert.equal(hUser.sent.length, 1, "a user-owned turn does not force an unsolicited goal continuation");
+
+  const hAbort = harness(t);
+  await hAbort.emit("session_start");
+  await hAbort.command(CONTRACT);
+  await hAbort.deliver();
+  await hAbort.userSays("stop");
+  await hAbort.emit("turn_start", { turnIndex: 0 });
+  await hAbort.emit("agent_end", {
+    messages: [{ role: "assistant", stopReason: "aborted" }],
+  });
+  assert.equal(hAbort.current().status, "active", "aborting a user-owned turn does not pause the goal");
+  assert.equal(hAbort.sent.length, 1, "an aborted user turn does not force an unsolicited goal continuation");
 });
 
 test("pause withdraws goal work not peer", async t => {

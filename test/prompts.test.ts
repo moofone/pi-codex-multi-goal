@@ -48,6 +48,7 @@ test("wrapper includes current criteria and memory only", () => {
   assert.match(wrapper, /<proved>\n- proved: lockfile pinned \(artifact: package-lock\.json\)\n<\/proved>/);
   assert.match(wrapper, /<unresolved>\n- unresolved: sign-off pending\n<\/unresolved>/);
   assert.match(wrapper, /<next>\nrerun the install check\n<\/next>/);
+  assert.match(wrapper, /Do not stop until you call update_goal complete or blocked for THIS stage/);
 
   // No other step titles, and no stale memory content.
   assert.equal(wrapper.includes("pin duplicate"), false);

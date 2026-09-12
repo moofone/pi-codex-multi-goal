@@ -83,21 +83,27 @@ maintains a small evidence record, and reports completion or a blocker.
 - Handoff must not cancel the peer's work, lose user input, duplicate a queued
   continuation, or revive a paused goal. With no goal active, the extension is inert.
 
-## 4. Goal checks happen near the context boundary
+## 4. Keep the current goal in front of the model until it finishes
 
-Here, "Codex-style" means the desired interaction pattern: let the model work
-without repeatedly asking it to reconsider the goal.
+Here, "Codex-style" means: let the model work without stacking reminder spam
+inside a running turn, but do not let an unfinished stage go idle.
 
-- Introduce the current objective at step start. Schedule routine goal review
-  near the end of the context window, around the compaction boundary, rather
-  than injecting a goal check after every turn or agent-end event.
-- Boundary checks decide whether to continue, complete, or report a blocker
-  using the current objective and available evidence. Recovery retains a compact
-  representation of that objective without accumulating reminder history.
+- Introduce the current objective at step start. The snapshot is the current
+  step's contract plus working memory — never other steps.
+- When an agent loop ends and the goal is still active, send exactly one
+  continuation whose snapshot is the CURRENT goal (latest memory/contract).
+  That is force keep going: the model stopping is not completion. At most one
+  continuation may be pending; queued/idle/yield/exhaustion still gate it.
+- Compaction still refreshes the snapshot after a full context, so recovery
+  after context loss is the same current goal, not a growing reminder history.
+- The provider-visible context keeps exactly one current-step snapshot — the
+  latest. Earlier wrappers for the same step are dropped so the model cannot
+  work from stale memory. In-step user/assistant/tool work is not cut off by
+  the newest snapshot's timestamp.
 - Completion, blockers, user pause, and safety exhaustion may be handled as soon
   as they occur; they do not need to wait for a full context window.
-- Silent accounting is separate from model-facing goal review. Sparse
-  reminders must never create an unbounded tool loop or bypass the execution limits.
+- Silent accounting is separate from model-facing goal review. Forced
+  continuations must never bypass the execution limits.
 
 ## 5. Optional steps are deterministic and isolated
 
@@ -227,7 +233,9 @@ runtime tests, including controlled model responses:
   and stop proven goal-owned work.
 - Relevant research and validation can count as progress; repeated no-op activity
   cannot. Reload and compaction do not erase a partially consumed allowance.
-- Ordinary turns do not inject goal-review prompts; the context boundary does.
+- An unfinished idle turn forces exactly one current-snapshot continuation; a
+  queued continuation is never stacked; the model view holds exactly one current
+  snapshot (the latest).
 - With pi-orchestrate driving the session, no competing goal execution occurs;
   handoff preserves state and schedules at most one continuation.
 - Each step starts with an isolated model context and its own allowance. Replayed
@@ -268,9 +276,11 @@ verified evidence:
   never refills and the ceiling never lifts. Being long and being stuck are
   bounded separately: a step doing real work is not killed for its length.
 - **Continuation (invariants 3, 4):** queued / delivered /
-  eligible-for-next-boundary with delivery acknowledgement; one kickoff, zero
-  per-turn reminders, one snapshot per eligible boundary; peer-owned sessions
-  are neither charged nor advanced and never aborted.
+  eligible-for-next-boundary with delivery acknowledgement; one kickoff; an
+  unfinished idle `agent_end` sends exactly one current-snapshot continuation
+  (force keep going); compact may refresh once after delivery; at most one
+  pending; the context filter keeps only the latest current-step snapshot;
+  peer-owned sessions are neither charged nor advanced and never aborted.
 - **Transitions (invariant 5):** terminal tools bound to goal/step/generation,
   idempotent under replay; completion requires criterion coverage from valid
   evidence (human-decision criteria block); accepted completion persists, drops

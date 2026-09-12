@@ -385,11 +385,9 @@ test("next context is clean or kickoff is withheld", async t => {
     const withBoundary = [...stepWork, asCustom(h.sent[0]!, 3000)];
     const boundaryView = await h.context(withBoundary);
     const boundaryMessages = boundaryView?.messages ?? withBoundary;
-    assert.equal(
-      boundaryMessages.filter((m: any) => m.role === "custom" && m.details?.stage === 1).length,
-      2,
-      "both current-step snapshots remain",
-    );
+    const snapshots = boundaryMessages.filter((m: any) => m.role === "custom" && m.details?.stage === 1);
+    assert.equal(snapshots.length, 1, "exactly one current-step snapshot remains");
+    assert.equal(snapshots[0]!.timestamp, 3000, "the model sees THIS (latest) snapshot, not a pile of stale wrappers");
     const boundaryVisible = JSON.stringify(boundaryMessages);
     assert.ok(boundaryVisible.includes("please start with the first step"), "a later boundary snapshot keeps the earlier user message");
     assert.ok(boundaryVisible.includes("working on step one"), "a later boundary snapshot keeps the in-step assistant turn");
@@ -476,4 +474,44 @@ test("next context is clean or kickoff is withheld", async t => {
   const resumedVisible = JSON.stringify(resumed?.messages ?? []);
   assert.equal(resumedVisible.includes("PREVIOUS_STEP_TRANSCRIPT_SENTINEL"), false);
   assert.ok(resumedVisible.includes("second"), "the resumed kickoff is the new step's snapshot");
+});
+
+test("unrelated custom messages do not displace the current goal snapshot", async t => {
+  const h = harness(t, { seed: seededGoal() });
+  await h.emit("session_start");
+  await h.command("resume");
+  assert.equal(h.sent.length, 1, "sanity: the kickoff went out");
+  await h.deliver();
+
+  const asSnapshot = (timestamp: number) => ({
+    role: "custom",
+    customType: CUSTOM_ENTRY_TYPE,
+    content: h.sent[0]!.message.content,
+    display: h.sent[0]!.message.display,
+    details: h.sent[0]!.message.details,
+    timestamp,
+  });
+  const foreign = {
+    role: "custom",
+    customType: "some-other-extension",
+    content: "FOREIGN_CUSTOM_PAYLOAD",
+    details: { kind: "unrelated" },
+    timestamp: 4000,
+  };
+  const original = [
+    { role: "user", content: "please start with the first step", timestamp: 1000 },
+    asSnapshot(1500),
+    { role: "assistant", content: [{ type: "text", text: "working on step one" }], timestamp: 2000 },
+    asSnapshot(3000),
+    foreign,
+  ];
+  const filtered = await h.context(original);
+  const messages = filtered?.messages ?? original;
+  const goalSnapshots = messages.filter((m: any) => m.role === "custom" && m.customType === CUSTOM_ENTRY_TYPE);
+  assert.equal(goalSnapshots.length, 1, "exactly one current goal snapshot remains");
+  assert.equal(goalSnapshots[0]!.timestamp, 3000, "the latest current goal wrapper stays in the provider context");
+  assert.ok(
+    messages.some((m: any) => m.customType === "some-other-extension" && String(m.content).includes("FOREIGN_CUSTOM_PAYLOAD")),
+    "an unrelated custom message is not treated as a goal snapshot and is retained",
+  );
 });

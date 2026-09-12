@@ -40,8 +40,9 @@ interface ContinuationDeps {
  *   acknowledged — while queued, no second continuation may be scheduled;
  * - `delivered`: the host acknowledged delivery on its message events; this
  *   arms eligibility for exactly one continuation at the next context
- *   boundary. A context boundary with no armed eligibility sends nothing, and
- *   ordinary `agent_end` turns never send at all.
+ *   boundary. A context boundary with no armed eligibility sends nothing.
+ *   An unfinished idle `agent_end` (goal still active) sends exactly one
+ *   current-snapshot continuation — force keep going, still at most one pending.
  *
  * Delivery is revalidated against the current goal/step/generation/status (and
  * ownership when a context is available): a stale delivery arms nothing. The
@@ -211,6 +212,14 @@ export function createContinuation(deps: ContinuationDeps) {
   const goalTurnInFlight = (): boolean => goalLoopInFlight;
 
   /**
+   * Read BEFORE agentLoopEnded() when handling agent_end. True while a
+   * delivered goal continuation still owns the loop — including after
+   * delivery and before agent_start/turn_start. userMessageDelivered()
+   * takes precedence, so a user-owned (or user-interrupted) loop is false.
+   */
+  const goalOwned = (): boolean => loopTrigger === "goal";
+
+  /**
    * True only when cancellation provably targets goal-owned work: a queued
    * continuation this extension submitted with no user message in front of it,
    * or an in-flight loop the delivered goal continuation started. Peer and
@@ -238,6 +247,7 @@ export function createContinuation(deps: ContinuationDeps) {
     agentLoopStarted,
     agentLoopEnded,
     goalTurnInFlight,
+    goalOwned,
     outstanding,
     queuedStale,
   };

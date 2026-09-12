@@ -715,10 +715,11 @@ export function registerMultiGoal(pi: ExtensionAPI): void {
 
   // The isolation boundary (F06/A08), built on probe 3: a context handler's
   // returned { messages } replaces the provider-visible list. The CURRENT
-  // step's snapshot (customType + details.goalId/stage) is always kept
+  // step's LATEST snapshot (customType + details.goalId/stage) is kept
   // regardless of its timestamp — including a snapshot stamped exactly at the
-  // cutoff (host clock tie) — and every other extension goal message is always
-  // dropped, so the model view holds exactly one current goal context.
+  // cutoff (host clock tie) — earlier current-step wrappers are dropped, and
+  // every other extension goal message is always dropped, so the model view
+  // holds exactly one current goal context (THIS snapshot, with current memory).
   // isolationCutoff applies only when it is non-null: non-snapshot messages at
   // or before the boundary belong to the completed step (its transcript, its
   // tool results, its memory) and are dropped. The completing turn's own
@@ -760,9 +761,17 @@ export function registerMultiGoal(pi: ExtensionAPI): void {
       const stamp = (message as { timestamp?: unknown } | null)?.timestamp;
       return typeof stamp === "number" ? stamp : 0;
     };
-    const isCurrentGoalSnapshot = (message: unknown): boolean =>
-      (message as { role?: unknown } | null)?.role === "custom" &&
-      !isNonCurrentGoalMessage(message, goal);
+    const isCurrentGoalSnapshot = (message: unknown): boolean => {
+      if (!message || typeof message !== "object") {
+        return false;
+      }
+      const record = message as { role?: unknown; customType?: unknown };
+      return (
+        record.role === "custom" &&
+        record.customType === CUSTOM_ENTRY_TYPE &&
+        !isNonCurrentGoalMessage(message, goal)
+      );
+    };
     // Old-step tool-call identity: ids of accepted completions for this goal,
     // plus ids of tool calls issued at or before the boundary (the completing
     // turn's call is among them; a restart empties the in-memory map, the
@@ -804,9 +813,17 @@ export function registerMultiGoal(pi: ExtensionAPI): void {
       }
       return false;
     };
-    const messages = event.messages.filter((message) => {
+    let lastCurrentSnapshot = -1;
+    for (let i = 0; i < event.messages.length; i += 1) {
+      if (isCurrentGoalSnapshot(event.messages[i])) {
+        lastCurrentSnapshot = i;
+      }
+    }
+    const messages = event.messages.filter((message, index) => {
       if (isCurrentGoalSnapshot(message)) {
-        return true; // always visible, regardless of its stamp
+        // Always keep THIS (latest) snapshot, regardless of its stamp; drop
+        // earlier current-step wrappers so the model cannot work from stale memory.
+        return index === lastCurrentSnapshot;
       }
       if (isNonCurrentGoalMessage(message, goal)) {
         return false; // other extension goal messages never surface
@@ -847,6 +864,7 @@ export function registerMultiGoal(pi: ExtensionAPI): void {
     // only a goal-owned turn's abort invalidates goal execution. A peer or
     // user turn aborting is not ours to act on (F07).
     const goalOwnedTurn = continuation.goalTurnInFlight();
+    const goalOwned = continuation.goalOwned();
     continuation.agentLoopEnded();
     const aborted = event.messages.some(
       (message) => message.role === "assistant" && "stopReason" in message && message.stopReason === "aborted",
@@ -861,8 +879,13 @@ export function registerMultiGoal(pi: ExtensionAPI): void {
         }
       }
     }
-    // No continuation request on ordinary turn ends: model-facing snapshots
-    // are scheduled at step start and eligible context boundaries only (A06).
+    // Force keep going only for a goal-owned turn that was not aborted: a
+    // user-owned (or user-aborted) agent_end must not inject an unsolicited
+    // continuation over the user's interaction. Queued/idle/yield/exhaustion
+    // still gate the send — this is not reminder spam inside a running turn.
+    if (goalOwned && !aborted) {
+      requestContinuation(ctx);
+    }
   });
 
   pi.on("session_shutdown", (_event, ctx) => {
