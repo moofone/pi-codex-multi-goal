@@ -153,8 +153,11 @@ inside a running turn, but do not let an unfinished stage go idle.
   rewriting it does not itself count as useful progress, replenish an allowance,
   or establish that the step is complete.
 - Pause, blocking, yielding, compaction, and reload preserve the current step's
-  memory. Recovery restores that record with the human-defined criteria, without
-  replaying a history of memory updates into model context.
+  memory. A paused or blocked step still accepts a memory replace so findings
+  are not lost; that write does not resume the goal, refill the grant, or credit
+  evidence. A completed goal refuses. Recovery restores that record with the
+  human-defined criteria, without replaying a history of memory updates into
+  model context.
 - Evidence artifacts must resolve to a real path inside the project workspace.
   Links are followed, not banned. Validation opens the file once, pins the
   device and inode it opened, containment-checks the resolved name, requires
