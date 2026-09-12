@@ -18,7 +18,8 @@ import { CUSTOM_ENTRY_TYPE } from "../src/types.ts";
 //     agent_end or compact;
 //   - an unfinished idle turn after delivery sends exactly one continuation
 //     whose snapshot is the CURRENT goal (latest memory/contract), not the
-//     kickoff — force keep going, still at most one pending;
+//     kickoff — force keep going, still at most one pending, including after
+//     a user-owned turn (talking is not waiting; abort/pause/complete still stop);
 //   - a context boundary sends at most one continuation, and only after the
 //     previous continuation's delivery was acknowledged (queued / delivered /
 //     eligible-for-next-boundary — no stacking);
@@ -369,7 +370,7 @@ test("unfinished idle turn forces continuation with the current snapshot", async
   assert.equal(hDone.sent.length, 1, "a completed goal does not force continuation");
 });
 
-test("user-owned turns do not force goal continuation", async t => {
+test("user-owned unfinished turns still force one continuation", async t => {
   const hUser = harness(t);
   await hUser.emit("session_start");
   await hUser.command(CONTRACT);
@@ -378,7 +379,13 @@ test("user-owned turns do not force goal continuation", async t => {
   await hUser.emit("turn_start", { turnIndex: 0 });
   await hUser.emit("agent_end", { messages: [] });
   assert.equal(hUser.current().status, "active", "a user turn leaves an active goal alone");
-  assert.equal(hUser.sent.length, 1, "a user-owned turn does not force an unsolicited goal continuation");
+  assert.equal(hUser.sent.length, 2, "an unfinished user-owned turn must force exactly one continuation");
+  assert.equal(hUser.sent[1]!.message.details.kind, "continuation");
+  assert.equal(hUser.sent[1]!.options.triggerTurn, true);
+  assert.match(String(hUser.sent[1]!.message.content), /<goal>/);
+
+  await hUser.emit("agent_end", { messages: [] });
+  assert.equal(hUser.sent.length, 2, "queued forced continuation is not stacked on a user-owned idle end");
 
   const hAbort = harness(t);
   await hAbort.emit("session_start");
@@ -390,7 +397,7 @@ test("user-owned turns do not force goal continuation", async t => {
     messages: [{ role: "assistant", stopReason: "aborted" }],
   });
   assert.equal(hAbort.current().status, "active", "aborting a user-owned turn does not pause the goal");
-  assert.equal(hAbort.sent.length, 1, "an aborted user turn does not force an unsolicited goal continuation");
+  assert.equal(hAbort.sent.length, 1, "an aborted user turn does not restart the goal");
 });
 
 test("pause withdraws goal work not peer", async t => {
