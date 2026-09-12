@@ -3,6 +3,7 @@ import { closeSync, fstatSync, openSync, readFileSync, realpathSync, statSync } 
 import { isAbsolute, relative, resolve } from "node:path";
 
 import { currentStage } from "./state.js";
+import { CREDIT_DIGEST_HEX_CHARS } from "./types.js";
 import type { MultiGoal } from "./types.js";
 
 /**
@@ -92,6 +93,83 @@ export function fingerprintFile(absolutePath: string): string | null {
  */
 export function evidenceKey(ref: EvidenceRefInput): string {
   return `${ref.operation}#${ref.artifact}#${ref.fingerprint}`;
+}
+
+/**
+ * The stored form of a dedupe key. Keys contain project paths of unbounded
+ * length, and the record has to be remembered for the whole goal, so what is
+ * persisted is a fixed-width digest rather than the key itself.
+ */
+export function creditKeyDigest(key: string): string {
+  return createHash("sha256").update(key, "utf8").digest("hex").slice(0, CREDIT_DIGEST_HEX_CHARS);
+}
+
+/**
+ * A peer's evidence reference, in the shape `pi-dag-compact` uses. Only an
+ * artifact with a content digest can become Goal evidence; the other kinds
+ * name things Goal has no way to verify.
+ */
+export type PeerEvidenceRef =
+  | { kind: "session"; sessionId: string; entryId: string }
+  | { kind: "research"; taskId: string; recordId: string }
+  | { kind: "artifact"; path: string; sha256?: string; recordId?: string };
+
+export type PeerEvidenceConversion =
+  | { ok: true; ref: EvidenceRefInput }
+  | { ok: false; message: string };
+
+/**
+ * Convert a peer evidence reference into a Goal evidence ref (P4).
+ *
+ * Goal's evidence bar is deliberately narrow: an artifact that exists on disk,
+ * whose current bytes match a fingerprint, associated with a criterion of the
+ * CURRENT step. A peer reference that cannot meet that bar is REFUSED with a
+ * reason. It is never silently dropped — that would let a completion claim
+ * coverage it does not have — and never fabricated into a passing ref.
+ *
+ * The resulting dedupe key is built from the producing operation, the project
+ * path, and the content fingerprint. A peer record or node ID never enters it,
+ * so re-creating or renaming a node cannot buy a second credit for an artifact
+ * that has not changed.
+ */
+export function convertPeerEvidence(
+  ref: PeerEvidenceRef,
+  context: { operation: string; criteria: string[] },
+): PeerEvidenceConversion {
+  if (ref.kind === "session") {
+    return {
+      ok: false,
+      message:
+        `Peer evidence rejected: a session reference (${ref.sessionId}/${ref.entryId}) names a ` +
+        "transcript entry, which Goal cannot fingerprint. Cite the artifact the work produced.",
+    };
+  }
+  if (ref.kind === "research") {
+    return {
+      ok: false,
+      message:
+        `Peer evidence rejected: a research reference (${ref.taskId}/${ref.recordId}) names a peer ` +
+        "record, not an artifact. Goal validates artifacts; cite the file the record points at.",
+    };
+  }
+  if (typeof ref.sha256 !== "string" || ref.sha256.length < FINGERPRINT_HEX_CHARS) {
+    return {
+      ok: false,
+      message:
+        `Peer evidence rejected: artifact "${ref.path}" carries no sha256 digest, so Goal would have ` +
+        "to take the peer's word for its contents.",
+    };
+  }
+  return {
+    ok: true,
+    ref: {
+      operation: context.operation,
+      artifact: ref.path,
+      // Goal's fingerprint is the sha256 prefix; a peer may carry the full digest.
+      fingerprint: ref.sha256.slice(0, FINGERPRINT_HEX_CHARS),
+      criteria: context.criteria,
+    },
+  };
 }
 
 /** Is `candidate` the workspace root itself, or somewhere beneath it? */
