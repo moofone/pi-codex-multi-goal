@@ -155,9 +155,12 @@ reminders, and exactly one continuation at an eligible context boundary.
 
 **Disposition (fixed):** `src/continuation.ts` tracks queued / delivered /
 eligible-for-next-boundary with delivery acknowledgement on the supported host
-message events; at most one continuation is pending, ordinary `agent_end` turns
-never send, and each eligible boundary sends exactly one snapshot
-(`test/continuation.test.ts`, `one kickoff one boundary no per-turn spam`).
+message events; at most one continuation is pending. An unfinished idle
+`agent_end` sends exactly one current-snapshot continuation (force keep going);
+a queued kickoff is not stacked; each eligible boundary may refresh once after
+delivery. The old unconditional agent-end spam is still prevented by the queued
+guard (`test/continuation.test.ts`, `unfinished idle turn forces continuation
+with the current snapshot`).
 
 ### F05 — P1: duplicate completion skips a step
 

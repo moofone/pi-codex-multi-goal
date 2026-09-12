@@ -385,11 +385,9 @@ test("next context is clean or kickoff is withheld", async t => {
     const withBoundary = [...stepWork, asCustom(h.sent[0]!, 3000)];
     const boundaryView = await h.context(withBoundary);
     const boundaryMessages = boundaryView?.messages ?? withBoundary;
-    assert.equal(
-      boundaryMessages.filter((m: any) => m.role === "custom" && m.details?.stage === 1).length,
-      2,
-      "both current-step snapshots remain",
-    );
+    const snapshots = boundaryMessages.filter((m: any) => m.role === "custom" && m.details?.stage === 1);
+    assert.equal(snapshots.length, 1, "exactly one current-step snapshot remains");
+    assert.equal(snapshots[0]!.timestamp, 3000, "the model sees THIS (latest) snapshot, not a pile of stale wrappers");
     const boundaryVisible = JSON.stringify(boundaryMessages);
     assert.ok(boundaryVisible.includes("please start with the first step"), "a later boundary snapshot keeps the earlier user message");
     assert.ok(boundaryVisible.includes("working on step one"), "a later boundary snapshot keeps the in-step assistant turn");

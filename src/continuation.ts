@@ -40,8 +40,9 @@ interface ContinuationDeps {
  *   acknowledged — while queued, no second continuation may be scheduled;
  * - `delivered`: the host acknowledged delivery on its message events; this
  *   arms eligibility for exactly one continuation at the next context
- *   boundary. A context boundary with no armed eligibility sends nothing, and
- *   ordinary `agent_end` turns never send at all.
+ *   boundary. A context boundary with no armed eligibility sends nothing.
+ *   An unfinished idle `agent_end` (goal still active) sends exactly one
+ *   current-snapshot continuation — force keep going, still at most one pending.
  *
  * Delivery is revalidated against the current goal/step/generation/status (and
  * ownership when a context is available): a stale delivery arms nothing. The

@@ -715,10 +715,11 @@ export function registerMultiGoal(pi: ExtensionAPI): void {
 
   // The isolation boundary (F06/A08), built on probe 3: a context handler's
   // returned { messages } replaces the provider-visible list. The CURRENT
-  // step's snapshot (customType + details.goalId/stage) is always kept
+  // step's LATEST snapshot (customType + details.goalId/stage) is kept
   // regardless of its timestamp — including a snapshot stamped exactly at the
-  // cutoff (host clock tie) — and every other extension goal message is always
-  // dropped, so the model view holds exactly one current goal context.
+  // cutoff (host clock tie) — earlier current-step wrappers are dropped, and
+  // every other extension goal message is always dropped, so the model view
+  // holds exactly one current goal context (THIS snapshot, with current memory).
   // isolationCutoff applies only when it is non-null: non-snapshot messages at
   // or before the boundary belong to the completed step (its transcript, its
   // tool results, its memory) and are dropped. The completing turn's own
@@ -804,9 +805,17 @@ export function registerMultiGoal(pi: ExtensionAPI): void {
       }
       return false;
     };
-    const messages = event.messages.filter((message) => {
+    let lastCurrentSnapshot = -1;
+    for (let i = 0; i < event.messages.length; i += 1) {
+      if (isCurrentGoalSnapshot(event.messages[i])) {
+        lastCurrentSnapshot = i;
+      }
+    }
+    const messages = event.messages.filter((message, index) => {
       if (isCurrentGoalSnapshot(message)) {
-        return true; // always visible, regardless of its stamp
+        // Always keep THIS (latest) snapshot, regardless of its stamp; drop
+        // earlier current-step wrappers so the model cannot work from stale memory.
+        return index === lastCurrentSnapshot;
       }
       if (isNonCurrentGoalMessage(message, goal)) {
         return false; // other extension goal messages never surface
@@ -861,8 +870,11 @@ export function registerMultiGoal(pi: ExtensionAPI): void {
         }
       }
     }
-    // No continuation request on ordinary turn ends: model-facing snapshots
-    // are scheduled at step start and eligible context boundaries only (A06).
+    // Force keep going: if the model ended a turn without completing, blocking,
+    // or pausing this stage, send exactly one current-snapshot continuation.
+    // Queued/idle/yield/exhaustion still gate it — this is not reminder spam
+    // inside a running turn; the loop already ended.
+    requestContinuation(ctx);
   });
 
   pi.on("session_shutdown", (_event, ctx) => {

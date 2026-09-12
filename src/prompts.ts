@@ -63,6 +63,7 @@ export function formatGoalWrapper(goal: MultiGoal): string {
     "<instructions>",
     "You are working on this active goal stage.",
     "Keep making concrete progress on THIS stage only.",
+    "Do not stop until you call update_goal complete or blocked for THIS stage.",
     "Do not work on other stages. Do not redefine this stage.",
     "Before declaring this stage done, verify it against current evidence.",
     "Evidence refs are project-relative: { operation: the tool run that produced the artifact, artifact: its path, fingerprint: first 16 hex chars of the artifact's sha256, criteria: the criterion ids above }.",
