@@ -488,16 +488,18 @@ export function registerMultiGoal(pi: ExtensionAPI): void {
   // Evidence refs ride the same validation path completion uses; each novel
   // verified ref resets only the no-progress streak, once. Unverifiable
   // claims stay in memory without resetting counters, and late writes bound
-  // to a completed step or a spent generation are rejected.
+  // to a completed step or a spent generation are rejected. Paused and blocked
+  // steps still accept a replace so findings are not lost; they never credit
+  // evidence (that would refill a grant that is not running).
   const updateMemory = (input: MemoryUpdateInput, ctx: ExtensionContext): MemoryResult => {
     const goal = persistence.getGoal();
     if (!goal) {
       return { ok: false, message: "No active goal exists.", goal: null };
     }
-    if (goal.status !== "active") {
+    if (goal.status === "complete") {
       return {
         ok: false,
-        message: `Goal is ${goal.status}; memory updates belong to an active execution.`,
+        message: "Goal is complete; memory updates belong to an active execution.",
         goal,
       };
     }
@@ -564,6 +566,9 @@ export function registerMultiGoal(pi: ExtensionAPI): void {
       if (!evidence.ok) {
         return { ok: false, message: evidence.message, goal };
       }
+      if (goal.status !== "active") {
+        return { ok: true, message: "Memory already recorded; nothing changed.", goal, credited: 0 };
+      }
       const outcome = creditVerifiedEvidence(goal, evidence.refs.map((ref) => ref.key));
       if (outcome.creditedKeys.length === 0) {
         return { ok: true, message: "Memory already recorded; nothing changed.", goal, credited: 0 };
@@ -598,9 +603,11 @@ export function registerMultiGoal(pi: ExtensionAPI): void {
       if (!evidence.ok) {
         return { ok: false, message: evidence.message, goal };
       }
-      const outcome = creditVerifiedEvidence(goal, evidence.refs.map((ref) => ref.key));
-      next = outcome.goal;
-      credited = outcome.creditedKeys.length;
+      if (goal.status === "active") {
+        const outcome = creditVerifiedEvidence(goal, evidence.refs.map((ref) => ref.key));
+        next = outcome.goal;
+        credited = outcome.creditedKeys.length;
+      }
     }
     const memory: GoalMemory = {
       revision: proposedRevision,

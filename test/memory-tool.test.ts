@@ -22,6 +22,8 @@ import { CUSTOM_ENTRY_TYPE } from "../src/types.ts";
 //     transition happens, and execution remaining is unchanged — a memory-only
 //     loop still consumes no-progress at a full context (A02 progress-buy).
 //   - human /goal status shows the memory record and the counters.
+//   - a paused or blocked step still accepts a replace (findings are not lost);
+//     a completed goal still refuses.
 
 interface HarnessOptions {
   seed?: unknown[];
@@ -101,6 +103,14 @@ function harness(t: any, options: HarnessOptions = {}) {
     command: (text: string) => commands.get("goal").handler(text, ctx),
     memory: (params: any, id = "memory-call") =>
       tools.get("update_goal_memory").execute(id, params, new AbortController().signal, undefined, ctx),
+    block: (params: any, id = "block-call") =>
+      tools.get("update_goal").execute(
+        id,
+        { status: "blocked", ...params },
+        new AbortController().signal,
+        undefined,
+        ctx,
+      ),
     providerRequest: () =>
       emit("before_provider_request", {
         payload: { model: "fake-model", messages: [{ role: "user", content: "<goal>turn</goal>" }], tools: [] },
@@ -237,4 +247,54 @@ test("update_goal_memory replace reject stale and oversized", async t => {
   const status = h.goalStatus();
   assert.match(status, /Memory: revision 2/);
   assert.match(status, /no-progress 19\/20, total 399\/400/);
+});
+
+const CONTRACT = JSON.stringify({ objective: "ship the fix", criteria: ["it ships"] });
+
+test("paused and blocked goals still record memory", async t => {
+  const hPause = harness(t);
+  await hPause.emit("session_start");
+  await hPause.command(CONTRACT);
+  await hPause.command("pause");
+  const paused = hPause.current();
+  assert.equal(paused.status, "paused");
+  const identity = {
+    goalId: paused.goalId,
+    step: paused.index + 1,
+    generation: paused.execution.generation,
+    revision: paused.memory.revision,
+  };
+  const proved = ["lock protocol installed on 3090 (artifact: gpu-lock.sh)"];
+  const unresolved = ["fixture, not TH/s"];
+  const next = "resume and keep the current-best";
+  const executionBefore = { ...paused.execution };
+  await hPause.memory({ ...identity, proved, unresolved, next });
+  const afterPause = hPause.current();
+  assert.equal(afterPause.status, "paused", "memory must not resume a paused goal");
+  assert.deepEqual(afterPause.memory, { revision: 1, proved, unresolved, next });
+  assert.deepEqual(afterPause.execution, executionBefore, "paused memory must not refill the grant");
+
+  const hBlock = harness(t);
+  await hBlock.emit("session_start");
+  await hBlock.command(CONTRACT);
+  const blockGoal = hBlock.current();
+  await hBlock.block({
+    goalId: blockGoal.goalId,
+    step: blockGoal.index + 1,
+    generation: blockGoal.execution.generation,
+  });
+  assert.equal(hBlock.current().status, "blocked");
+  const blocked = hBlock.current();
+  await hBlock.memory({
+    goalId: blocked.goalId,
+    step: blocked.index + 1,
+    generation: blocked.execution.generation,
+    revision: blocked.memory.revision,
+    proved: ["need the lock token from the user"],
+    unresolved: ["3090 lock owner unknown"],
+    next: "wait for /goal resume",
+  });
+  assert.equal(hBlock.current().status, "blocked", "memory must not unblock");
+  assert.equal(hBlock.current().memory.revision, 1);
+  assert.match(hBlock.current().memory.proved[0]!, /lock token/);
 });
