@@ -864,7 +864,6 @@ export function registerMultiGoal(pi: ExtensionAPI): void {
     // only a goal-owned turn's abort invalidates goal execution. A peer or
     // user turn aborting is not ours to act on (F07).
     const goalOwnedTurn = continuation.goalTurnInFlight();
-    const goalOwned = continuation.goalOwned();
     continuation.agentLoopEnded();
     const aborted = event.messages.some(
       (message) => message.role === "assistant" && "stopReason" in message && message.stopReason === "aborted",
@@ -879,11 +878,12 @@ export function registerMultiGoal(pi: ExtensionAPI): void {
         }
       }
     }
-    // Force keep going only for a goal-owned turn that was not aborted: a
-    // user-owned (or user-aborted) agent_end must not inject an unsolicited
-    // continuation over the user's interaction. Queued/idle/yield/exhaustion
-    // still gate the send — this is not reminder spam inside a running turn.
-    if (goalOwned && !aborted) {
+    // Force keep going: the model stopping is not completion. An unfinished
+    // idle agent_end — goal-owned or user-owned — sends exactly one current
+    // snapshot. Talking to the user is not waiting; the legal wait is
+    // update_goal blocked. Escape/abort is a stop and must not restart.
+    // Queued/idle/yield/exhaustion still gate the send.
+    if (!aborted) {
       requestContinuation(ctx);
     }
   });

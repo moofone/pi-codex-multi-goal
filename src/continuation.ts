@@ -212,14 +212,6 @@ export function createContinuation(deps: ContinuationDeps) {
   const goalTurnInFlight = (): boolean => goalLoopInFlight;
 
   /**
-   * Read BEFORE agentLoopEnded() when handling agent_end. True while a
-   * delivered goal continuation still owns the loop — including after
-   * delivery and before agent_start/turn_start. userMessageDelivered()
-   * takes precedence, so a user-owned (or user-interrupted) loop is false.
-   */
-  const goalOwned = (): boolean => loopTrigger === "goal";
-
-  /**
    * True only when cancellation provably targets goal-owned work: a queued
    * continuation this extension submitted with no user message in front of it,
    * or an in-flight loop the delivered goal continuation started. Peer and
@@ -247,7 +239,6 @@ export function createContinuation(deps: ContinuationDeps) {
     agentLoopStarted,
     agentLoopEnded,
     goalTurnInFlight,
-    goalOwned,
     outstanding,
     queuedStale,
   };
