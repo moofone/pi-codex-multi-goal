@@ -27,8 +27,27 @@ export const DEFAULT_EVIDENCE_GRANT = 50;
 export const DEFAULT_LIFETIME_CEILING = 1000;
 /** Consumed fraction of any one budget before the footer starts showing it. */
 export const BUDGET_WARNING_FRACTION = 0.8;
-/** Maximum credited-evidence dedupe keys kept on one execution grant. */
-export const MAX_CREDITED_EVIDENCE = 64;
+/**
+ * Maximum credited-evidence dedupe keys remembered for one goal.
+ *
+ * This is a security bound, not a display bound. A credit renews the working
+ * request budget by `evidenceGrant` (D4), so any key that ages out of this
+ * record buys another grant for an artifact that has not changed and cost no
+ * new work. Keys are stored as short digests (see `creditKeyDigest`) so the
+ * record can be large enough that eviction is not reachable in a real step,
+ * and the lifetime ceiling remains the backstop if it ever were.
+ */
+export const MAX_CREDITED_EVIDENCE = 4096;
+
+/**
+ * Digests kept in reserve above the credit-grant cap, so the dedupe record is
+ * strictly larger than the number of credits a goal can ever receive.
+ */
+export const MAX_CREDIT_GRANT_HEADROOM = 96;
+
+/** Hex characters of the stored dedupe digest. */
+export const CREDIT_DIGEST_HEX_CHARS = 16;
+
 /**
  * Durable operation receipts kept per stage. Retention only has to cover the
  * lifetime in which an operation can be retried (GOAL_WITH_DAG_SUPPORT §4), and
@@ -104,8 +123,6 @@ export interface GoalExecution {
   /** Unrenewable hard stop for `lifetimeRequests`. */
   lifetimeCeiling: number;
   tokenUsage: number | null;
-  /** Dedupe keys of evidence refs that already received progress credit. */
-  creditedEvidence: string[];
 }
 
 /**
@@ -220,6 +237,26 @@ export interface MultiGoal {
    * the wrong contract. See `computeContractRevision`.
    */
   contractRevision: string;
+  /**
+   * Digests of evidence refs that already received progress credit, for the
+   * lifetime of this goal. Deliberately NOT on the execution grant: a step
+   * transition resets budgets, and forgetting what was already paid for would
+   * let a step-1 artifact be re-submitted against a step-2 criterion for
+   * another grant, with no new work done.
+   */
+  creditedEvidence: string[];
+  /**
+   * Credits granted over this goal's whole life. Monotonic: nothing resets it,
+   * not a step transition and not `/goal resume`.
+   *
+   * It exists to make eviction from `creditedEvidence` unreachable rather than
+   * merely unlikely. `lifetimeRequests` does not bound crediting — it is only
+   * charged at provider entry, while one memory update can carry many refs — so
+   * without this counter an agent could credit past `MAX_CREDITED_EVIDENCE`,
+   * age out the earliest digest, and replay that artifact for another grant
+   * having done no new work.
+   */
+  creditGrants: number;
   createdAt: number;
   updatedAt: number;
   memory: GoalMemory;

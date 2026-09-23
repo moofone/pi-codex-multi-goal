@@ -1,7 +1,9 @@
+import { creditKeyDigest } from "./evidence.js";
 import { cloneGoal } from "./state.js";
 import {
   BUDGET_WARNING_FRACTION,
   MAX_CREDITED_EVIDENCE,
+  MAX_CREDIT_GRANT_HEADROOM,
   type GoalExecution,
   type MultiGoal,
 } from "./types.js";
@@ -136,6 +138,19 @@ export function applyResumeGrant(goal: MultiGoal): MultiGoal {
   return next;
 }
 
+/**
+ * How many credits one goal may ever be granted.
+ *
+ * Derived from the execution's own ceiling so a configured goal keeps a
+ * proportionate allowance, then held strictly below MAX_CREDITED_EVIDENCE so
+ * the dedupe record can never evict. Legitimate work is nowhere near it: a
+ * session that credits on every single admitted request still stops at the
+ * lifetime ceiling first.
+ */
+export function creditGrantCap(execution: GoalExecution): number {
+  return Math.min(execution.lifetimeCeiling, MAX_CREDITED_EVIDENCE - MAX_CREDIT_GRANT_HEADROOM);
+}
+
 export interface CreditOutcome {
   goal: MultiGoal;
   /** Keys newly credited by this call (empty when everything was stale). */
@@ -159,17 +174,31 @@ export interface CreditOutcome {
  * edit/write/apply_patch names alone never reach this function.
  */
 export function creditVerifiedEvidence(goal: MultiGoal, keys: string[]): CreditOutcome {
-  const already = new Set(goal.execution.creditedEvidence ?? []);
-  const fresh = [...new Set(keys)].filter((key) => !already.has(key));
+  const already = new Set(goal.creditedEvidence ?? []);
+  const unique = [...new Set(keys)];
+  const novel = unique.filter((key) => !already.has(creditKeyDigest(key)));
+  // The grant cap is what keeps `creditedEvidence` from ever ageing out. It is
+  // set below MAX_CREDITED_EVIDENCE, so the record cannot reach its bound and
+  // the eviction replay — credit past the cap, age out the first digest, then
+  // resubmit that artifact for a second grant — is unreachable by construction
+  // rather than merely expensive. lifetimeRequests cannot serve here: it is
+  // charged at provider entry, and one memory update may carry many refs.
+  const remaining = Math.max(0, creditGrantCap(goal.execution) - (goal.creditGrants ?? 0));
+  const fresh = novel.slice(0, remaining);
   if (fresh.length === 0) {
     return { goal, creditedKeys: [] };
   }
   const next = cloneGoal(goal);
-  const credited = [...(next.execution.creditedEvidence ?? []), ...fresh];
+  const credited = [...(next.creditedEvidence ?? []), ...fresh.map(creditKeyDigest)];
   const renewed = next.execution.totalRemaining + next.execution.evidenceGrant * fresh.length;
+  // The dedupe record lives on the goal, not the execution grant: a step
+  // transition resets the budgets but must NOT forget what was already paid
+  // for. Re-submitting a step-1 artifact against a step-2 criterion is not new
+  // work, and with D4 in place it would otherwise buy another grant.
+  next.creditedEvidence = credited;
+  next.creditGrants = (next.creditGrants ?? 0) + fresh.length;
   next.execution = {
     ...next.execution,
-    creditedEvidence: credited.slice(-MAX_CREDITED_EVIDENCE),
     noProgressRemaining: next.execution.noProgressLimit,
     turnRequests: 0,
     totalRemaining: Math.min(next.execution.totalLimit, renewed),

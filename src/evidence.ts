@@ -3,6 +3,7 @@ import { closeSync, fstatSync, openSync, readFileSync, realpathSync, statSync } 
 import { isAbsolute, relative, resolve } from "node:path";
 
 import { currentStage } from "./state.js";
+import { CREDIT_DIGEST_HEX_CHARS } from "./types.js";
 import type { MultiGoal } from "./types.js";
 
 /**
@@ -92,6 +93,100 @@ export function fingerprintFile(absolutePath: string): string | null {
  */
 export function evidenceKey(ref: EvidenceRefInput): string {
   return `${ref.operation}#${ref.artifact}#${ref.fingerprint}`;
+}
+
+/**
+ * The stored form of a dedupe key. Keys contain project paths of unbounded
+ * length, and the record has to be remembered for the whole goal, so what is
+ * persisted is a fixed-width digest rather than the key itself.
+ */
+export function creditKeyDigest(key: string): string {
+  return createHash("sha256").update(key, "utf8").digest("hex").slice(0, CREDIT_DIGEST_HEX_CHARS);
+}
+
+/**
+ * A peer's evidence reference, in the shape `pi-dag-compact` uses. Only an
+ * artifact with a content digest can become Goal evidence; the other kinds
+ * name things Goal has no way to verify.
+ */
+export type PeerEvidenceRef =
+  | { kind: "session"; sessionId: string; entryId: string }
+  | { kind: "research"; taskId: string; recordId: string }
+  | { kind: "artifact"; path: string; sha256?: string; recordId?: string };
+
+export type PeerEvidenceConversion =
+  | { ok: true; ref: EvidenceRefInput & { peerSha256: string } }
+  | { ok: false; message: string };
+
+/**
+ * Model/tool-input representation of peer evidence. The wrapper supplies the
+ * producing operation and current-step criterion association required by Goal;
+ * the embedded peer reference itself is never treated as a Goal ref directly.
+ */
+export interface PeerEvidenceInput {
+  source: "peer";
+  ref: PeerEvidenceRef;
+  operation: string;
+  criteria: string[];
+}
+
+/**
+ * Convert a peer evidence reference into a Goal evidence ref (P4). Artifact
+ * refs must carry the peer's complete 64-character SHA-256 hex digest; Goal
+ * stores only its lowercase 16-character fingerprint prefix.
+ *
+ * Goal's evidence bar is deliberately narrow: an artifact that exists on disk,
+ * whose current bytes match a fingerprint, associated with a criterion of the
+ * CURRENT step. A peer reference that cannot meet that bar is REFUSED with a
+ * reason. It is never silently dropped — that would let a completion claim
+ * coverage it does not have — and never fabricated into a passing ref.
+ *
+ * The resulting dedupe key is built from the producing operation, the project
+ * path, and the content fingerprint. A peer record or node ID never enters it,
+ * so re-creating or renaming a node cannot buy a second credit for an artifact
+ * that has not changed.
+ */
+export function convertPeerEvidence(
+  ref: PeerEvidenceRef,
+  context: { operation: string; criteria: string[] },
+): PeerEvidenceConversion {
+  if (ref.kind === "session") {
+    return {
+      ok: false,
+      message:
+        `Peer evidence rejected: a session reference (${ref.sessionId}/${ref.entryId}) names a ` +
+        "transcript entry, which Goal cannot fingerprint. Cite the artifact the work produced.",
+    };
+  }
+  if (ref.kind === "research") {
+    return {
+      ok: false,
+      message:
+        `Peer evidence rejected: a research reference (${ref.taskId}/${ref.recordId}) names a peer ` +
+        "record, not an artifact. Goal validates artifacts; cite the file the record points at.",
+    };
+  }
+  if (typeof ref.sha256 !== "string" || !/^[0-9a-f]{64}$/i.test(ref.sha256)) {
+    return {
+      ok: false,
+      message:
+        `Peer evidence rejected: artifact "${ref.path}" must carry a complete 64-character sha256 hex digest, ` +
+        "so Goal does not have to take the peer's word for its contents.",
+    };
+  }
+  return {
+    ok: true,
+    ref: {
+      operation: context.operation,
+      artifact: ref.path,
+      // Keep the complete peer digest through artifact validation. The
+      // validator strips this field after checking it against the artifact;
+      // only the prefix is retained in Goal evidence and dedupe keys.
+      fingerprint: ref.sha256.toLowerCase().slice(0, FINGERPRINT_HEX_CHARS),
+      criteria: context.criteria,
+      peerSha256: ref.sha256.toLowerCase(),
+    },
+  };
 }
 
 /** Is `candidate` the workspace root itself, or somewhere beneath it? */
@@ -202,12 +297,78 @@ function refFailure(index: number, message: string): { ok: false; message: strin
   return { ok: false, message: `Evidence ref ${index + 1} rejected: ${message}` };
 }
 
+function isPeerEvidenceRef(value: unknown): value is PeerEvidenceRef {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return false;
+  }
+  const ref = value as Record<string, unknown>;
+  if (ref.kind === "session") {
+    return typeof ref.sessionId === "string" && typeof ref.entryId === "string";
+  }
+  if (ref.kind === "research") {
+    return typeof ref.taskId === "string" && typeof ref.recordId === "string";
+  }
+  if (ref.kind === "artifact") {
+    return (
+      typeof ref.path === "string" &&
+      (ref.sha256 === undefined || typeof ref.sha256 === "string") &&
+      (ref.recordId === undefined || typeof ref.recordId === "string")
+    );
+  }
+  return false;
+}
+
+/** Convert peer-shaped tool inputs before the ordinary artifact validator runs. */
+function adaptPeerEvidenceInputs(refs: unknown):
+  | { ok: true; refs: unknown }
+  | { ok: false; message: string } {
+  if (!Array.isArray(refs)) {
+    return { ok: true, refs };
+  }
+  const adapted: unknown[] = [];
+  for (const [index, raw] of refs.entries()) {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw) || (raw as { source?: unknown }).source !== "peer") {
+      adapted.push(raw);
+      continue;
+    }
+    const peerInput = raw as Partial<PeerEvidenceInput>;
+    if (!isPeerEvidenceRef(peerInput.ref)) {
+      return refFailure(index, "Peer evidence rejected: the peer reference is malformed or incomplete.");
+    }
+    if (
+      typeof peerInput.operation !== "string" ||
+      !Array.isArray(peerInput.criteria) ||
+      !peerInput.criteria.every((criterion) => typeof criterion === "string")
+    ) {
+      return refFailure(
+        index,
+        "Peer evidence rejected: provide the producing operation and current-step criterion ids with the peer ref.",
+      );
+    }
+    const converted = convertPeerEvidence(peerInput.ref, {
+      operation: peerInput.operation,
+      criteria: peerInput.criteria,
+    });
+    if (!converted.ok) {
+      return refFailure(index, converted.message);
+    }
+    adapted.push(converted.ref);
+  }
+  return { ok: true, refs: adapted };
+}
+
 /**
- * Validate an array of raw evidence refs against the CURRENT step. Every ref
- * must pass all four narrow checks; one invalid ref rejects the whole batch
- * (missing or stale evidence can neither complete a step nor earn credit).
+ * Adapt peer-shaped inputs first, then validate the resulting evidence refs
+ * against the CURRENT step. Every ref must pass all four narrow checks; one
+ * invalid ref rejects the whole batch (missing or stale evidence can neither
+ * complete a step nor earn credit).
  */
 export function validateEvidenceRefs(goal: MultiGoal, refs: unknown): EvidenceValidation {
+  const adapted = adaptPeerEvidenceInputs(refs);
+  if (!adapted.ok) {
+    return adapted;
+  }
+  refs = adapted.refs;
   if (!Array.isArray(refs) || refs.length === 0) {
     return {
       ok: false,
@@ -257,7 +418,18 @@ export function validateEvidenceRefs(goal: MultiGoal, refs: unknown): EvidenceVa
         `fingerprint must be ${FINGERPRINT_HEX_CHARS} lowercase hex characters (sha256 prefix of the artifact bytes)`,
       );
     }
-    const actual = fingerprintContent(content.bytes);
+    const peerSha256 = (ref as Partial<EvidenceRefInput> & { peerSha256?: unknown }).peerSha256;
+    if (peerSha256 !== undefined && (typeof peerSha256 !== "string" || !/^[0-9a-f]{64}$/.test(peerSha256))) {
+      return refFailure(index, "peer SHA-256 must be a complete lowercase 64-character hex digest");
+    }
+    const actualSha256 = createHash("sha256").update(content.bytes).digest("hex");
+    if (typeof peerSha256 === "string" && actualSha256 !== peerSha256) {
+      return refFailure(
+        index,
+        `peer SHA-256 mismatch: the complete digest does not match the current bytes of "${ref.artifact}"`,
+      );
+    }
+    const actual = actualSha256.slice(0, FINGERPRINT_HEX_CHARS);
     if (actual !== ref.fingerprint) {
       return refFailure(
         index,

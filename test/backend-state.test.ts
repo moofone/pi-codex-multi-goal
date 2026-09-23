@@ -412,6 +412,49 @@ test("B01: an unbound goal shows no backend noise in /goal status", async (t) =>
   assert.equal(/Backend:/.test(status), false, "unbound is today's view, unchanged");
 });
 
+test("P4: the bound update_goal input adapts peer refs before completion validation", async (t) => {
+  const h = harness(t, { seed: [boundSnapshot("bound-available", null)] });
+  await h.emit("session_start");
+  await h.command("resume");
+
+  const active = h.current();
+  assert.equal(active.backend.state, "bound-available", "sanity: the peer owns this stage");
+  const criteria = active.stages[0]!.criteria.map((criterion: any) => criterion.id);
+  const content = "peer-produced finding, verified against local bytes\n";
+  const goalEvidence = h.evidence(criteria, "src/peer-finding.md", content, "read");
+  const peerArtifact = {
+    source: "peer",
+    ref: {
+      kind: "artifact",
+      path: goalEvidence.artifact,
+      sha256: createHash("sha256").update(content).digest("hex"),
+      recordId: "peer-node-17",
+    },
+    operation: "read",
+    criteria,
+  };
+  const peerTranscript = {
+    source: "peer",
+    ref: { kind: "session", sessionId: "peer-session", entryId: "entry-9" },
+    operation: "read",
+    criteria,
+  };
+  const identity = { goalId: active.goalId, step: active.index + 1, generation: active.execution.generation };
+  const executionBefore = JSON.stringify(active.execution);
+
+  await assert.rejects(
+    () => h.updateGoal({ status: "complete", ...identity, evidence: [peerArtifact, peerTranscript] }),
+    /peer evidence rejected: a session reference/i,
+    "a non-artifact peer ref explicitly refuses the whole batch",
+  );
+  assert.equal(h.current().index, 0, "a valid earlier peer artifact is not committed around a later refusal");
+  assert.equal(JSON.stringify(h.current().execution), executionBefore, "refusal leaves the allowance untouched");
+
+  const accepted = await h.updateGoal({ status: "complete", ...identity, evidence: [peerArtifact] });
+  assert.equal(accepted.ok !== false, true, "the peer artifact is converted then validated through the real tool path");
+  assert.equal(h.current().index, 1, "validated peer evidence covers the criterion and allows completion");
+});
+
 /**
  * B11 (review finding 1): no state reachable within P0 may be permanently
  * unrecoverable.

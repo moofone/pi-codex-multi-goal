@@ -303,3 +303,71 @@ test("verified evidence resets no-progress once", async t => {
   await h.memory({ ...h.identity(), proved: ["proved: rewrite only"], unresolved: [], next: "n" });
   assert.deepEqual(h.counters(), before, "memory text still never buys progress");
 });
+
+test("peer evidence tool inputs convert before verified progress credit", async (t) => {
+  const h = harness(t);
+  await h.emit("session_start");
+  await h.command("resume");
+  await h.spend(2);
+
+  const content = "peer result inspected locally\n";
+  const goalRef = h.evidenceRef("docs/peer-result.md", content, "read");
+  const peerArtifact = {
+    source: "peer",
+    ref: {
+      kind: "artifact",
+      path: goalRef.artifact,
+      sha256: createHash("sha256").update(content).digest("hex"),
+      recordId: "peer-node-1",
+    },
+    operation: "read",
+    criteria: goalRef.criteria,
+  };
+  const peerSession = {
+    source: "peer",
+    ref: { kind: "session", sessionId: "peer-session", entryId: "entry-1" },
+    operation: "read",
+    criteria: goalRef.criteria,
+  };
+  const before = h.counters();
+  const revision = h.identity().revision;
+  const actualPeerDigest = peerArtifact.ref.sha256;
+  const fabricatedDigest = `${actualPeerDigest.slice(0, 16)}${actualPeerDigest[16] === "0" ? "1" : "0"}${actualPeerDigest.slice(17)}`;
+  await assert.rejects(
+    () => h.memory({
+      ...h.identity(),
+      proved: ["peer finding"],
+      unresolved: [],
+      next: "continue checking",
+      evidence: [{ ...peerArtifact, ref: { ...peerArtifact.ref, sha256: fabricatedDigest } }],
+    }),
+    /peer SHA-256 mismatch/i,
+    "a matching prefix with a fabricated suffix is rejected before progress is committed",
+  );
+  assert.deepEqual(h.counters(), before, "a mismatched complete peer digest earns no credit");
+  assert.equal(h.identity().revision, revision, "a mismatched complete peer digest leaves memory unchanged");
+
+  await assert.rejects(
+    () => h.memory({
+      ...h.identity(),
+      proved: ["peer finding"],
+      unresolved: [],
+      next: "continue checking",
+      evidence: [peerArtifact, peerSession],
+    }),
+    /peer evidence rejected: a session reference/i,
+    "the peer adapter refuses unsupported evidence instead of dropping it",
+  );
+  assert.deepEqual(h.counters(), before, "one rejected ref prevents credit for every ref in the batch");
+  assert.equal(h.identity().revision, revision, "the rejected batch also leaves memory unchanged");
+
+  const accepted = await h.memory({
+    ...h.identity(),
+    proved: ["peer finding"],
+    unresolved: [],
+    next: "continue checking",
+    evidence: [peerArtifact],
+  });
+  assert.equal(h.ack(accepted).credited, 1, "the converted peer artifact uses normal verified credit");
+  assert.equal(h.counters()!.noProgressRemaining, 20, "verified peer evidence resets no-progress");
+});

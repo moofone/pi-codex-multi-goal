@@ -8,15 +8,18 @@ import {
   normalizeBackend,
 } from "./backend.js";
 import { computeContractRevision } from "./contract.js";
+import { creditKeyDigest } from "./evidence.js";
 import { parseStageTitles, validateSteps, validateTitles } from "./parse.js";
 import {
   CUSTOM_ENTRY_TYPE,
+  CREDIT_DIGEST_HEX_CHARS,
   DEFAULT_EVIDENCE_GRANT,
   DEFAULT_LIFETIME_CEILING,
   DEFAULT_NO_PROGRESS_LIMIT,
   DEFAULT_TOTAL_LIMIT,
   DEFAULT_TURN_LIMIT,
   MAX_CREDITED_EVIDENCE,
+  MAX_CREDIT_GRANT_HEADROOM,
   type Criterion,
   type GoalCustomEntry,
   type GoalEntrySource,
@@ -131,7 +134,6 @@ export function freshExecution(
     ...clampedLimits(limits),
     lifetimeRequests: 0,
     tokenUsage: null,
-    creditedEvidence: [],
   };
 }
 
@@ -163,11 +165,12 @@ function effectiveLimits(execution: GoalExecution): FilledLimits {
  * after an upgrade and be skipped as malformed.
  */
 function normalizeExecution(execution: GoalExecution): GoalExecution {
+  const normalized = { ...execution } as GoalExecution & { creditedEvidence?: unknown };
+  delete normalized.creditedEvidence;
   return {
-    ...execution,
+    ...normalized,
     turnRequests: execution.turnRequests ?? 0,
     ...effectiveLimits(execution),
-    creditedEvidence: [...(execution.creditedEvidence ?? [])],
   };
 }
 
@@ -178,22 +181,73 @@ function normalizeExecution(execution: GoalExecution): GoalExecution {
  * older snapshot that predates the field gets one, and a stale or tampered
  * stored value is overwritten by the truth.
  */
-function currentContractRevision(goal: Omit<MultiGoal, "contractRevision">): string {
+function currentContractRevision(goal: Pick<MultiGoal, "stages" | "index">): string {
   const stage = goal.stages[goal.index];
   return stage ? computeContractRevision(stage) : "";
 }
 
+/**
+ * The goal-lifetime credited-evidence record, tolerating both older shapes: the
+ * field is absent on pre-Task-8 snapshots, and lived on the execution grant as
+ * full keys before it became goal-scoped. Migrating those keys forward matters
+ * because dropping them would let every previously credited artifact buy one
+ * more grant after an upgrade.
+ */
+function migrateCreditedEvidence(goal: MultiGoal): string[] {
+  const own = goal.creditedEvidence;
+  if (Array.isArray(own)) {
+    return [...own];
+  }
+  const legacy = (goal.execution as { creditedEvidence?: unknown }).creditedEvidence;
+  if (!Array.isArray(legacy)) {
+    return [];
+  }
+  return legacy
+    .slice(-LEGACY_MAX_CREDITED_EVIDENCE)
+    .filter((key): key is string => typeof key === "string")
+    .map(creditKeyDigest);
+}
+
+/** The execution-scoped dedupe list was capped at 64 before it became goal-scoped. */
+const LEGACY_MAX_CREDITED_EVIDENCE = 64;
+
+function migrateCreditGrants(goal: MultiGoal, creditedEvidence: string[], execution: GoalExecution): number {
+  if (goal.creditGrants !== undefined) {
+    return Math.max(goal.creditGrants, creditedEvidence.length);
+  }
+
+  // A full historical list may have evicted earlier credits, so its true count
+  // is unknowable. Conservatively exhaust the new cap rather than reopening it.
+  const own = goal.creditedEvidence;
+  const legacy = (goal.execution as { creditedEvidence?: unknown }).creditedEvidence;
+  const retentionLimit = Array.isArray(own)
+    ? MAX_CREDITED_EVIDENCE
+    : Array.isArray(legacy)
+      ? LEGACY_MAX_CREDITED_EVIDENCE
+      : undefined;
+  // Keep aligned with allowance.creditGrantCap().
+  const grantCap = Math.min(execution.lifetimeCeiling, MAX_CREDITED_EVIDENCE - MAX_CREDIT_GRANT_HEADROOM);
+  if (retentionLimit !== undefined && creditedEvidence.length >= retentionLimit) {
+    return Math.max(grantCap, creditedEvidence.length);
+  }
+  return creditedEvidence.length;
+}
+
 /** Stamp a freshly constructed goal with the identity of its current contract. */
-function sealGoal(goal: Omit<MultiGoal, "contractRevision">): MultiGoal {
-  return { ...goal, contractRevision: currentContractRevision(goal) };
+function sealGoal(goal: Omit<MultiGoal, "contractRevision" | "creditedEvidence" | "creditGrants">): MultiGoal {
+  return { ...goal, contractRevision: currentContractRevision(goal), creditedEvidence: [], creditGrants: 0 };
 }
 
 export function cloneGoal(goal: MultiGoal): MultiGoal {
+  const execution = normalizeExecution(goal.execution);
+  const creditedEvidence = migrateCreditedEvidence(goal);
   return {
     goalId: goal.goalId,
     status: goal.status,
     index: goal.index,
     contractRevision: currentContractRevision(goal),
+    creditedEvidence,
+    creditGrants: migrateCreditGrants(goal, creditedEvidence, execution),
     createdAt: goal.createdAt,
     updatedAt: goal.updatedAt,
     isolationCutoff: goal.isolationCutoff ?? null,
@@ -203,7 +257,7 @@ export function cloneGoal(goal: MultiGoal): MultiGoal {
       unresolved: [...goal.memory.unresolved],
       next: goal.memory.next,
     },
-    execution: normalizeExecution(goal.execution),
+    execution,
     // A snapshot written before P0 has no backend record; a goal that never met
     // a peer is `unbound`, which is today's behaviour (invariant 1).
     backend: normalizeBackend(goal.backend),
@@ -388,7 +442,6 @@ export function acceptCompletion(
     lifetimeRequests: next.execution.lifetimeRequests,
     lifetimeCeiling: next.execution.lifetimeCeiling,
     tokenUsage: next.execution.tokenUsage,
-    creditedEvidence: [],
   };
   next.isolationCutoff = isolationCutoffMs;
   // A binding is scoped to one stage, so it ends with the stage it belonged
@@ -536,14 +589,6 @@ function isGoalExecution(value: unknown): value is GoalExecution {
     return false;
   }
   const execution = value as GoalExecution;
-  // creditedEvidence was added in Task 8; snapshots persisted by earlier
-  // builds may omit it and are accepted until the next write materializes it.
-  const credited = execution.creditedEvidence;
-  const creditedValid =
-    credited === undefined ||
-    (Array.isArray(credited) &&
-      credited.length <= MAX_CREDITED_EVIDENCE &&
-      credited.every((key) => typeof key === "string" && key.length <= 1024));
   // The turn bound, evidence grant, and lifetime ceiling were added with the
   // D4 budget split; snapshots persisted by earlier builds omit them and are
   // accepted, then materialized by normalizeExecution on load.
@@ -551,11 +596,18 @@ function isGoalExecution(value: unknown): value is GoalExecution {
     value === undefined || (Number.isInteger(value) && (value as number) >= 0);
   const optionalLimit = (value: unknown): boolean =>
     value === undefined || (Number.isInteger(value) && (value as number) > 0);
+  const legacyCredited = (value as { creditedEvidence?: unknown }).creditedEvidence;
   if (
     !optionalCounter(execution.turnRequests) ||
     !optionalLimit(execution.turnLimit) ||
     !optionalLimit(execution.evidenceGrant) ||
-    !optionalLimit(execution.lifetimeCeiling)
+    !optionalLimit(execution.lifetimeCeiling) ||
+    (legacyCredited !== undefined &&
+      !(
+        Array.isArray(legacyCredited) &&
+        legacyCredited.length <= LEGACY_MAX_CREDITED_EVIDENCE &&
+        legacyCredited.every((key) => typeof key === "string" && key.length <= 1024)
+      ))
   ) {
     return false;
   }
@@ -573,8 +625,7 @@ function isGoalExecution(value: unknown): value is GoalExecution {
     Number.isInteger(execution.lifetimeRequests) &&
     execution.lifetimeRequests >= 0 &&
     (execution.tokenUsage === null ||
-      (typeof execution.tokenUsage === "number" && Number.isFinite(execution.tokenUsage))) &&
-    creditedValid;
+      (typeof execution.tokenUsage === "number" && Number.isFinite(execution.tokenUsage)));
   if (!wellFormed) {
     return false;
   }
@@ -636,6 +687,37 @@ export function isMultiGoal(value: unknown): value is MultiGoal {
     !(goal.backend === undefined || isGoalBackend(goal.backend)) ||
     !(goal.pauseReason === null || typeof goal.pauseReason === "string")
   ) {
+    return false;
+  }
+  // Monotonic and optional on older snapshots; materialized as 0 on load.
+  const grants = goal.creditGrants;
+  if (grants !== undefined && !(Number.isInteger(grants) && grants >= 0)) {
+    return false;
+  }
+  // The credited-evidence record is optional on older snapshots and is
+  // materialized by migrateCreditedEvidence on load.
+  const credited = goal.creditedEvidence;
+  if (
+    credited !== undefined &&
+    !(
+      Array.isArray(credited) &&
+      credited.length <= MAX_CREDITED_EVIDENCE &&
+      credited.every(
+        (key) =>
+          typeof key === "string" &&
+          key.length === CREDIT_DIGEST_HEX_CHARS &&
+          /^[0-9a-f]+$/.test(key),
+      )
+    )
+  ) {
+    return false;
+  }
+  const legacyCredited = (goal.execution as { creditedEvidence?: unknown }).creditedEvidence;
+  const retainedCreditCount = Math.max(
+    Array.isArray(credited) ? credited.length : 0,
+    Array.isArray(legacyCredited) ? legacyCredited.length : 0,
+  );
+  if (grants !== undefined && grants < retainedCreditCount) {
     return false;
   }
   // isolationCutoff was added in Task 8; tolerate snapshots persisted by
