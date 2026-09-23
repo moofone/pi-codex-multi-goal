@@ -86,9 +86,33 @@ interface AcceptedCompletion {
 
 const MAX_ACCEPTED_COMPLETIONS = 32;
 
+/** Details stamped on the stage-boundary compaction entry this extension appends. */
+export const STAGE_COMPACTION_SOURCE = "pi-codex-multi-goal/stage-boundary";
+
+/**
+ * Summary for the retain-none compaction at a stage boundary. Deliberately
+ * names no step title (old or next): the next step's objective arrives only
+ * through its own goal snapshot, exactly as with the isolation filter.
+ */
+export function stageCompactionSummary(handoff: string | undefined): string {
+  const lines = [
+    "Earlier goal steps were completed and verified; their transcript was compacted away at the step boundary.",
+    "Work only from the current goal snapshot and its working memory.",
+  ];
+  if (handoff && handoff.trim()) {
+    lines.push(`Handoff from the completed step: ${handoff.trim().slice(0, HANDOFF_MAX_CHARS)}`);
+  }
+  return lines.join("\n");
+}
+
 export function registerMultiGoal(pi: ExtensionAPI): void {
   const settings = loadSettings();
   const persistence = createPersistence({ pi });
+  // An accepted non-final completion waiting for its turn_end boundary, where
+  // a pi >= 0.87 host lets us append a retain-none compaction.
+  let pendingStageCompaction:
+    | { toolCallId: string; goalId: string; stage: number; handoff: string | undefined }
+    | undefined;
   let persistenceBroken = false;
 
   const trackPersistence = (ctx: ExtensionContext | null): void => {
@@ -439,6 +463,14 @@ export function registerMultiGoal(pi: ExtensionAPI): void {
       result: terminal,
     });
     if (result.goal.status === "active") {
+      if (settings.stageCompaction) {
+        pendingStageCompaction = {
+          toolCallId: input.toolCallId,
+          goalId: input.goalId,
+          stage: result.goal.index + 1,
+          handoff: typeof input.handoff === "string" ? input.handoff : undefined,
+        };
+      }
       // Exactly one kickoff for the next step, through the admission gates
       // (fresh grant, ownership, persistence) — isolation is enforced by the
       // persisted context boundary the provider request is filtered through.
@@ -695,6 +727,7 @@ export function registerMultiGoal(pi: ExtensionAPI): void {
   });
 
   pi.on("session_start", (_event, ctx) => {
+    pendingStageCompaction = undefined;
     const restored = restoreBranchGoal(ctx);
     persistence.setGoalSnapshot(restored);
     persistence.syncPersistedSnapshot(restored);
@@ -705,6 +738,7 @@ export function registerMultiGoal(pi: ExtensionAPI): void {
   });
 
   pi.on("session_tree", (_event, ctx) => {
+    pendingStageCompaction = undefined;
     const restored = restoreBranchGoal(ctx);
     persistence.setGoalSnapshot(restored);
     persistence.syncPersistedSnapshot(restored);
@@ -847,6 +881,47 @@ export function registerMultiGoal(pi: ExtensionAPI): void {
       return undefined;
     }
     return { messages };
+  });
+
+  // Stage-boundary compaction (pi >= 0.87 actionable turn_end). The completing
+  // turn's tool result has just been persisted; a retain-none compaction here
+  // makes the next request start from its summary, and — unlike the isolation
+  // filter alone — keeps later auto-compactions from re-summarizing completed
+  // steps the model never sees. Older hosts ignore turn_end results and pass no
+  // `entries`, so they keep the isolation filter only. The kickoff is a
+  // follow-up delivered after this boundary, so the compaction cannot hide it.
+  pi.on("turn_end", (event: any, ctx) => {
+    const pending = pendingStageCompaction;
+    if (!pending) {
+      return undefined;
+    }
+    const results: Array<{ toolCallId?: unknown }> = Array.isArray(event?.toolResults) ? event.toolResults : [];
+    if (!results.some((result) => result?.toolCallId === pending.toolCallId)) {
+      return undefined; // not the completing turn (yet)
+    }
+    pendingStageCompaction = undefined;
+    const goal = persistence.getGoal();
+    if (
+      !Array.isArray(event?.entries) ||
+      yielding(ctx) ||
+      !goal ||
+      goal.status !== "active" ||
+      goal.goalId !== pending.goalId ||
+      goal.index + 1 !== pending.stage
+    ) {
+      return undefined;
+    }
+    return {
+      entries: [
+        ...event.entries,
+        {
+          type: "compaction",
+          summary: stageCompactionSummary(pending.handoff),
+          firstKeptEntryId: null,
+          details: { source: STAGE_COMPACTION_SOURCE, goalId: pending.goalId, stage: pending.stage },
+        },
+      ],
+    };
   });
 
   pi.on("session_before_compact", (_event, ctx) => {

@@ -114,9 +114,17 @@ Settings live in `~/.pi/agent/pi-codex-multi-goal.json`:
   "turnLimit": 40,
   "totalLimit": 400,
   "evidenceGrant": 50,
-  "lifetimeCeiling": 1000
+  "lifetimeCeiling": 1000,
+  "stageCompaction": true
 }
 ```
+
+`stageCompaction` (default `true`, Pi >= 0.87): when a step completes, the
+completing turn's `turn_end` boundary appends a retain-none compaction whose
+summary carries only the handoff note. The per-request isolation filter still
+runs, but later auto-compactions no longer re-summarize completed steps the
+model never sees. Older hosts ignore the boundary result and keep the filter
+only. Set `false` to disable.
 
 Migration: `maxCompactionsWithoutMutation` is the legacy name for the
 no-progress full-context limit. A positive legacy value migrates onto

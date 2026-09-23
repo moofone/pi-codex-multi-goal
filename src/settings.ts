@@ -17,6 +17,12 @@ export interface MultiGoalSettings {
   turnLimit: number;
   evidenceGrant: number;
   lifetimeCeiling: number;
+  /**
+   * Pi >= 0.87: at an accepted stage transition, append a retain-none
+   * compaction so later auto-compactions never re-summarize completed steps.
+   * Default on; set false to keep only the per-request isolation filter.
+   */
+  stageCompaction: boolean;
   settingsPath: string;
 }
 
@@ -47,6 +53,7 @@ export function parseSettings(raw: unknown, path: string): MultiGoalSettings {
     turnLimit: DEFAULT_TURN_LIMIT,
     evidenceGrant: DEFAULT_EVIDENCE_GRANT,
     lifetimeCeiling: DEFAULT_LIFETIME_CEILING,
+    stageCompaction: true,
     settingsPath: path,
   };
   if (!raw || typeof raw !== "object") {
@@ -59,6 +66,7 @@ export function parseSettings(raw: unknown, path: string): MultiGoalSettings {
     evidenceGrant?: unknown;
     lifetimeCeiling?: unknown;
     maxCompactionsWithoutMutation?: unknown;
+    stageCompaction?: unknown;
   };
   const legacy = parsePositiveInteger(record.maxCompactionsWithoutMutation);
   const totalLimit = parsePositiveInteger(record.totalLimit) ?? DEFAULT_TOTAL_LIMIT;
@@ -77,6 +85,7 @@ export function parseSettings(raw: unknown, path: string): MultiGoalSettings {
       evidenceGrant: parsePositiveInteger(record.evidenceGrant),
       lifetimeCeiling: parsePositiveInteger(record.lifetimeCeiling),
     }),
+    stageCompaction: record.stageCompaction !== false,
     settingsPath: path,
   };
 }

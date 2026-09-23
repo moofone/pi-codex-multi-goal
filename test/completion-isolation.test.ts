@@ -515,3 +515,45 @@ test("unrelated custom messages do not displace the current goal snapshot", asyn
     "an unrelated custom message is not treated as a goal snapshot and is retained",
   );
 });
+
+test("stage completion appends a retain-none compaction at the completing turn_end (pi >= 0.87)", async t => {
+  const h = harness(t, { seed: seededGoal() });
+  await h.emit("session_start");
+  await h.command("resume");
+  await h.deliver();
+
+  // A turn that did not complete a step leaves the boundary alone.
+  assert.equal(await h.emit("turn_end", { entries: [], toolResults: [{ toolCallId: "other" }] }), undefined);
+
+  await h.updateGoal({ status: "complete", ...h.identity(), evidence: [h.evidence(h.criterionIds(0))], handoff: "fix lives in src/fix.ts" }, "terminal-c");
+  assert.equal(h.current().index, 1, "sanity: advanced");
+
+  // Not the completing turn yet: nothing appended, still pending.
+  assert.equal(await h.emit("turn_end", { entries: [], toolResults: [] }), undefined);
+
+  const prior = { type: "custom", customType: "other-extension", data: 1 };
+  const result = await h.emit("turn_end", { entries: [prior], toolResults: [{ toolCallId: "terminal-c" }] });
+  assert.ok(result, "the completing turn returns boundary entries");
+  assert.equal(result.entries.length, 2, "earlier handlers' drafts are preserved in order");
+  assert.equal(result.entries[0], prior);
+  const compaction = result.entries[1];
+  assert.equal(compaction.type, "compaction");
+  assert.equal(compaction.firstKeptEntryId, null, "retain-none: completed steps are dropped");
+  assert.equal(compaction.details.stage, 2);
+  assert.match(compaction.summary, /fix lives in src\/fix\.ts/, "the handoff survives");
+  assert.equal(/second|third|first/.test(compaction.summary), false, "no step title leaks into the summary");
+  assert.equal(result.continue, undefined, "continuation scheduling is left to the kickoff");
+
+  // One compaction per transition.
+  assert.equal(await h.emit("turn_end", { entries: [], toolResults: [{ toolCallId: "terminal-c" }] }), undefined);
+});
+
+test("stage compaction is skipped on hosts without actionable turn_end", async t => {
+  const h = harness(t, { seed: seededGoal() });
+  await h.emit("session_start");
+  await h.command("resume");
+  await h.deliver();
+  await h.updateGoal({ status: "complete", ...h.identity(), evidence: [h.evidence(h.criterionIds(0))] }, "old-host");
+  // pi < 0.87: turn_end carries no `entries`; the isolation filter alone applies.
+  assert.equal(await h.emit("turn_end", { toolResults: [{ toolCallId: "old-host" }] }), undefined);
+});
