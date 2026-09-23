@@ -4,8 +4,8 @@ import { join, relative } from "node:path";
 import test, { after } from "node:test";
 
 import { creditGrantCap, creditVerifiedEvidence } from "../src/allowance.ts";
-import { fingerprintContent, validateEvidenceRefs } from "../src/evidence.ts";
-import { acceptCompletion, cloneGoal, replaceGoalFromSteps } from "../src/state.ts";
+import { creditKeyDigest, fingerprintContent, validateEvidenceRefs } from "../src/evidence.ts";
+import { acceptCompletion, cloneGoal, isMultiGoal, replaceGoalFromSteps } from "../src/state.ts";
 import type { MultiGoal } from "../src/types.ts";
 
 /**
@@ -152,8 +152,52 @@ test("P4: legacy credited evidence seeds the lifetime grant counter", () => {
   delete (fullGoalRecord as Partial<MultiGoal>).creditGrants;
   assert.equal(
     cloneGoal(fullGoalRecord).creditGrants,
-    creditGrantCap(goal.execution),
-    "a saturated goal-scoped retention list conservatively exhausts the cap",
+    fullGoalRecord.creditedEvidence.length,
+    "a saturated goal-scoped list keeps the counter at least as high as retained digests",
+  );
+});
+
+test("P4: legacy evidence migration is bounded and inconsistent grant counters are rejected", () => {
+  const { goal } = fixture();
+  const legacyKeys = Array.from({ length: 10_000 }, (_, index) => `read#docs/${index}.md#0123456789abcdef`);
+  const legacy = {
+    ...goal,
+    execution: { ...goal.execution, creditedEvidence: legacyKeys },
+  } as MultiGoal;
+  delete (legacy as Partial<MultiGoal>).creditedEvidence;
+  delete (legacy as Partial<MultiGoal>).creditGrants;
+
+  assert.equal(isMultiGoal(legacy), false, "oversized legacy evidence is malformed on load");
+  const undercountedLegacy = {
+    ...goal,
+    execution: { ...goal.execution, creditedEvidence: legacyKeys.slice(-2) },
+    creditGrants: 0,
+  } as MultiGoal;
+  delete (undercountedLegacy as Partial<MultiGoal>).creditedEvidence;
+  assert.equal(isMultiGoal(undercountedLegacy), false, "legacy evidence cannot exceed its grant counter");
+
+  const migrated = cloneGoal(legacy);
+  assert.equal(migrated.creditedEvidence.length, 64, "direct migration examines only the legacy retention bound");
+  assert.ok(!migrated.creditedEvidence.includes(creditKeyDigest(legacyKeys[0]!)));
+  assert.ok(migrated.creditedEvidence.includes(creditKeyDigest(legacyKeys.at(-1)!)));
+  assert.equal(
+    Object.hasOwn(migrated.execution, "creditedEvidence"),
+    false,
+    "legacy evidence is removed from normalized execution",
+  );
+
+  const inconsistent = {
+    ...goal,
+    creditedEvidence: Array.from({ length: 4096 }, (_, index) => index.toString(16).padStart(16, "0")),
+    creditGrants: 0,
+  } as MultiGoal;
+  assert.equal(isMultiGoal(inconsistent), false, "grant count cannot trail retained digests");
+  const normalized = cloneGoal(inconsistent);
+  assert.equal(normalized.creditGrants, normalized.creditedEvidence.length);
+  assert.deepEqual(
+    creditVerifiedEvidence(normalized, ["read#docs/new.md#0123456789abcdef"]).creditedKeys,
+    [],
+    "normalization does not reopen grants beyond the retained count",
   );
 });
 

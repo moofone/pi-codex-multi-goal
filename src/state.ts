@@ -164,8 +164,10 @@ function effectiveLimits(execution: GoalExecution): FilledLimits {
  * after an upgrade and be skipped as malformed.
  */
 function normalizeExecution(execution: GoalExecution): GoalExecution {
+  const normalized = { ...execution } as GoalExecution & { creditedEvidence?: unknown };
+  delete normalized.creditedEvidence;
   return {
-    ...execution,
+    ...normalized,
     turnRequests: execution.turnRequests ?? 0,
     ...effectiveLimits(execution),
   };
@@ -200,9 +202,9 @@ function migrateCreditedEvidence(goal: MultiGoal): string[] {
     return [];
   }
   return legacy
+    .slice(-LEGACY_MAX_CREDITED_EVIDENCE)
     .filter((key): key is string => typeof key === "string")
-    .map(creditKeyDigest)
-    .slice(-MAX_CREDITED_EVIDENCE);
+    .map(creditKeyDigest);
 }
 
 /** The execution-scoped dedupe list was capped at 64 before it became goal-scoped. */
@@ -210,7 +212,7 @@ const LEGACY_MAX_CREDITED_EVIDENCE = 64;
 
 function migrateCreditGrants(goal: MultiGoal, creditedEvidence: string[], execution: GoalExecution): number {
   if (goal.creditGrants !== undefined) {
-    return goal.creditGrants;
+    return Math.max(goal.creditGrants, creditedEvidence.length);
   }
 
   // A full historical list may have evicted earlier credits, so its true count
@@ -225,9 +227,9 @@ function migrateCreditGrants(goal: MultiGoal, creditedEvidence: string[], execut
   // Keep aligned with allowance.creditGrantCap().
   const grantCap = Math.min(execution.lifetimeCeiling, MAX_CREDITED_EVIDENCE - MAX_CREDIT_GRANT_HEADROOM);
   if (retentionLimit !== undefined && creditedEvidence.length >= retentionLimit) {
-    return grantCap;
+    return Math.max(grantCap, creditedEvidence.length);
   }
-  return Math.min(creditedEvidence.length, grantCap);
+  return creditedEvidence.length;
 }
 
 /** Stamp a freshly constructed goal with the identity of its current contract. */
@@ -593,11 +595,18 @@ function isGoalExecution(value: unknown): value is GoalExecution {
     value === undefined || (Number.isInteger(value) && (value as number) >= 0);
   const optionalLimit = (value: unknown): boolean =>
     value === undefined || (Number.isInteger(value) && (value as number) > 0);
+  const legacyCredited = (value as { creditedEvidence?: unknown }).creditedEvidence;
   if (
     !optionalCounter(execution.turnRequests) ||
     !optionalLimit(execution.turnLimit) ||
     !optionalLimit(execution.evidenceGrant) ||
-    !optionalLimit(execution.lifetimeCeiling)
+    !optionalLimit(execution.lifetimeCeiling) ||
+    (legacyCredited !== undefined &&
+      !(
+        Array.isArray(legacyCredited) &&
+        legacyCredited.length <= LEGACY_MAX_CREDITED_EVIDENCE &&
+        legacyCredited.every((key) => typeof key === "string" && key.length <= 1024)
+      ))
   ) {
     return false;
   }
@@ -695,6 +704,14 @@ export function isMultiGoal(value: unknown): value is MultiGoal {
       credited.every((key) => typeof key === "string" && key.length <= 1024)
     )
   ) {
+    return false;
+  }
+  const legacyCredited = (goal.execution as { creditedEvidence?: unknown }).creditedEvidence;
+  const retainedCreditCount = Math.max(
+    Array.isArray(credited) ? credited.length : 0,
+    Array.isArray(legacyCredited) ? legacyCredited.length : 0,
+  );
+  if (grants !== undefined && grants < retainedCreditCount) {
     return false;
   }
   // isolationCutoff was added in Task 8; tolerate snapshots persisted by
