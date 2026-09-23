@@ -12,11 +12,11 @@ import { CUSTOM_ENTRY_TYPE } from "../src/types.ts";
 // CANNOT deny a request including retries — probe 1 [fail]).
 //
 // Therefore this suite deliberately does NOT claim a host-side admission
-// barrier (A04 stays open). It proves the fallback contract: goal-owned
-// requests are charged durably at provider entry, goal continuations stop
-// being requested once the allowance reaches 0, reloads never refund, and a
-// fourth goal-owned provider entry is never recorded by the extension even
-// though the host itself cannot be denied.
+// barrier (A04 stays open). It proves the fallback contract: the total
+// budget is charged durably per goal-owned provider request; no-progress is
+// charged per full context (session_compact); exhaustion pauses and withdraws
+// proven goal-owned work; reloads never refund; a fourth goal-owned provider
+// entry is never recorded even though the host itself cannot be denied.
 
 interface HarnessOptions {
   limits?: { noProgressLimit: number; totalLimit: number };
@@ -55,11 +55,14 @@ function harness(t: any, options: HarnessOptions = {}) {
   const commands = new Map<string, any>();
   const sent: any[] = [];
   let lastNotified: string | null = null;
+  let aborts = 0;
   const ctx: any = {
     hasUI: false,
     isIdle: () => true,
     hasPendingMessages: () => false,
-    abort: () => {},
+    abort: () => {
+      aborts += 1;
+    },
     sessionManager: {
       getSessionId: () => "admission-session",
       getSessionFile: () => "/qa/admission-session.jsonl",
@@ -107,10 +110,13 @@ function harness(t: any, options: HarnessOptions = {}) {
   return {
     emit,
     sent,
+    aborted: () => aborts,
     branchSnapshot: () => [...branch],
     /** Simulates the host running one provider request against the fake provider. */
     providerRequest: () =>
       emit("before_provider_request", { payload: fakeProviderPayload() }),
+    /** One full context window (compaction boundary). */
+    compact: () => emit("session_compact", { reason: "threshold" }),
     goalStatus: () => {
       commands.get("goal").handler("", ctx);
       return lastNotified ?? "";
@@ -142,7 +148,7 @@ function assertExecution(
       lifetimeRequests: execution.lifetimeRequests,
     },
     expected,
-    message,
+    message ?? "execution counters",
   );
 }
 
@@ -159,16 +165,16 @@ test("allowance three admits three never four", async t => {
   assertExecution(h, { noProgressRemaining: 3, totalRemaining: 3, lifetimeRequests: 0 },
     "scheduling a request is not yet charging it");
   await h.providerRequest();
-  assertExecution(h, { noProgressRemaining: 2, totalRemaining: 2, lifetimeRequests: 1 },
-    "the kickoff request is charged exactly once, durably");
+  assertExecution(h, { noProgressRemaining: 3, totalRemaining: 2, lifetimeRequests: 1 },
+    "the kickoff request spends total only, once, durably");
 
   // Entry 2 — a retried request: another provider request for the same goal
   // turn (a tool-loop continuation of the kickoff), charged again at the hook.
   await h.providerRequest();
-  assertExecution(h, { noProgressRemaining: 1, totalRemaining: 1, lifetimeRequests: 2 },
-    "the retried request is charged; counters never reset on bookkeeping activity");
+  assertExecution(h, { noProgressRemaining: 3, totalRemaining: 1, lifetimeRequests: 2 },
+    "the retried request is charged against total; no-progress is untouched");
   await h.emit("agent_end", { messages: [] });
-  assertExecution(h, { noProgressRemaining: 1, totalRemaining: 1, lifetimeRequests: 2 },
+  assertExecution(h, { noProgressRemaining: 3, totalRemaining: 1, lifetimeRequests: 2 },
     "turn ends never recharge an already-charged request");
 
   // Reload must not refund: the restored grant is the charged one.
@@ -178,7 +184,7 @@ test("allowance three admits three never four", async t => {
   assert.match(restored, /Status: paused/, "restored work waits for an explicit decision");
   assert.match(
     restored,
-    /no-progress 1\/3, total 1\/3/,
+    /no-progress 3\/3, total 1\/3/,
     "a reload must not refund the consumed allowance",
   );
 
@@ -187,7 +193,7 @@ test("allowance three admits three never four", async t => {
   assert.match(reloaded.goalStatus(), /Status: active/);
   assert.equal(reloaded.sent.length, 1, "the resume kickoff is the third goal-owned entry");
   await reloaded.providerRequest();
-  assertExecution(reloaded, { noProgressRemaining: 2, totalRemaining: 0, lifetimeRequests: 3 },
+  assertExecution(reloaded, { noProgressRemaining: 3, totalRemaining: 0, lifetimeRequests: 3 },
     "the third request exhausts the total allowance and is charged once");
   assert.match(reloaded.goalStatus(), /Status: paused/);
   assert.match(reloaded.goalStatus(), /total request allowance exhausted/);
@@ -221,35 +227,46 @@ test("allowance three admits three never four", async t => {
   );
 });
 
-// Task 9 maintained regression for the QA-01 probe ("repeated goal turns pause
-// without compaction"): under request accounting the equivalent contract is
-// that unproductive goal-owned provider entries exhaust the no-progress streak
-// and pause the goal at provider entry — no compaction ever fires — and
-// nothing further is admitted until an explicit resume grants a fresh bounded
-// streak (verified progress resetting the streak is test/progress-credit).
-test("no-progress exhaustion pauses without compaction", async t => {
+// Tool-loop provider requests are not full contexts. noProgressLimit: 3 means
+// three session_compact events, not three model turns. Exhaustion pauses and
+// withdraws the outstanding queued kickoff (abort once).
+test("no-progress exhaustion is full contexts, not turns, and stops", async t => {
   const h = harness(t, { limits: { noProgressLimit: 3, totalLimit: 200 } });
 
   await h.emit("session_start");
   await h.command(JSON.stringify({ objective: "ship the fix", criteria: ["it ships"] }));
   assert.equal(h.sent.length, 1, "the kickoff is scheduled once");
   await h.providerRequest();
-  assertExecution(h, { noProgressRemaining: 2, totalRemaining: 199, lifetimeRequests: 1 });
+  assertExecution(h, { noProgressRemaining: 3, totalRemaining: 199, lifetimeRequests: 1 },
+    "a provider request spends total, not no-progress");
 
-  // Three unproductive requests in, the no-progress streak is spent. No
-  // compaction event ever fired; the pause happens purely at provider entry.
+  // A tight tool loop must not burn the 3 full-context allowance.
   await h.providerRequest();
   await h.providerRequest();
+  assert.match(h.goalStatus(), /Status: active/, "turns without a full context must not pause");
+  assertExecution(h, { noProgressRemaining: 3, totalRemaining: 197, lifetimeRequests: 3 });
+  assert.equal(h.aborted(), 0, "active tool-loop turns do not stop the goal");
+
+  await h.compact();
+  await h.compact();
+  assert.match(h.goalStatus(), /Status: active/);
+  assertExecution(h, { noProgressRemaining: 1, totalRemaining: 197, lifetimeRequests: 3 });
+
+  await h.compact();
   assert.match(h.goalStatus(), /Status: paused/);
-  assert.match(h.goalStatus(), /no-progress/, "the pause reason names the no-progress allowance");
+  assert.match(h.goalStatus(), /full contexts/, "the pause reason names full contexts");
   assertExecution(h, { noProgressRemaining: 0, totalRemaining: 197, lifetimeRequests: 3 });
+  assert.equal(h.aborted(), 1, "valid exhaustion withdraws outstanding goal-owned work once");
+  assert.equal(h.sent.length, 1, "no further goal continuation is requested once the streak is spent");
 
-  // Nothing more is scheduled, and host-side requests the extension cannot
-  // deny (probe 1) record nothing: counters never go negative.
+  // Host-side requests the extension cannot deny record nothing: counters
+  // never go negative. Already-paused work is not aborted again.
   await h.emit("agent_end", { messages: [] });
   await h.providerRequest();
+  await h.compact();
   assertExecution(h, { noProgressRemaining: 0, totalRemaining: 197, lifetimeRequests: 3 });
-  assert.equal(h.sent.length, 1, "no goal continuation is requested once the streak is spent");
+  assert.equal(h.aborted(), 1, "a second exhaustion does not abort again");
+  assert.equal(h.sent.length, 1);
 
   // An explicit user resume grants a fresh bounded no-progress streak only.
   await h.command("resume");

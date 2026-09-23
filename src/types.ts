@@ -49,10 +49,13 @@ export interface GoalMemory {
 /** Bounded execution grant plus lifetime accounting for the current step. */
 export interface GoalExecution {
   generation: number;
+  /** Full contexts remaining before a no-progress pause. */
   noProgressRemaining: number;
+  /** Goal-owned provider requests remaining in this step's total budget. */
   totalRemaining: number;
   noProgressLimit: number;
   totalLimit: number;
+  /** Admitted goal-owned provider requests this step (never refunded). */
   lifetimeRequests: number;
   tokenUsage: number | null;
   /** Dedupe keys of evidence refs that already received progress credit. */

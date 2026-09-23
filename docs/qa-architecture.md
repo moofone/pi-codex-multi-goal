@@ -75,15 +75,17 @@ kickoff, tool continuations, retries, and recovery through a controlled provider
 the limit must hold without waiting for natural idle or compaction.
 
 **Disposition (fixed):** `src/allowance.ts` persists a finite no-progress/total
-grant per step and charges every goal-owned request exactly once at provider
-entry (kickoff, continuations, retries, recovery); reloads never refund,
+grant per step. No-progress is charged once per full context (`session_compact`);
+the total budget is charged once per goal-owned provider request at provider
+entry (kickoff, continuations, retries, recovery). Reloads never refund,
 lifetime totals never reset, and settings no longer accept unlimited values
 (`test/admission.test.ts`, `test/stall.test.ts`). Verified evidence resets only
 the no-progress streak, once per novel ref (`test/progress-credit.test.ts`); a
-spent streak pauses at provider entry without compaction (`test/admission.test.ts`,
-`no-progress exhaustion pauses without compaction`). Remaining gap: the host hook
-cannot deny retries (probe 1), so exhaustion stops goal scheduling rather than
-walling off the host — A04's barrier is not claimed.
+spent no-progress streak pauses at compaction, not at tool-loop turns
+(`test/admission.test.ts`, `no-progress exhaustion is full contexts, not turns, and stops`),
+and valid exhaustion withdraws proven goal-owned work. Remaining gap: the host
+hook cannot deny retries (probe 1), so the in-flight provider request itself is
+not walled off — A04's barrier is not claimed.
 
 ### F02 — P1: pause changes state without stopping submitted execution
 
