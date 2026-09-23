@@ -67,10 +67,13 @@ test("P4: an artifact peer ref converts to a Goal evidence ref", () => {
     artifact,
     fingerprint,
     criteria: [criterion],
+    peerSha256: sha256,
   });
 
   const validated = validateEvidenceRefs(goal, [converted.ref]);
   assert.equal(validated.ok, true, "and the result passes the same validator completion uses");
+  assert.ok(validated.ok);
+  assert.equal("peerSha256" in validated.refs[0]!, false, "only Goal's prefix survives validation");
 });
 
 test("P4: a peer artifact digest must be a complete sha256 hex value", () => {
@@ -93,6 +96,37 @@ test("P4: a peer artifact digest must be a complete sha256 hex value", () => {
   );
   assert.ok(uppercase.ok, "uppercase hexadecimal is accepted and normalized");
   assert.equal(uppercase.ref.fingerprint, prefix, "the Goal fingerprint remains lowercase canonical hex");
+  assert.equal(uppercase.ref.peerSha256, sha256, "the complete peer digest remains canonical for validation");
+});
+
+test("P4: a peer digest with a correct prefix but fabricated suffix is rejected", () => {
+  const { goal, artifact, sha256, criterion } = fixture();
+  const fabricated = `${sha256.slice(0, 16)}${sha256[16] === "0" ? "1" : "0"}${sha256.slice(17)}`;
+  assert.equal(fabricated.length, 64);
+  assert.equal(fabricated.slice(0, 16), sha256.slice(0, 16));
+  assert.notEqual(fabricated, sha256);
+
+  const valid = validateEvidenceRefs(goal, [
+    {
+      source: "peer",
+      ref: { kind: "artifact", path: artifact, sha256 },
+      operation: "read",
+      criteria: [criterion],
+    },
+  ]);
+  assert.ok(valid.ok, "the adapter accepts the complete digest that matches the artifact bytes");
+
+  const attempted = validateEvidenceRefs(goal, [
+    {
+      source: "peer",
+      ref: { kind: "artifact", path: artifact, sha256: fabricated },
+      operation: "read",
+      criteria: [criterion],
+    },
+  ]);
+  assert.equal(attempted.ok, false, "matching only the fingerprint prefix cannot validate peer evidence");
+  assert.ok(!attempted.ok);
+  assert.match(attempted.message, /peer SHA-256 mismatch/i);
 });
 
 test("P4: peer refs Goal cannot verify are refused, not dropped or invented", () => {

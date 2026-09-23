@@ -331,6 +331,21 @@ test("peer evidence tool inputs convert before verified progress credit", async 
   };
   const before = h.counters();
   const revision = h.identity().revision;
+  const actualPeerDigest = peerArtifact.ref.sha256;
+  const fabricatedDigest = `${actualPeerDigest.slice(0, 16)}${actualPeerDigest[16] === "0" ? "1" : "0"}${actualPeerDigest.slice(17)}`;
+  await assert.rejects(
+    () => h.memory({
+      ...h.identity(),
+      proved: ["peer finding"],
+      unresolved: [],
+      next: "continue checking",
+      evidence: [{ ...peerArtifact, ref: { ...peerArtifact.ref, sha256: fabricatedDigest } }],
+    }),
+    /peer SHA-256 mismatch/i,
+    "a matching prefix with a fabricated suffix is rejected before progress is committed",
+  );
+  assert.deepEqual(h.counters(), before, "a mismatched complete peer digest earns no credit");
+  assert.equal(h.identity().revision, revision, "a mismatched complete peer digest leaves memory unchanged");
 
   await assert.rejects(
     () => h.memory({

@@ -115,7 +115,7 @@ export type PeerEvidenceRef =
   | { kind: "artifact"; path: string; sha256?: string; recordId?: string };
 
 export type PeerEvidenceConversion =
-  | { ok: true; ref: EvidenceRefInput }
+  | { ok: true; ref: EvidenceRefInput & { peerSha256: string } }
   | { ok: false; message: string };
 
 /**
@@ -179,9 +179,12 @@ export function convertPeerEvidence(
     ref: {
       operation: context.operation,
       artifact: ref.path,
-      // Goal's fingerprint is the sha256 prefix; a peer may carry the full digest.
+      // Keep the complete peer digest through artifact validation. The
+      // validator strips this field after checking it against the artifact;
+      // only the prefix is retained in Goal evidence and dedupe keys.
       fingerprint: ref.sha256.toLowerCase().slice(0, FINGERPRINT_HEX_CHARS),
       criteria: context.criteria,
+      peerSha256: ref.sha256.toLowerCase(),
     },
   };
 }
@@ -415,7 +418,18 @@ export function validateEvidenceRefs(goal: MultiGoal, refs: unknown): EvidenceVa
         `fingerprint must be ${FINGERPRINT_HEX_CHARS} lowercase hex characters (sha256 prefix of the artifact bytes)`,
       );
     }
-    const actual = fingerprintContent(content.bytes);
+    const peerSha256 = (ref as Partial<EvidenceRefInput> & { peerSha256?: unknown }).peerSha256;
+    if (peerSha256 !== undefined && (typeof peerSha256 !== "string" || !/^[0-9a-f]{64}$/.test(peerSha256))) {
+      return refFailure(index, "peer SHA-256 must be a complete lowercase 64-character hex digest");
+    }
+    const actualSha256 = createHash("sha256").update(content.bytes).digest("hex");
+    if (typeof peerSha256 === "string" && actualSha256 !== peerSha256) {
+      return refFailure(
+        index,
+        `peer SHA-256 mismatch: the complete digest does not match the current bytes of "${ref.artifact}"`,
+      );
+    }
+    const actual = actualSha256.slice(0, FINGERPRINT_HEX_CHARS);
     if (actual !== ref.fingerprint) {
       return refFailure(
         index,
