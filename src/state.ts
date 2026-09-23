@@ -12,6 +12,7 @@ import { creditKeyDigest } from "./evidence.js";
 import { parseStageTitles, validateSteps, validateTitles } from "./parse.js";
 import {
   CUSTOM_ENTRY_TYPE,
+  CREDIT_DIGEST_HEX_CHARS,
   DEFAULT_EVIDENCE_GRANT,
   DEFAULT_LIFETIME_CEILING,
   DEFAULT_NO_PROGRESS_LIMIT,
@@ -701,7 +702,12 @@ export function isMultiGoal(value: unknown): value is MultiGoal {
     !(
       Array.isArray(credited) &&
       credited.length <= MAX_CREDITED_EVIDENCE &&
-      credited.every((key) => typeof key === "string" && key.length <= 1024)
+      credited.every(
+        (key) =>
+          typeof key === "string" &&
+          key.length === CREDIT_DIGEST_HEX_CHARS &&
+          /^[0-9a-f]+$/.test(key),
+      )
     )
   ) {
     return false;

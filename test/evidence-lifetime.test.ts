@@ -108,6 +108,27 @@ test("P4: a credit never refunds lifetime requests", () => {
   );
 });
 
+test("P4: goal-scoped credited evidence must be stored as fixed-width hex digests", () => {
+  const { goal } = fixture();
+  const rawKey = "read#docs/already-credited.md#0123456789abcdef";
+  const malformed = {
+    ...goal,
+    creditedEvidence: [rawKey],
+    creditGrants: 1,
+  } as MultiGoal;
+
+  assert.equal(
+    isMultiGoal(malformed),
+    false,
+    "a raw evidence key with a matching grant count must not load as a persisted digest",
+  );
+  assert.equal(
+    isMultiGoal({ ...goal, creditedEvidence: [creditKeyDigest(rawKey)], creditGrants: 1 }),
+    true,
+    "the corresponding fixed-width digest remains valid",
+  );
+});
+
 test("P4: legacy credited evidence seeds the lifetime grant counter", () => {
   const { goal } = fixture();
   const keys = [
