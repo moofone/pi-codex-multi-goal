@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join, relative } from "node:path";
 import test, { after } from "node:test";
 
-import { creditVerifiedEvidence } from "../src/allowance.ts";
+import { creditGrantCap, creditVerifiedEvidence } from "../src/allowance.ts";
 import { fingerprintContent, validateEvidenceRefs } from "../src/evidence.ts";
 import { acceptCompletion, cloneGoal, replaceGoalFromSteps } from "../src/state.ts";
 import type { MultiGoal } from "../src/types.ts";
@@ -105,6 +105,55 @@ test("P4: a credit never refunds lifetime requests", () => {
   assert.ok(
     credited.goal.execution.totalRemaining > 90,
     "the working total is renewed, which is the point of the credit",
+  );
+});
+
+test("P4: legacy credited evidence seeds the lifetime grant counter", () => {
+  const { goal } = fixture();
+  const keys = [
+    "read#docs/one.md#0123456789abcdef",
+    "edit#docs/two.md#fedcba9876543210",
+  ];
+  const legacy = {
+    ...goal,
+    execution: { ...goal.execution, creditedEvidence: keys },
+  } as MultiGoal;
+  delete (legacy as Partial<MultiGoal>).creditedEvidence;
+  delete (legacy as Partial<MultiGoal>).creditGrants;
+
+  const migrated = cloneGoal(legacy);
+  assert.equal(migrated.creditedEvidence.length, keys.length);
+  assert.equal(migrated.creditGrants, keys.length, "each retained legacy key counts against the new cap");
+  assert.deepEqual(creditVerifiedEvidence(migrated, [keys[0]!]).creditedKeys, [], "legacy keys remain deduped");
+
+  // Before evidence became goal-scoped, the execution list retained only 64
+  // keys; reaching that bound means earlier grants may already have been evicted.
+  const fullLegacy = {
+    ...goal,
+    execution: {
+      ...goal.execution,
+      creditedEvidence: Array.from({ length: 64 }, (_, index) => `read#docs/${index}.md#0123456789abcdef`),
+    },
+  } as MultiGoal;
+  delete (fullLegacy as Partial<MultiGoal>).creditedEvidence;
+  delete (fullLegacy as Partial<MultiGoal>).creditGrants;
+  assert.equal(
+    cloneGoal(fullLegacy).creditGrants,
+    creditGrantCap(goal.execution),
+    "a saturated legacy retention list conservatively exhausts the cap",
+  );
+
+  // The subsequent goal-scoped format could retain up to 4096 entries and also
+  // had no grant counter, so a full list there is likewise treated as saturated.
+  const fullGoalRecord = {
+    ...goal,
+    creditedEvidence: Array.from({ length: 4096 }, (_, index) => index.toString(16).padStart(16, "0")),
+  } as MultiGoal;
+  delete (fullGoalRecord as Partial<MultiGoal>).creditGrants;
+  assert.equal(
+    cloneGoal(fullGoalRecord).creditGrants,
+    creditGrantCap(goal.execution),
+    "a saturated goal-scoped retention list conservatively exhausts the cap",
   );
 });
 

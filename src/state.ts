@@ -18,6 +18,7 @@ import {
   DEFAULT_TOTAL_LIMIT,
   DEFAULT_TURN_LIMIT,
   MAX_CREDITED_EVIDENCE,
+  MAX_CREDIT_GRANT_HEADROOM,
   type Criterion,
   type GoalCustomEntry,
   type GoalEntrySource,
@@ -204,19 +205,46 @@ function migrateCreditedEvidence(goal: MultiGoal): string[] {
     .slice(-MAX_CREDITED_EVIDENCE);
 }
 
+/** The execution-scoped dedupe list was capped at 64 before it became goal-scoped. */
+const LEGACY_MAX_CREDITED_EVIDENCE = 64;
+
+function migrateCreditGrants(goal: MultiGoal, creditedEvidence: string[], execution: GoalExecution): number {
+  if (goal.creditGrants !== undefined) {
+    return goal.creditGrants;
+  }
+
+  // A full historical list may have evicted earlier credits, so its true count
+  // is unknowable. Conservatively exhaust the new cap rather than reopening it.
+  const own = goal.creditedEvidence;
+  const legacy = (goal.execution as { creditedEvidence?: unknown }).creditedEvidence;
+  const retentionLimit = Array.isArray(own)
+    ? MAX_CREDITED_EVIDENCE
+    : Array.isArray(legacy)
+      ? LEGACY_MAX_CREDITED_EVIDENCE
+      : undefined;
+  // Keep aligned with allowance.creditGrantCap().
+  const grantCap = Math.min(execution.lifetimeCeiling, MAX_CREDITED_EVIDENCE - MAX_CREDIT_GRANT_HEADROOM);
+  if (retentionLimit !== undefined && creditedEvidence.length >= retentionLimit) {
+    return grantCap;
+  }
+  return Math.min(creditedEvidence.length, grantCap);
+}
+
 /** Stamp a freshly constructed goal with the identity of its current contract. */
 function sealGoal(goal: Omit<MultiGoal, "contractRevision" | "creditedEvidence" | "creditGrants">): MultiGoal {
   return { ...goal, contractRevision: currentContractRevision(goal), creditedEvidence: [], creditGrants: 0 };
 }
 
 export function cloneGoal(goal: MultiGoal): MultiGoal {
+  const execution = normalizeExecution(goal.execution);
+  const creditedEvidence = migrateCreditedEvidence(goal);
   return {
     goalId: goal.goalId,
     status: goal.status,
     index: goal.index,
     contractRevision: currentContractRevision(goal),
-    creditedEvidence: migrateCreditedEvidence(goal),
-    creditGrants: goal.creditGrants ?? 0,
+    creditedEvidence,
+    creditGrants: migrateCreditGrants(goal, creditedEvidence, execution),
     createdAt: goal.createdAt,
     updatedAt: goal.updatedAt,
     isolationCutoff: goal.isolationCutoff ?? null,
@@ -226,7 +254,7 @@ export function cloneGoal(goal: MultiGoal): MultiGoal {
       unresolved: [...goal.memory.unresolved],
       next: goal.memory.next,
     },
-    execution: normalizeExecution(goal.execution),
+    execution,
     // A snapshot written before P0 has no backend record; a goal that never met
     // a peer is `unbound`, which is today's behaviour (invariant 1).
     backend: normalizeBackend(goal.backend),
