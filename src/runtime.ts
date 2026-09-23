@@ -890,7 +890,13 @@ export function registerMultiGoal(pi: ExtensionAPI): void {
   // steps the model never sees. Older hosts ignore turn_end results and pass no
   // `entries`, so they keep the isolation filter only. The kickoff is a
   // follow-up delivered after this boundary, so the compaction cannot hide it.
-  pi.on("turn_end", (event: any, ctx) => {
+  // Registered through a widened signature: pi < 0.87 types turn_end as
+  // notification-only (void), and this package supports those peers too.
+  const onBoundary = pi.on as unknown as (
+    name: "turn_end",
+    handler: (event: any, ctx: ExtensionContext) => unknown,
+  ) => void;
+  onBoundary("turn_end", (event, ctx) => {
     const pending = pendingStageCompaction;
     if (!pending) {
       return undefined;
