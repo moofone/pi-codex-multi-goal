@@ -21,6 +21,30 @@ const EvidenceRefParams = Type.Object({
   }),
 });
 
+const PeerEvidenceParams = Type.Object({
+  source: Type.Literal("peer", {
+    description: "Use this form for peer refs; only artifacts with a full SHA-256 digest can become Goal evidence.",
+  }),
+  ref: Type.Union([
+    Type.Object({ kind: Type.Literal("session"), sessionId: Type.String(), entryId: Type.String() }),
+    Type.Object({ kind: Type.Literal("research"), taskId: Type.String(), recordId: Type.String() }),
+    Type.Object({
+      kind: Type.Literal("artifact"),
+      path: Type.String(),
+      sha256: Type.Optional(
+        Type.String({ description: "The peer artifact's complete 64-character SHA-256 hex digest." }),
+      ),
+      recordId: Type.Optional(Type.String()),
+    }),
+  ]),
+  operation: Type.String({ description: "Producing operation associated with the peer artifact." }),
+  criteria: Type.Array(Type.String(), {
+    description: "Criterion ids of the CURRENT step this peer evidence supports.",
+  }),
+});
+
+const EvidenceInputParams = Type.Union([EvidenceRefParams, PeerEvidenceParams]);
+
 const UpdateGoalParams = Type.Object({
   status: StringEnum(["complete", "blocked"] as const, {
     description: "complete = this stage is done (harness advances). blocked = this stage cannot proceed.",
@@ -35,9 +59,9 @@ const UpdateGoalParams = Type.Object({
     description: "The generation attribute of the memory block.",
   }),
   evidence: Type.Optional(
-    Type.Array(EvidenceRefParams, {
+    Type.Array(EvidenceInputParams, {
       description:
-        "Required for complete: refs proving every criterion of the current step (same validation as progress credit). Missing or stale evidence is refused.",
+        "Required for complete: refs proving every criterion of the current step (same validation as progress credit). Accept Goal refs or { source: 'peer', ref, operation, criteria }; missing, stale, or unverifiable peer refs are refused.",
     }),
   ),
   handoff: Type.Optional(
@@ -104,9 +128,9 @@ const UpdateGoalMemoryParams = Type.Object({
     description: "The next concrete action toward the human-defined success criteria.",
   }),
   evidence: Type.Optional(
-    Type.Array(EvidenceRefParams, {
+    Type.Array(EvidenceInputParams, {
       description:
-        "Optional refs verified on the same path as completion (artifact exists, producing operation, sha256-16 fingerprint, criterion ids). Each NOVEL verified ref resets the no-progress allowance once; unverifiable claims stay in memory without credit.",
+        "Optional refs verified on the same path as completion (artifact exists, producing operation, sha256-16 fingerprint, criterion ids). Accept Goal refs or { source: 'peer', ref, operation, criteria }; each NOVEL verified ref resets the no-progress allowance once; unverifiable claims stay in memory without credit.",
     }),
   ),
 });

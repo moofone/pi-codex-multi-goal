@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join, relative } from "node:path";
 import test, { after } from "node:test";
@@ -28,7 +29,7 @@ import type { MultiGoal } from "../src/types.ts";
  */
 
 /** A goal whose current step has two criteria, plus a real artifact on disk. */
-function fixture(): { goal: MultiGoal; artifact: string; fingerprint: string; criterion: string } {
+function fixture(): { goal: MultiGoal; artifact: string; fingerprint: string; sha256: string; criterion: string } {
   // The validator only accepts project-relative paths without traversal, so
   // the artifact has to live under the working directory, not in the tmpdir.
   const dir = mkdtempSync(join(process.cwd(), ".goal-evidence-"));
@@ -46,15 +47,16 @@ function fixture(): { goal: MultiGoal; artifact: string; fingerprint: string; cr
     goal: result.goal,
     artifact: relative(process.cwd(), absolute),
     fingerprint: fingerprintContent(bytes),
+    sha256: createHash("sha256").update(bytes).digest("hex"),
     criterion: result.goal.stages[0]!.criteria[0]!.id,
   };
 }
 
 test("P4: an artifact peer ref converts to a Goal evidence ref", () => {
-  const { goal, artifact, fingerprint, criterion } = fixture();
+  const { goal, artifact, fingerprint, sha256, criterion } = fixture();
 
   const converted = convertPeerEvidence(
-    { kind: "artifact", path: artifact, sha256: fingerprint },
+    { kind: "artifact", path: artifact, sha256 },
     { operation: "read", criteria: [criterion] },
   );
 
@@ -69,6 +71,28 @@ test("P4: an artifact peer ref converts to a Goal evidence ref", () => {
 
   const validated = validateEvidenceRefs(goal, [converted.ref]);
   assert.equal(validated.ok, true, "and the result passes the same validator completion uses");
+});
+
+test("P4: a peer artifact digest must be a complete sha256 hex value", () => {
+  const { artifact, sha256, criterion } = fixture();
+  const prefix = sha256.slice(0, 16);
+
+  for (const malformed of [prefix, sha256.slice(0, -1), `${sha256}0`, `${sha256.slice(0, -1)}g`]) {
+    const converted = convertPeerEvidence(
+      { kind: "artifact", path: artifact, sha256: malformed },
+      { operation: "read", criteria: [criterion] },
+    );
+    assert.equal(converted.ok, false, `refuses malformed digest: ${malformed}`);
+    assert.ok(!converted.ok);
+    assert.match(converted.message, /64-character sha256 hex/i);
+  }
+
+  const uppercase = convertPeerEvidence(
+    { kind: "artifact", path: artifact, sha256: sha256.toUpperCase() },
+    { operation: "read", criteria: [criterion] },
+  );
+  assert.ok(uppercase.ok, "uppercase hexadecimal is accepted and normalized");
+  assert.equal(uppercase.ref.fingerprint, prefix, "the Goal fingerprint remains lowercase canonical hex");
 });
 
 test("P4: peer refs Goal cannot verify are refused, not dropped or invented", () => {
@@ -102,14 +126,14 @@ test("P4: peer refs Goal cannot verify are refused, not dropped or invented", ()
 });
 
 test("P4: a peer node id never reaches the dedupe key", () => {
-  const { goal, artifact, fingerprint, criterion } = fixture();
+  const { goal, artifact, fingerprint, sha256, criterion } = fixture();
 
   const first = convertPeerEvidence(
-    { kind: "artifact", path: artifact, sha256: fingerprint, recordId: "node-1" },
+    { kind: "artifact", path: artifact, sha256, recordId: "node-1" },
     { operation: "read", criteria: [criterion] },
   );
   const churned = convertPeerEvidence(
-    { kind: "artifact", path: artifact, sha256: fingerprint, recordId: "node-2-renamed" },
+    { kind: "artifact", path: artifact, sha256, recordId: "node-2-renamed" },
     { operation: "read", criteria: [criterion] },
   );
   assert.ok(first.ok && churned.ok);
