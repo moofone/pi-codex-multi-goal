@@ -19,9 +19,24 @@ test("goal text is a single objective", () => {
   });
 });
 
+test("accepts realistic multi-sentence objectives", () => {
+  const rejectedInPractice =
+    "Complete Phase A in /Users/greg/spec/TSC_PROOF_OF_INFERENCE/RESEARCH_HANDOFF.md. Reports only; respect its resource restrictions. " +
+    "Produce the acceptance-contract assessment and next falsifiable experiment, or exact blockers. Do not start later phases.";
+  assert.deepEqual(parseStageTitles(rejectedInPractice), { ok: true, titles: [rejectedInPractice] });
+  // A paragraph-sized brief with paths and constraints is an objective, not a title.
+  const brief = `${rejectedInPractice} `.repeat(8).trim();
+  assert.ok([...brief].length > 1500);
+  assert.equal(parseStageTitles(brief).ok, true);
+});
+
 test("rejects empty and oversized objectives", () => {
   assert.equal(parseStageTitles("").ok, false);
   assert.equal(parseStageTitles("   ").ok, false);
   assert.equal(parseStageTitles("a".repeat(MAX_STAGE_TITLE_CHARS)).ok, true);
-  assert.equal(parseStageTitles("a".repeat(MAX_STAGE_TITLE_CHARS + 1)).ok, false);
+  const oversized = parseStageTitles("a".repeat(MAX_STAGE_TITLE_CHARS + 1));
+  assert.equal(oversized.ok, false);
+  assert.match(oversized.ok ? "" : oversized.message, /^Objectives must be \d+ characters or fewer\.$/);
+  // Code points, not UTF-16 units: an astral character counts once.
+  assert.equal(parseStageTitles("\u{1F600}".repeat(MAX_STAGE_TITLE_CHARS)).ok, true);
 });

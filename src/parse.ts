@@ -34,7 +34,7 @@ export function validateTitles(
   }
   for (const title of titles) {
     if ([...title].length > MAX_STAGE_TITLE_CHARS) {
-      return { ok: false, message: `Stage titles must be ${MAX_STAGE_TITLE_CHARS} characters or fewer.` };
+      return { ok: false, message: `Objectives must be ${MAX_STAGE_TITLE_CHARS} characters or fewer.` };
     }
   }
   return { ok: true, titles };
