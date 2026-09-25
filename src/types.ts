@@ -3,7 +3,12 @@ import type { PeerOperationKind, PeerReceipt, PeerScope } from "./peer.js";
 export const CUSTOM_ENTRY_TYPE = "pi-codex-multi-goal";
 export const MAX_STAGES = 24;
 export const MIN_WIZARD_STAGES = 2;
-export const MAX_STAGE_TITLE_CHARS = 200;
+/**
+ * Upper bound on one step objective, in Unicode code points. Objectives are
+ * human-authored briefs (paths, scope, constraints), not display titles, so the
+ * bound only rejects pathological pastes; the working-memory cap is separate.
+ */
+export const MAX_STAGE_TITLE_CHARS = 4000;
 
 // Provisional limits — to be validated against the long-run fixtures (Task 9);
 // these are not frozen product numbers. Bytes are not a token count.
