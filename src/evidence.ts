@@ -245,13 +245,13 @@ export type ArtifactContent =
  * directly. The containment rule ties evidence to project artifacts; it is not
  * and never was a confidentiality boundary.
  */
-function resolveArtifactContent(artifact: string): ArtifactContent {
+function resolveArtifactContent(artifact: string, workspaceRoot: string): ArtifactContent {
   if (artifact.length === 0 || isAbsolute(artifact)) {
     return { ok: false, reason: "outside" };
   }
   let root: string;
   try {
-    root = realpathSync(process.cwd());
+    root = realpathSync(workspaceRoot);
   } catch {
     return { ok: false, reason: "outside" };
   }
@@ -363,7 +363,12 @@ function adaptPeerEvidenceInputs(refs: unknown):
  * invalid ref rejects the whole batch (missing or stale evidence can neither
  * complete a step nor earn credit).
  */
-export function validateEvidenceRefs(goal: MultiGoal, refs: unknown): EvidenceValidation {
+/**
+ * `workspaceRoot` is the session's working directory (`ctx.cwd`). It defaults to the
+ * process cwd only for callers without a session: when several sessions share one
+ * process (a headless host), the process cwd is not any session's workspace.
+ */
+export function validateEvidenceRefs(goal: MultiGoal, refs: unknown, workspaceRoot: string = process.cwd()): EvidenceValidation {
   const adapted = adaptPeerEvidenceInputs(refs);
   if (!adapted.ok) {
     return adapted;
@@ -397,7 +402,7 @@ export function validateEvidenceRefs(goal: MultiGoal, refs: unknown): EvidenceVa
     // One open, one read, one inode: the bytes are fetched and proved to belong
     // to the workspace together, so the path is never resolved by name again
     // between the check and the read.
-    const content = resolveArtifactContent(ref.artifact);
+    const content = resolveArtifactContent(ref.artifact, workspaceRoot);
     if (!content.ok && content.reason === "outside") {
       return refFailure(
         index,

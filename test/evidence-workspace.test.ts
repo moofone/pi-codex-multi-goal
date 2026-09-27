@@ -236,3 +236,16 @@ test("B22: KNOWN RESIDUAL — a hard link inside the workspace is indistinguisha
     "documented residual: a hard link is a real directory entry inside the workspace",
   );
 });
+
+test("validateEvidenceRefs resolves against an explicit workspace root, not the process cwd", (t) => {
+  const root = mkdtempSync(join(tmpdir(), "multi-goal-root-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const goal = oneStepGoal();
+  const criterion = goal.stages[0].criteria[0].id;
+  mkdirSync(join(root, "docs"), { recursive: true });
+  writeFileSync(join(root, "docs/proof.md"), "proof\n");
+  const ref = { operation: "read", artifact: "docs/proof.md", fingerprint: sha16("proof\n"), criteria: [criterion] };
+  assert.notEqual(realpathSync(process.cwd()), realpathSync(root), "precondition: the process cwd is elsewhere");
+  assert.equal(validateEvidenceRefs(goal, [ref], root).ok, true, "found under the explicit root");
+  assert.equal(validateEvidenceRefs(goal, [ref]).ok, false, "not found under the process cwd (the old behaviour)");
+});
