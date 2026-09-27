@@ -41,6 +41,14 @@ import type { GoalContinuationKind, GoalEntrySource, GoalMemory, GoalResult, Mul
 import { CUSTOM_ENTRY_TYPE } from "./types.js";
 import { sessionOwnsLiveOrchestrateFeature, type SessionIdentity } from "./yield.js";
 
+/**
+ * The session's workspace: evidence artifacts resolve against it. `ctx.cwd`, not the
+ * process cwd, so sessions hosted together in one process each check their own tree.
+ */
+function workspaceRoot(ctx: ExtensionContext): string {
+  return ctx.cwd || process.cwd();
+}
+
 function sessionIdentity(ctx: ExtensionContext): SessionIdentity {
   const manager = ctx.sessionManager as {
     getSessionId?: () => string;
@@ -420,7 +428,7 @@ export function registerMultiGoal(pi: ExtensionAPI): void {
     }
     // One evidence-validation path for credit and completion: existence,
     // producing operation, fingerprint, and criterion association.
-    const validated = validateEvidenceRefs(goal, input.evidence);
+    const validated = validateEvidenceRefs(goal, input.evidence, workspaceRoot(ctx));
     if (!validated.ok) {
       return { ok: false, message: validated.message, goal };
     }
@@ -594,7 +602,7 @@ export function registerMultiGoal(pi: ExtensionAPI): void {
       // so validate the refs and persist only the credit — the memory record
       // (and its revision) is untouched. An invalid ref rejects the whole
       // update, keeping the previous record and counters.
-      const evidence = validateEvidenceRefs(goal, input.evidence);
+      const evidence = validateEvidenceRefs(goal, input.evidence, workspaceRoot(ctx));
       if (!evidence.ok) {
         return { ok: false, message: evidence.message, goal };
       }
@@ -631,7 +639,7 @@ export function registerMultiGoal(pi: ExtensionAPI): void {
     let next = cloneGoal(goal);
     let credited = 0;
     if (input.evidence !== undefined) {
-      const evidence = validateEvidenceRefs(goal, input.evidence);
+      const evidence = validateEvidenceRefs(goal, input.evidence, workspaceRoot(ctx));
       if (!evidence.ok) {
         return { ok: false, message: evidence.message, goal };
       }

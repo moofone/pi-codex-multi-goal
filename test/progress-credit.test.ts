@@ -32,7 +32,8 @@ const sha16 = (content: string): string =>
 
 const here = dirname(fileURLToPath(import.meta.url));
 
-function harness(t: any) {
+function harness(t: any, opts: { chdir?: boolean } = {}) {
+  const chdir = opts.chdir ?? true;
   const root = mkdtempSync(join(tmpdir(), "multi-goal-credit-"));
   const previousCwd = process.cwd();
   const oldAgent = process.env.PI_AGENT_DIR;
@@ -41,9 +42,10 @@ function harness(t: any) {
   process.env.PI_ORCHESTRATOR_ROOT = join(root, "orchestrator");
   mkdirSync(join(root, "orchestrator"), { recursive: true });
   writeFileSync(join(root, "pi-codex-multi-goal.json"), JSON.stringify({}));
-  // Evidence artifacts resolve against the working directory of the pi
-  // process; the harness chdirs into its own root.
-  process.chdir(root);
+  // Evidence artifacts resolve against the session's cwd (ctx.cwd). By default the
+  // harness also chdirs into its root (the historical setup); with chdir:false only
+  // ctx.cwd points at the workspace, as in a host running many sessions in one process.
+  if (chdir) process.chdir(root);
 
   const seed = [
     {
@@ -59,6 +61,7 @@ function harness(t: any) {
   const tools = new Map<string, any>();
   let lastNotified: string | null = null;
   const ctx: any = {
+    ...(chdir ? {} : { cwd: root }),
     hasUI: false,
     isIdle: () => true,
     hasPendingMessages: () => false,
@@ -124,8 +127,8 @@ function harness(t: any) {
     criterionId: (stepIndex = 0) => h.current().stages[stepIndex].criteria[0].id,
     /** A well-formed evidence ref backed by a real artifact file. */
     evidenceRef: (artifact: string, content: string, operation: string, criteria?: string[]) => {
-      mkdirSync(dirname(artifact), { recursive: true });
-      writeFileSync(artifact, content);
+      mkdirSync(dirname(join(root, artifact)), { recursive: true });
+      writeFileSync(join(root, artifact), content);
       return { operation, artifact, fingerprint: sha16(content), criteria: criteria ?? [h.criterionId(0)] };
     },
     providerRequest: () =>
@@ -370,4 +373,22 @@ test("peer evidence tool inputs convert before verified progress credit", async 
   });
   assert.equal(h.ack(accepted).credited, 1, "the converted peer artifact uses normal verified credit");
   assert.equal(h.counters()!.noProgressRemaining, 20, "verified peer evidence resets no-progress");
+});
+
+test("evidence resolves against the session cwd (ctx.cwd), not the process cwd", async (t) => {
+  // A headless host runs many sessions in one process: its cwd is no session's workspace.
+  const h = harness(t, { chdir: false });
+  await h.emit("session_start");
+  await h.command("resume");
+  await h.spend(2);
+  const ref = h.evidenceRef("qa/in-session-workspace.md", "only under ctx.cwd\n", "read");
+  const result = await h.memory({
+    ...h.identity(),
+    proved: ["proved: artifact lives in the session workspace"],
+    unresolved: [],
+    next: "continue",
+    evidence: [ref],
+  });
+  assert.equal(result.ok !== false, true, "update accepted");
+  assert.equal(h.ack(result).credited, 1, "the ref is verified under ctx.cwd although the process cwd is elsewhere");
 });
